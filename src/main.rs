@@ -65,7 +65,10 @@ struct App {
     outcome: Arc<Mutex<Option<(bool, String)>>>,
 }
 
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
 fn log(msg: &str) {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -276,6 +279,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let app = app_ref(hwnd);
                 let outcome = app.outcome.lock().unwrap().take();
                 if let Some((ok, message)) = outcome {
+                    // The recording is over: release Esc no matter how it
+                    // ended, otherwise the hotkey outlives the recording.
+                    let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     app.state = State::Idle;
                     let _ = set_tray_tip(hwnd, "mnvoice - idle");
                     if ok {
@@ -334,6 +340,13 @@ fn toggle(app: &mut App) {
                 let _ = unsafe { balloon(app.hwnd, "mnvoice - error", "GROQ_API_KEY not set - see mnvoice.env", true) };
                 return;
             };
+            // Pre-flight before registering the Esc hotkey: a blocked mic
+            // must not leave global hotkeys in a half-registered state.
+            if let Err(e) = audio::preflight() {
+                log(&format!("preflight failed: {e}"));
+                let _ = unsafe { balloon(app.hwnd, "mnvoice - error", &e, true) };
+                return;
+            }
             app.stop.store(false, Ordering::SeqCst);
             let stop = app.stop.clone();
             let outcome = app.outcome.clone();

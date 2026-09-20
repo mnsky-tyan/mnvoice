@@ -16,6 +16,28 @@ pub const SAMPLE_RATE: u32 = 16_000;
 const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
 const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 
+/// Cheap pre-flight: is the default capture endpoint muted (or missing)?
+/// Runs before any hotkey is registered so a blocked mic cannot leave the
+/// Esc hotkey hijacked.
+pub fn preflight() -> Result<(), String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| format!("audio backend unavailable ({e})"))?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .map_err(|e| format!("no default microphone ({e})"))?;
+        if let Ok(vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+            if let Ok(muted) = vol.GetMute() {
+                if muted.as_bool() {
+                    return Err("microphone is muted in Windows (unmute it in Settings > System > Sound, or the mic-mute key)".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Records until `stop` is set or `max_seconds` elapses.
 /// Returns mono 16 kHz i16 samples.
 pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> {
