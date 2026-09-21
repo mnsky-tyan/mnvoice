@@ -1,8 +1,10 @@
 // Real-time streaming transcription for Deepgram over native WinHTTP WebSockets.
 // Directly types confirmed text input into the focused window via Win32 SendInput (KEYEVENTF_UNICODE).
 // Auto-stops smoothly when 2.0s of silence is detected.
+// Receives pre-buffered audio chunks from the audio thread via an mpsc Receiver to guarantee zero truncation.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,11 +39,12 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
     })
 }
 
-/// Runs a real-time streaming session with Deepgram.
-/// Directly types confirmed tokens into the active window.
+/// Connects to Deepgram WebSocket and streams audio chunks from `rx`.
+/// Any audio captured before the connection completed is immediately drained from `rx` and sent.
 pub fn run_stream(
     cfg: &Config,
     stop: &Arc<AtomicBool>,
+    rx: Receiver<Vec<i16>>,
 ) -> Result<String, String> {
     unsafe {
         let session = WinHttpOpen(
@@ -62,7 +65,7 @@ pub fn run_stream(
             return Err("cannot connect to api.deepgram.com".into());
         }
 
-        // endpointing=1500ms allows natural relaxed speaking pauses
+        // endpointing=1500 allows natural relaxed pauses without cutting off
         let mut path = format!(
             "/v1/listen?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500",
             cfg.model
@@ -178,7 +181,7 @@ pub fn run_stream(
                                 *full = chunk_to_type.clone();
                             }
 
-                            // Directly type the confirmed text into the active window!
+                            // Directly type confirmed text into active window
                             let _ = paste::type_text(&chunk_to_type);
                             *typed_clone.lock().unwrap() += chunk_to_type.len();
                         }
@@ -191,8 +194,8 @@ pub fn run_stream(
             }
         });
 
-        // Capture and stream audio chunks via WASAPI with 2.0s silence VAD
-        let stream_result = crate::audio::capture_stream(stop, cfg.max_seconds, |packet_i16| {
+        // Drain pre-buffered audio from channel and continue streaming live
+        while let Ok(packet_i16) = rx.recv_timeout(Duration::from_millis(50)) {
             let slice_u8 = std::slice::from_raw_parts(
                 packet_i16.as_ptr() as *const u8,
                 packet_i16.len() * 2,
@@ -202,14 +205,16 @@ pub fn run_stream(
                 WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
                 Some(slice_u8),
             );
-            send_res == 0
-        });
+            if send_res != 0 || stop.load(Ordering::SeqCst) {
+                break;
+            }
+        }
 
         // Close stream cleanly
         let close_msg = b"{\"type\": \"CloseStream\"}";
         let _ = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Some(close_msg));
 
-        // Wait up to 350ms for final response from Deepgram
+        // Wait up to 350ms for final response
         let wait_deadline = Instant::now() + Duration::from_millis(350);
         while Instant::now() < wait_deadline && !reader_done.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(20));
@@ -222,10 +227,6 @@ pub fn run_stream(
         let _ = WinHttpCloseHandle(session);
 
         let _ = reader_thread.join();
-
-        if let Err(e) = stream_result {
-            return Err(e);
-        }
 
         let full_text = final_text.lock().unwrap().trim().to_string();
         let typed = *typed_count.lock().unwrap();

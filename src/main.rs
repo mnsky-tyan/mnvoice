@@ -245,6 +245,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            audio::WM_APP_RECORDING_READY => {
+                // Mic hardware is confirmed capturing. Show the orb now!
+                let app = app_ref(hwnd);
+                if app.state == State::Recording {
+                    if let Some(orb) = &mut app.orb {
+                        orb.show(orb::OrbState::Recording);
+                    }
+                    let _ = SetTimer(app.hwnd, TIMER_ORB, 33, None);
+                }
+                LRESULT(0)
+            }
             WM_HOTKEY => {
                 let app = app_ref(hwnd);
                 match wparam.0 as i32 {
@@ -341,15 +352,14 @@ fn toggle(app: &mut App) {
             let stop = app.stop.clone();
             let outcome = app.outcome.clone();
             let hwnd_bits = app.hwnd.0 as usize;
+
+            // Worker immediately spawns WASAPI capture thread & connects WebSocket
             thread::spawn(move || worker(stop, cfg, outcome, hwnd_bits));
             app.state = State::Recording;
+
             if let Err(e) = unsafe { RegisterHotKey(app.hwnd, HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) } {
                 log(&format!("RegisterHotKey(Esc) failed: {e}"));
             }
-            if let Some(orb) = &mut app.orb {
-                orb.show(orb::OrbState::Recording);
-            }
-            let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
             let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (auto-stops on silence)") };
             log("recording started");
         }
@@ -373,64 +383,59 @@ fn worker(
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     hwnd_bits: usize,
 ) {
-    let result = run_once(&stop, &cfg);
-    *outcome.lock().unwrap() = Some(result);
     let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
-    let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
-}
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop_audio = stop.clone();
+    let max_seconds = cfg.max_seconds;
 
-fn run_once(stop: &Arc<AtomicBool>, cfg: &config::Config) -> (bool, String) {
-    // 1. Direct streaming text input via Deepgram WebSocket
-    if cfg.provider == config::Provider::Deepgram {
-        match stream::run_stream(cfg, stop) {
+    // 1. Immediately spawn audio capture thread! Audio begins recording into channel from t=0.
+    let audio_handle = thread::spawn(move || {
+        audio::capture_to_channel(&stop_audio, max_seconds, tx, hwnd_bits)
+    });
+
+    // 2. Concurrently run streaming transcription using pre-buffered + live audio chunks
+    let result = if cfg.provider == config::Provider::Deepgram {
+        match stream::run_stream(&cfg, &stop, rx) {
             Ok(text) => {
                 let text = text.trim().to_string();
                 if text.is_empty() {
-                    return (false, "No speech detected".into());
+                    (false, "No speech detected".into())
+                } else {
+                    (true, text)
                 }
-                // Text was typed directly into the active window via SendInput during streaming!
-                return (true, text);
             }
             Err(e) => {
-                log(&format!("streaming error ({e}), falling back to batch"));
+                log(&format!("streaming error: {e}"));
+                (false, e)
             }
         }
-    }
-
-    // 2. Fallback batch mode
-    let samples = match audio::capture(stop, cfg.max_seconds) {
-        Ok(s) => s,
-        Err(e) => {
-            log(&format!("capture error: {e}"));
-            return (false, format!("Recording failed: {e}"));
+    } else {
+        // Fallback batch mode
+        let mut samples = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            samples.extend_from_slice(&chunk);
+        }
+        let wav = audio::wav_bytes(&samples);
+        match groq::transcribe(&cfg, &wav) {
+            Ok(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    (false, "No speech detected".into())
+                } else {
+                    let _ = paste::type_text(&text);
+                    if cfg.trailing_space {
+                        let _ = paste::type_text(" ");
+                    }
+                    (true, text)
+                }
+            }
+            Err(e) => (false, e),
         }
     };
-    let secs = samples.len() as f32 / audio::SAMPLE_RATE as f32;
-    log(&format!("captured {secs:.1}s of audio"));
-    if samples.is_empty() {
-        return (false, "No audio captured".into());
-    }
-    let wav = audio::wav_bytes(&samples);
-    match groq::transcribe(cfg, &wav) {
-        Ok(text) => {
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                return (false, "No speech detected".into());
-            }
-            if let Err(e) = paste::type_text(&text) {
-                log(&format!("type error: {e}"));
-                return (false, format!("Type failed: {e}"));
-            }
-            if cfg.trailing_space {
-                let _ = paste::type_text(" ");
-            }
-            (true, text)
-        }
-        Err(e) => {
-            log(&format!("transcription error: {e}"));
-            (false, e)
-        }
-    }
+
+    let _ = audio_handle.join();
+    *outcome.lock().unwrap() = Some(result);
+    let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
 }
 
 unsafe fn show_menu(hwnd: HWND) {

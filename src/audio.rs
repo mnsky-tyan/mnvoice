@@ -3,22 +3,24 @@
 // refuses, we take the mix format and convert in software.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::*;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::Audio::Endpoints::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const SAMPLE_RATE: u32 = 16_000;
+pub const WM_APP_RECORDING_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
 // Shared-mode capture at a non-mix format needs the engine's converter.
 const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
 const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 
 /// Cheap pre-flight: is the default capture endpoint muted (or missing)?
-/// Runs before any hotkey is registered so a blocked mic cannot leave the
-/// Esc hotkey hijacked.
 pub fn preflight() -> Result<(), String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -38,12 +40,14 @@ pub fn preflight() -> Result<(), String> {
     }
 }
 
-/// Records in streaming chunks (~100ms packets) and invokes `on_chunk`.
-/// Includes automatic silence detection (VAD) to auto-stop when speech ends.
-pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
+/// Immediately starts WASAPI recording, notifies the UI thread that the mic is live,
+/// and streams ~100ms packets into the provided mpsc Sender.
+/// Includes local VAD to auto-stop when 2.0s of silence is detected after speaking.
+pub fn capture_to_channel(
     stop: &AtomicBool,
     max_seconds: u32,
-    mut on_chunk: F,
+    tx: Sender<Vec<i16>>,
+    hwnd_bits: usize,
 ) -> Result<(), String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -57,7 +61,7 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
         if let Ok(vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
             if let Ok(muted) = vol.GetMute() {
                 if muted.as_bool() {
-                    return Err("microphone is muted in Windows (unmute it in Settings > System > Sound, or the mic-mute key)".into());
+                    return Err("microphone is muted in Windows".into());
                 }
             }
         }
@@ -105,12 +109,20 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
         let capture_client: IAudioCaptureClient = client
             .GetService()
             .map_err(|e| format!("capture client ({e})"))?;
+
+        // Start hardware capture
         client.Start().map_err(|e| format!("capture start ({e})"))?;
+
+        // Signal UI thread: MICROPHONE IS ACTUALLY LIVE AND RECORDING NOW!
+        if hwnd_bits != 0 {
+            let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
+            let _ = PostMessageW(hwnd, WM_APP_RECORDING_READY, WPARAM(0), LPARAM(0));
+        }
 
         let deadline = Instant::now() + Duration::from_secs(max_seconds as u64);
         let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
 
-        // VAD state
+        // VAD state: 2.0s silence threshold after speech
         let mut speech_started = false;
         let mut silence_ms = 0u32;
         let mut no_speech_ms = 0u32;
@@ -120,7 +132,7 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
                 .GetNextPacketSize()
                 .map_err(|e| format!("capture read ({e})"))?;
             if packet == 0 {
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(8));
                 continue;
             }
             let mut frames = packet;
@@ -143,7 +155,7 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
                 .ReleaseBuffer(frames)
                 .map_err(|e| format!("capture release ({e})"))?;
 
-            // Send when we have at least 100ms (1600 samples)
+            // Push 100ms chunks (1600 samples)
             while sample_buf.len() >= 1600 {
                 let chunk: Vec<i16> = sample_buf.drain(..1600).collect();
 
@@ -162,13 +174,13 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
                     }
                 } else {
                     no_speech_ms += 100;
-                    if no_speech_ms >= 8000 {
-                        // 8s with no speech at all -> auto-stop!
+                    if no_speech_ms >= 10000 {
+                        // 10s with no speech at all -> auto-stop!
                         stop.store(true, Ordering::SeqCst);
                     }
                 }
 
-                if !on_chunk(&chunk) {
+                if tx.send(chunk).is_err() {
                     stop.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -180,147 +192,34 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
         }
 
         if !sample_buf.is_empty() {
-            let _ = on_chunk(&sample_buf);
+            let _ = tx.send(sample_buf);
         }
 
         Ok(())
     }
 }
 
-/// Records until `stop` is set or `max_seconds` elapses.
-/// Includes auto-stop on silence. Returns mono 16 kHz i16 samples.
+/// Fallback batch capture.
+#[allow(dead_code)]
 pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+    let stop_clone = AtomicBool::new(stop.load(Ordering::SeqCst));
+    let deadline = Instant::now() + Duration::from_secs(max_seconds as u64);
 
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("audio backend unavailable ({e})"))?;
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eCapture, eConsole)
-            .map_err(|e| format!("no default microphone ({e})"))?;
-
-        if let Ok(vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-            if let Ok(muted) = vol.GetMute() {
-                if muted.as_bool() {
-                    return Err("microphone is muted in Windows (unmute it in Settings > System > Sound, or the mic-mute key)".into());
-                }
+    let handle = thread::spawn(move || {
+        let mut samples = Vec::new();
+        while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(50)) {
+            samples.extend_from_slice(&chunk);
+            if stop_clone.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                break;
             }
         }
-        let mut client: IAudioClient = device
-            .Activate(CLSCTX_ALL, None)
-            .map_err(|e| format!("cannot open microphone ({e})"))?;
+        samples
+    });
 
-        let desired = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_PCM as u16,
-            nChannels: 1,
-            nSamplesPerSec: SAMPLE_RATE,
-            nAvgBytesPerSec: SAMPLE_RATE * 2,
-            nBlockAlign: 2,
-            wBitsPerSample: 16,
-            cbSize: 0,
-        };
-
-        let (format, native, mix_ptr) = if client
-            .Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                0,
-                0,
-                &desired,
-                None,
-            )
-            .is_ok()
-        {
-            (desired, true, None)
-        } else {
-            client = device
-                .Activate(CLSCTX_ALL, None)
-                .map_err(|e| format!("cannot open microphone ({e})"))?;
-            let mix_ptr = client
-                .GetMixFormat()
-                .map_err(|e| format!("GetMixFormat ({e})"))?;
-            let mix = *mix_ptr;
-            client
-                .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None)
-                .map_err(|e| format!("audio client init ({e})"))?;
-            (mix, false, Some(mix_ptr))
-        };
-        let block_align = format.nBlockAlign.max(1) as usize;
-
-        let capture_client: IAudioCaptureClient = client
-            .GetService()
-            .map_err(|e| format!("capture client ({e})"))?;
-        client.Start().map_err(|e| format!("capture start ({e})"))?;
-
-        let deadline = Instant::now() + Duration::from_secs(max_seconds as u64);
-        let mut raw: Vec<u8> = Vec::new();
-        let mut vad_buf: Vec<i16> = Vec::new();
-        let mut speech_started = false;
-        let mut silence_ms = 0u32;
-
-        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-            let packet = capture_client
-                .GetNextPacketSize()
-                .map_err(|e| format!("capture read ({e})"))?;
-            if packet == 0 {
-                thread::sleep(Duration::from_millis(4));
-                continue;
-            }
-            let mut frames = packet;
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            let mut dwflags = 0u32;
-            capture_client
-                .GetBuffer(&mut ptr, &mut frames, &mut dwflags, None, None)
-                .map_err(|e| format!("capture buffer ({e})"))?;
-            if frames > 0 && !ptr.is_null() {
-                let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
-                raw.extend_from_slice(bytes);
-                if native {
-                    for c in bytes.chunks_exact(2) {
-                        vad_buf.push(i16::from_le_bytes([c[0], c[1]]));
-                    }
-                }
-            }
-            capture_client
-                .ReleaseBuffer(frames)
-                .map_err(|e| format!("capture release ({e})"))?;
-
-            // VAD check every 100ms
-            if vad_buf.len() >= 1600 {
-                let sum_sq: f64 = vad_buf.iter().map(|&s| (s as f64) * (s as f64)).sum();
-                let rms = (sum_sq / vad_buf.len() as f64).sqrt();
-                vad_buf.clear();
-                if rms > 550.0 {
-                    speech_started = true;
-                    silence_ms = 0;
-                } else if speech_started {
-                    silence_ms += 100;
-                    if silence_ms >= 2000 {
-                        stop.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
-        }
-        let _ = client.Stop();
-        if let Some(p) = mix_ptr {
-            CoTaskMemFree(Some(p as *const std::ffi::c_void));
-        }
-
-        let samples = if native {
-            raw.chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                .collect()
-        } else {
-            convert_mix(&raw, &format)?
-        };
-
-        let peak = samples.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
-        if peak < 50 {
-            return Err("microphone captured only silence (check the input device and Windows mic privacy settings)".into());
-        }
-
-        Ok(samples)
-    }
+    let _ = capture_to_channel(stop, max_seconds, tx, 0);
+    let samples = handle.join().unwrap_or_default();
+    Ok(samples)
 }
 
 /// Software fallback: arbitrary mix format -> mono 16 kHz i16.
