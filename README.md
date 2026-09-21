@@ -1,64 +1,49 @@
 # mnvoice
 
-Ultra-low-latency, hands-free push-to-talk dictation utility for Windows.
-Streams audio over WebSockets in real time and directly types text into the focused window with zero clipboard interference.
+Ultra-low-latency, hands-free push-to-talk dictation for Windows.  
+Press a hotkey, speak naturally - words type directly into whatever window you are using, in real time, with zero clipboard interference.
 
-Built from scratch in native Rust using pure Win32, WASAPI, and WinHTTP. Zero Electron, zero Python, zero async runtimes.
+Built in native Rust using pure Win32, WASAPI, and WinHTTP. No Electron, no Python, no async runtimes.
 
 ```
 mnvoice.exe (~302 KB)
-  ├── Global hotkey (Alt+Space to start, Esc/Alt+Space to stop)
-  ├── Standby pre-initialized audio capture (WASAPI, 16 kHz mono, ~15ms to first audio byte)
-  ├── Dual-layer VAD (local RMS energy + server endpointing for hands-free auto-stop on silence)
-  ├── Provider-agnostic STT (Real-time WebSocket streaming or standard REST audio/transcriptions)
-  ├── Monotonic live word-by-word typing (SendInput with KEYEVENTF_UNICODE, zero clipboard history clobbering)
-  ├── Custom vocabulary / keyterm prompting (keywords.txt / KEYWORDS env)
-  └── Procedural glass fluid orb indicator (36px, 32-bit premultiplied ARGB layered window, click-through)
+  ├── Global hotkey (configurable, default Alt+Space to start / stop)
+  ├── Standby pre-initialized audio capture (WASAPI, 16 kHz mono, ~15 ms to first audio)
+  ├── Dual-layer VAD (local RMS energy + server endpointing, auto-stops on silence)
+  ├── Provider-agnostic STT (real-time WebSocket streaming or standard REST)
+  ├── Monotonic live word-by-word typing (SendInput KEYEVENTF_UNICODE, zero clipboard touch)
+  ├── Custom vocabulary / keyterm prompting (keywords.txt or KEYWORDS= env)
+  └── Procedural glass fluid orb indicator (color + fluid level configurable)
 ```
 
 ## Features
 
-- **Instantaneous Activation (~15 ms)**: Uses a persistent standby audio engine that pre-initializes the WASAPI audio graph at application startup. When you press Alt+Space, hardware capture starts in ~4 ms and the first audio buffer is captured in ~15 ms with zero truncation.
-- **Direct Keystroke Injection**: Transcribed words flow directly into the active window at the cursor via `SendInput` with `KEYEVENTF_UNICODE`. Your system clipboard history remains completely untouched.
-- **True Real-Time Word Streaming**: Audio is streamed in 40 ms slices over native WinHTTP WebSockets. Words stream into your document in real time as you speak.
-- **Hands-Free Silence Auto-Stop**: Dual-layer Voice Activity Detection (local RMS energy calculation + server endpointing) detects when you finish speaking (2.2s silence threshold) and finalizes automatically.
-- **Lightweight Glass Fluid Indicator**: A 36px procedural glass orb with undulating fluid floats 2px above your taskbar during recording. Renders with pure GDI premultiplied 32-bit ARGB (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`), consuming only ~6 KB buffer memory.
-- **Custom Vocabulary**: Easily add specialized acronyms, technical jargon, or hard-to-pronounce names via a simple `keywords.txt` file or `KEYWORDS=` environment variable.
-- **Privacy & Security Focused**: Zero audio saved to disk. Point-to-point TLS encryption directly to your chosen endpoint. Zero telemetry or third-party tracking.
-- **Minimal Resource Footprint**:
-  - Binary size: **~302 KB**
-  - Working set RAM: **~10.9 MB**
-  - Private memory: **~1.9 MB**
-  - Idle CPU: **0.0%**
+- **~15 ms activation** - persistent standby WASAPI engine pre-initializes at launch; Alt+Space starts capture in ~4 ms, first audio in ~15 ms.
+- **Zero clipboard pollution** - words are injected directly at the cursor via `SendInput` with `KEYEVENTF_UNICODE`.
+- **Real-time word streaming** - 40 ms audio slices over native WinHTTP WebSockets; words appear as you speak.
+- **Hands-free auto-stop** - dual VAD (local RMS + server endpointing) detects ~2.2 s of silence and finalizes automatically.
+- **Fully configurable** - hotkey, cancel key, orb color, fluid level, STT provider, model, language, and vocabulary all set in one plain text file.
+- **Privacy focused** - zero audio written to disk, point-to-point TLS, zero telemetry. See [SECURITY.md](SECURITY.md).
+- **Tiny footprint** - ~302 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
 
-## Supported Speech Providers
+---
 
-`mnvoice` is not hardwired to any single vendor. It supports two generic protocols:
+## Quick Start
 
-1. **Real-Time WebSocket Streaming (`PROTOCOL=streaming`)** *(Recommended)*:
-   - Lowest latency (~150-200ms). Streams live linear16 audio chunks.
-   - Example providers: [Deepgram](https://deepgram.com/) (`model=nova-3` or `nova-2`), or any compatible WebSocket STT server.
-2. **OpenAI-Compatible REST (`PROTOCOL=rest`)**:
-   - Posts audio WAV files to any `/v1/audio/transcriptions` multipart endpoint.
-   - Example providers: [Groq](https://console.groq.com/) (`whisper-large-v3-turbo`), [OpenAI](https://platform.openai.com/) (`whisper-1`), or self-hosted Whisper / vLLM / Ollama servers.
+### 1. Download
 
-## Getting Started
+Grab the latest `mnvoice-windows-x64.zip` from the [Releases](../../releases/latest) page.  
+Extract it - you get three files:
 
-### 1. Build from Source
-
-Requires the standard Rust toolchain with the MSVC target on Windows:
-
-```cmd
-git clone https://github.com/your-username/mnvoice.git
-cd mnvoice
-cargo build --release
+```
+mnvoice.exe
+mnvoice.env.example
+keywords.txt.example
 ```
 
-The optimized binary is generated at `target/release/mnvoice.exe`.
+### 2. Configure
 
-### 2. Configuration
-
-Copy `mnvoice.env.example` to `mnvoice.env` next to `mnvoice.exe` (or set environment variables):
+Rename `mnvoice.env.example` to `mnvoice.env` (keep it next to `mnvoice.exe`) and fill in your API key:
 
 ```ini
 PROTOCOL=streaming
@@ -67,63 +52,202 @@ MODEL=nova-3
 LANGUAGE=en
 ```
 
-### 3. Custom Vocabulary (Optional)
+Get a free API key from [Deepgram](https://console.deepgram.com/) (streaming, ~$200 free credit) or [Groq](https://console.groq.com/) (REST, free tier).
 
-Create a `keywords.txt` file next to `mnvoice.exe` and list your technical terms, project names, or rare names (one per line or comma-separated):
+### 3. Run
 
-```text
-# Custom terminology
-mnvoice
-herdr
-Kubernetes
-TypeScript
-PostgreSQL
+Double-click `mnvoice.exe`, or from a terminal:
+
+```cmd
+mnvoice.exe
 ```
 
-### 4. Run
+A small icon appears in the system tray. Press **Alt+Space** to start dictating into whatever window is focused.
 
-Launch `mnvoice.exe`. It runs unobtrusively in the system tray:
-- **Alt+Space**: Start dictation. The pink glass fluid orb appears at the bottom of the screen.
-- Speak naturally. Words type into your active window in real time.
-- Stop speaking for ~2 seconds, or tap **Alt+Space** / **Esc** to stop manually.
-- Right-click tray icon: View status or Exit.
+---
 
-#### Launch on Startup (Optional)
+## Running Automatically at Shell / System Startup
 
-To start automatically with Windows:
+mnvoice is designed to run silently in the background. You never interact with it directly - just use your hotkey.
+
+### Option A - Windows Startup folder (recommended for most users)
+
+Run once from a terminal beside `mnvoice.exe`:
+
 ```cmd
 mnvoice.exe --install-startup
 ```
-To remove:
+
+This creates a shortcut in your Windows Startup folder. mnvoice launches automatically (hidden, no window) every time you log in. To remove it:
+
 ```cmd
 mnvoice.exe --uninstall-startup
 ```
 
-## Configuration Reference
+### Option B - PowerShell profile (starts with every PowerShell / Windows Terminal session)
 
-Settings can be placed in `mnvoice.env` beside the executable or exported as environment variables:
+Add to your PowerShell profile (`$PROFILE`):
+
+```powershell
+# Start mnvoice in the background if it is not already running
+if (-not (Get-Process mnvoice -ErrorAction SilentlyContinue)) {
+    Start-Process -WindowStyle Hidden "C:\path\to\mnvoice.exe"
+}
+```
+
+Replace `C:\path\to\mnvoice.exe` with the actual path. The `-WindowStyle Hidden` flag keeps it completely invisible.
+
+### Option C - WSL / bash profile (starts with every WSL shell)
+
+Add to `~/.bashrc` or `~/.zshrc`:
+
+```bash
+# Start mnvoice on Windows side if not already running
+if ! powershell.exe -NoProfile -Command \
+    "if (Get-Process mnvoice -EA SilentlyContinue) { exit 0 } else { exit 1 }" \
+    > /dev/null 2>&1; then
+    powershell.exe -NoProfile -WindowStyle Hidden \
+        -Command "Start-Process 'C:\path\to\mnvoice.exe'" \
+        > /dev/null 2>&1 &
+fi
+```
+
+### Option D - Task Scheduler (most robust, survives session restarts)
+
+```cmd
+schtasks /create /tn "mnvoice" /tr "C:\path\to\mnvoice.exe" /sc onlogon /rl limited /f
+```
+
+This registers mnvoice to start on every login via Windows Task Scheduler with no UAC prompt.
+
+---
+
+## Customization
+
+All settings go in `mnvoice.env` next to the executable. Full reference below.
+
+### Keybindings
+
+```ini
+# Start / stop dictation
+HOTKEY=Alt+Space
+
+# Cancel recording and discard transcript
+CANCEL_KEY=Escape
+```
+
+Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win`  
+Supported keys: `Space`, `Escape`, `Tab`, `Enter`, `F1`-`F24`, `A`-`Z`, `0`-`9`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `BackQuote`
+
+Examples:
+```ini
+HOTKEY=Ctrl+Shift+D
+HOTKEY=F9
+HOTKEY=Win+Space
+CANCEL_KEY=none
+```
+
+### Orb Color
+
+```ini
+# Named preset
+ORB_COLOR=hot_pink
+
+# Any hex color
+ORB_COLOR=#A855F7
+```
+
+Built-in presets: `hot_pink` (default), `cyan`, `purple`, `blue`, `emerald`, `amber`, `red`, `white`
+
+### Fluid Level
+
+Controls how dense / full the fluid inside the orb appears. `0.0` = wispy mist, `1.0` = fully filled.
+
+```ini
+ORB_FLUID_LEVEL=0.75   # or 75%
+```
+
+### Speech Provider
+
+```ini
+# Real-time WebSocket streaming (default, lowest latency)
+PROTOCOL=streaming
+API_KEY=your_deepgram_key
+MODEL=nova-3
+LANGUAGE=en
+
+# Standard REST (OpenAI-compatible: Groq, OpenAI, self-hosted Whisper, vLLM)
+PROTOCOL=rest
+API_KEY=your_groq_key
+MODEL=whisper-large-v3-turbo
+BASE_URL=https://api.groq.com
+```
+
+Custom endpoint (self-hosted or corporate proxy):
+```ini
+BASE_URL=wss://stt.internal.company.com:8443/listen
+```
+
+### Custom Vocabulary
+
+Create `keywords.txt` beside `mnvoice.exe` (auto-loaded), or use the env var:
+
+```ini
+KEYWORDS=Kubernetes, TypeScript, PostgreSQL, herdr, mnvoice
+```
+
+One word per line or comma-separated. Lines starting with `#` are comments.
+
+### All Options
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROTOCOL` | `streaming` | Protocol mode: `streaming` (WebSocket) or `rest` (HTTP) |
-| `API_KEY` | - | Authentication key / token for your speech provider |
-| `MODEL` | `nova-3` (streaming) / `whisper-large-v3-turbo` (rest) | Speech model identifier |
-| `BASE_URL` | `https://api.deepgram.com` (streaming) / `https://api.groq.com` (rest) | Custom endpoint URL / host / reverse proxy |
-| `LANGUAGE` | `en` | Language code (or `auto` for detection) |
-| `KEYWORDS` | - | Comma-separated custom keywords / keyterms |
-| `TRAILING_SPACE` | `1` | Automatically append a space after transcription |
-| `MAX_SECONDS` | `120` | Maximum recording limit before automatic cutoff |
+| `PROTOCOL` | `streaming` | `streaming` (WebSocket) or `rest` (HTTP) |
+| `API_KEY` | - | API key / auth token |
+| `MODEL` | `nova-3` / `whisper-large-v3-turbo` | STT model identifier |
+| `BASE_URL` | provider default | Custom endpoint URL |
+| `LANGUAGE` | `en` | Language code, or `auto` for detection |
+| `HOTKEY` | `Alt+Space` | Start / stop hotkey |
+| `CANCEL_KEY` | `Escape` | Cancel hotkey (`none` to disable) |
+| `ORB_COLOR` | `hot_pink` | Orb fluid color (preset name or `#RRGGBB`) |
+| `ORB_FLUID_LEVEL` | `0.75` | Orb fill level `0.0`-`1.0` or `0%`-`100%` |
+| `KEYWORDS` | - | Comma-separated custom vocabulary |
+| `TRAILING_SPACE` | `1` | Append space after each dictation (`0` to disable) |
+| `MAX_SECONDS` | `120` | Max recording duration before auto-stop |
 
-*(Note: Provider-specific aliases such as `DEEPGRAM_API_KEY`, `GROQ_API_KEY`, and `OPENAI_API_KEY` are also automatically recognized for convenience.)*
+Provider-specific aliases (`DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, etc.) are also recognized for convenience.
+
+---
+
+## Building from Source
+
+Requires Rust stable with the `x86_64-pc-windows-msvc` target:
+
+```cmd
+git clone https://github.com/mnsky-tyan/mnvoice.git
+cd mnvoice
+cargo build --release
+```
+
+Binary at `target\release\mnvoice.exe`. Run tests:
+
+```cmd
+cargo test
+```
+
+---
 
 ## Privacy & Security
 
 See [SECURITY.md](SECURITY.md) for full details:
-- **Zero local audio retention**: Audio is processed purely in volatile RAM buffers and never written to disk.
-- **Direct encrypted TLS connections**: All audio and keystroke streams communicate directly with your configured endpoint over native Windows TLS.
-- **Zero clipboard modifications**: Dictation is typed directly via native Unicode keystrokes (`KEYEVENTF_UNICODE`), never reading or clearing your clipboard.
-- **Zero telemetry**: No telemetry, analytics, or third-party phone-home calls.
+
+- Zero audio written to disk - buffers live in RAM only and are dropped immediately after transmission.
+- Point-to-point TLS (WinHTTP `WINHTTP_FLAG_SECURE`) directly to your configured endpoint. Zero third-party calls.
+- Zero clipboard reads or writes - dictation uses `SendInput` with `KEYEVENTF_UNICODE` only.
+- No global keyboard hooks - only the two registered hotkeys (`RegisterHotKey`) are intercepted.
+
+---
 
 ## License
 
-MIT License.
+MIT

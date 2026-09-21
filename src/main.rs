@@ -24,7 +24,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_ESCAPE, VK_SPACE,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT,
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
@@ -115,11 +115,22 @@ fn main() {
         }
     };
     let kw_count = config.as_ref().map(|c| c.keywords.len()).unwrap_or(0);
+    let (hk_mod, hk_vk, hk_str) = config
+        .as_ref()
+        .map(|c| (c.hotkey.0, c.hotkey.1, c.hotkey_str.clone()))
+        .unwrap_or((MOD_ALT.0 | MOD_NOREPEAT.0, 0x20, "Alt+Space".to_string()));
+    let cancel_str = config
+        .as_ref()
+        .map(|c| c.cancel_key_str.clone())
+        .unwrap_or_else(|| "Escape".to_string());
+
     log(&format!(
-        "mnvoice started (pid {}, protocol {:?}, model {}, keywords: {})",
+        "mnvoice started (pid {}, protocol {:?}, model {}, hotkey: {}, cancel: {}, keywords: {})",
         unsafe { GetCurrentProcessId() },
         config.as_ref().map(|c| c.protocol),
         config.as_ref().map(|c| c.model.as_str()).unwrap_or("none"),
+        hk_str,
+        cancel_str,
         kw_count
     ));
 
@@ -162,10 +173,10 @@ fn main() {
         if let Err(e) = RegisterHotKey(
             hwnd,
             HOTKEY_TOGGLE,
-            MOD_ALT | MOD_NOREPEAT,
-            VK_SPACE.0 as u32,
+            HOT_KEY_MODIFIERS(hk_mod),
+            hk_vk,
         ) {
-            log(&format!("RegisterHotKey(Alt+Space) failed: {e}"));
+            log(&format!("RegisterHotKey({hk_str}) failed: {e}"));
         }
 
         add_tray(hwnd, "mnvoice - idle");
@@ -226,7 +237,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CREATE => {
                 let cs = &*(lparam.0 as *const CREATESTRUCTW);
                 let init = Box::from_raw(cs.lpCreateParams as *mut AppInit);
-                let orb = orb::Orb::new(init.instance).map_err(|e| {
+                let color = init.config.as_ref().map(|c| c.orb_color).unwrap_or((1.0, 0.18, 0.58));
+                let fluid = init.config.as_ref().map(|c| c.orb_fluid_level).unwrap_or(0.75);
+                let orb = orb::Orb::new(init.instance, color, fluid).map_err(|e| {
                     log(&format!("orb init: {e}"));
                     e
                 }).ok();
@@ -364,11 +377,21 @@ fn toggle(app: &mut App) {
             let audio_engine = app.audio_engine.clone();
 
             // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
-            thread::spawn(move || worker(stop, cfg, outcome, hwnd_bits, audio_engine));
+            let worker_cfg = cfg.clone();
+            thread::spawn(move || worker(stop, worker_cfg, outcome, hwnd_bits, audio_engine));
             app.state = State::Recording;
 
-            if let Err(e) = unsafe { RegisterHotKey(app.hwnd, HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) } {
-                log(&format!("RegisterHotKey(Esc) failed: {e}"));
+            if cfg.cancel_key.1 != 0 {
+                if let Err(e) = unsafe {
+                    RegisterHotKey(
+                        app.hwnd,
+                        HOTKEY_ESC,
+                        HOT_KEY_MODIFIERS(cfg.cancel_key.0),
+                        cfg.cancel_key.1,
+                    )
+                } {
+                    log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
+                }
             }
             let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (auto-stops on silence)") };
             log("recording started");

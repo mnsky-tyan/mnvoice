@@ -31,6 +31,8 @@ pub struct Orb {
     pub state: OrbState,
     frame: u32,
     visible: bool,
+    color: (f32, f32, f32),
+    fluid_level: f32,
 }
 
 unsafe extern "system" fn orb_wndproc(
@@ -43,7 +45,11 @@ unsafe extern "system" fn orb_wndproc(
 }
 
 impl Orb {
-    pub fn new(instance: HINSTANCE) -> Result<Self, String> {
+    pub fn new(
+        instance: HINSTANCE,
+        color: (f32, f32, f32),
+        fluid_level: f32,
+    ) -> Result<Self, String> {
         unsafe {
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(orb_wndproc),
@@ -127,6 +133,8 @@ impl Orb {
                 state: OrbState::Recording,
                 frame: 0,
                 visible: false,
+                color,
+                fluid_level,
             })
         }
     }
@@ -189,8 +197,8 @@ impl Orb {
         let buf = unsafe { std::slice::from_raw_parts_mut(self.bits, total_pixels) };
 
         match self.state {
-            OrbState::Recording => render_gas_fluid(self.frame, buf, false),
-            OrbState::Transcribing => render_gas_fluid(self.frame, buf, true),
+            OrbState::Recording => render_gas_fluid(self.frame, buf, false, self.color, self.fluid_level),
+            OrbState::Transcribing => render_gas_fluid(self.frame, buf, true, self.color, self.fluid_level),
         }
 
         unsafe {
@@ -282,7 +290,15 @@ fn pack_premul(r: f32, g: f32, b: f32, a: f32) -> u32 {
 }
 
 /// Render 36px translucent glass sphere with floating zero-gravity gas-fluid nebula inside.
-fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
+fn render_gas_fluid(
+    frame: u32,
+    buf: &mut [u32],
+    is_loading: bool,
+    color: (f32, f32, f32),
+    fluid_level: f32,
+) {
+    let (base_r, base_g, base_b) = color;
+    let fluid_mult = fluid_level.clamp(0.05, 1.0);
     let speed = if is_loading { 0.065 } else { 0.038 };
     let t = frame as f32 * speed;
     let cx = ORB_CX;
@@ -308,9 +324,9 @@ fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
             let mut b = 0.0f32;
             let mut a = 0.0f32;
 
-            // 1. Ambient soft pink aura
-            let aura = (-d_sq / 260.0).exp() * 0.26;
-            add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.18, 0.58, aura);
+            // 1. Ambient soft aura
+            let aura = (-d_sq / 260.0).exp() * 0.26 * fluid_mult.max(0.4);
+            add_light(&mut r, &mut g, &mut b, &mut a, base_r, base_g, base_b, aura);
 
             if d <= r_sphere + 1.2 {
                 let sphere_edge = ((r_sphere + 1.2 - d) / 1.5).clamp(0.0, 1.0);
@@ -336,42 +352,57 @@ fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
                 let g3 = ((warp_x * 4.5 + t * 3.0).sin() + (warp_y * 4.5 - t * 2.8).cos()) * 0.5;
 
                 // Balanced, airy fluid density with breathing room
-                let density = (0.46 + 0.26 * g1 + 0.20 * g2 + 0.16 * g3).clamp(0.0, 1.0);
+                let density = ((0.46 + 0.26 * g1 + 0.20 * g2 + 0.16 * g3) * fluid_mult).clamp(0.0, 1.0);
                 let core_falloff = (1.0 - (r_norm * 0.78).powi(2)).clamp(0.0, 1.0);
                 let gas_volume = density * core_falloff;
 
-                // Subtle ambient pink vapor fill
-                let ambient_fluid = 0.12 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.15, 0.55, ambient_fluid);
+                // Subtle ambient vapor fill
+                let ambient_fluid = 0.12 * sphere_edge * fluid_mult;
+                add_light(&mut r, &mut g, &mut b, &mut a, base_r, base_g, base_b, ambient_fluid);
 
-                // Real vibrant hot pink fluid body
+                // Real vibrant fluid body
                 let body_int = gas_volume * 0.88 * sphere_edge;
-                let cr = 1.0;
-                let cg = 0.10 + 0.18 * density;
-                let cb = 0.50 + 0.28 * density;
+                let cr = base_r;
+                let cg = base_g * (0.6 + 0.4 * density);
+                let cb = base_b * (0.6 + 0.4 * density);
                 add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_int);
 
-                // Luminous neon pink filaments & tendrils
-                let filament = (gas_volume * 1.45 - 0.28).clamp(0.0, 1.0);
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.40, 0.78, filament * 0.72 * sphere_edge);
+                // Luminous filaments & tendrils
+                let filament = (gas_volume * 1.45 * (fluid_mult / 0.75) - 0.28).clamp(0.0, 1.0);
+                let fil_r = (base_r + 0.3).min(1.0);
+                let fil_g = (base_g + 0.3).min(1.0);
+                let fil_b = (base_b + 0.3).min(1.0);
+                add_light(&mut r, &mut g, &mut b, &mut a, fil_r, fil_g, fil_b, filament * 0.72 * sphere_edge);
 
-                // Floating pink-white ion sparks drifting in zero-g gas
+                // Floating ion sparks drifting in zero-g gas
                 let sp1_x = (t * 1.3).sin() * 6.5;
                 let sp1_y = (t * 1.7).cos() * 6.5;
                 let sp1 = (-((dx - sp1_x).powi(2) + (dy - sp1_y).powi(2)) / 3.8).exp() * 0.85;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.70, 0.90, sp1 * sphere_edge);
+                let sp_r = (base_r + 0.4).min(1.0);
+                let sp_g = (base_g + 0.4).min(1.0);
+                let sp_b = (base_b + 0.4).min(1.0);
+                add_light(&mut r, &mut g, &mut b, &mut a, sp_r, sp_g, sp_b, sp1 * sphere_edge);
 
                 let sp2_x = (t * 2.1 + 2.0).cos() * 8.0;
                 let sp2_y = (t * 1.5 + 1.0).sin() * 8.0;
                 let sp2 = (-((dx - sp2_x).powi(2) + (dy - sp2_y).powi(2)) / 3.2).exp() * 0.75;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.55, 0.82, sp2 * sphere_edge);
+                add_light(&mut r, &mut g, &mut b, &mut a, sp_r, sp_g, sp_b, sp2 * sphere_edge);
 
                 // --- TRANSLUCENT GLASS SHELL ---
-                // Rose crystal Fresnel rim
+                // Crystal Fresnel rim tinted with base color
                 let rim = fresnel * (0.46 + 0.20 * (t * 2.5).sin()) * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.40, 0.75, rim);
+                add_light(
+                    &mut r,
+                    &mut g,
+                    &mut b,
+                    &mut a,
+                    (base_r + 0.2).min(1.0),
+                    (base_g + 0.2).min(1.0),
+                    (base_b + 0.2).min(1.0),
+                    rim,
+                );
 
-                // Primary specular highlight (crisp white with faint rose tint)
+                // Primary specular highlight (crisp white reflection on outer glass)
                 let hl_dx = dx + 5.2;
                 let hl_dy = dy + 5.8;
                 let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
@@ -383,7 +414,7 @@ fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
                 let hl2_dy = dy - 5.2;
                 let hl2_d_sq = hl2_dx * hl2_dx + hl2_dy * hl2_dy;
                 let hl2 = (-hl2_d_sq / 13.0).exp() * 0.36 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.45, 0.70, hl2);
+                add_light(&mut r, &mut g, &mut b, &mut a, (base_r + 0.2).min(1.0), (base_g + 0.2).min(1.0), (base_b + 0.2).min(1.0), hl2);
             }
 
             buf[row_offset + x as usize] = pack_premul(r, g, b, a);
@@ -398,7 +429,7 @@ mod tests {
     #[test]
     fn test_render_recording_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(10, &mut buf, false);
+        render_gas_fluid(10, &mut buf, false, (1.0, 0.18, 0.58), 0.75);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
         assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }
@@ -406,7 +437,7 @@ mod tests {
     #[test]
     fn test_render_loading_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(10, &mut buf, true);
+        render_gas_fluid(10, &mut buf, true, (1.0, 0.18, 0.58), 0.75);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
         assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }
