@@ -23,41 +23,41 @@ pub fn type_text(text: &str) -> Result<(), String> {
         return Ok(());
     }
     let utf16: Vec<u16> = text.encode_utf16().collect();
-    let mut inputs = Vec::with_capacity(utf16.len() * 2);
-
-    for &ch in &utf16 {
-        // Press
-        inputs.push(INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: ch,
-                    dwFlags: KEYEVENTF_UNICODE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        });
-        // Release
-        inputs.push(INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: ch,
-                    dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        });
-    }
 
     unsafe {
-        let sent = SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent != inputs.len() as u32 {
-            return Err("SendInput keystroke failed".into());
+        for &ch in &utf16 {
+            let mut inputs = [
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: ch,
+                            dwFlags: KEYEVENTF_UNICODE,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                },
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: ch,
+                            dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                },
+            ];
+            SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+            // Small delay between characters so the target window processes each
+            // keystroke before the next arrives. Without this, apps that buffer
+            // input (browsers, terminals) can auto-repeat or drop events when
+            // flooded with a large batch all at once.
+            thread::sleep(Duration::from_millis(2));
         }
     }
     Ok(())
