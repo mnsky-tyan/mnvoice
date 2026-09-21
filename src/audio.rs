@@ -21,6 +21,7 @@ const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
 const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 
 /// Cheap pre-flight: is the default capture endpoint muted (or missing)?
+#[allow(dead_code)]
 pub fn preflight() -> Result<(), String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -58,13 +59,6 @@ pub fn capture_to_channel(
             .GetDefaultAudioEndpoint(eCapture, eConsole)
             .map_err(|e| format!("no default microphone ({e})"))?;
 
-        if let Ok(vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-            if let Ok(muted) = vol.GetMute() {
-                if muted.as_bool() {
-                    return Err("microphone is muted in Windows".into());
-                }
-            }
-        }
         let mut client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
             .map_err(|e| format!("cannot open microphone ({e})"))?;
@@ -132,7 +126,7 @@ pub fn capture_to_channel(
                 .GetNextPacketSize()
                 .map_err(|e| format!("capture read ({e})"))?;
             if packet == 0 {
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(Duration::from_millis(4));
                 continue;
             }
             let mut frames = packet;

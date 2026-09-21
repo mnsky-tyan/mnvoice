@@ -179,6 +179,7 @@ pub fn run_stream(
             let mut buf = vec![0u8; 16384];
             let mut typed_word_count = 0usize;
             let mut has_typed_any = false;
+            let mut latest_uncommitted = String::new();
 
             while !reader_done_clone.load(Ordering::SeqCst) {
                 let mut bytes_read = 0u32;
@@ -198,6 +199,7 @@ pub fn run_stream(
                 if let Some(res) = parse_stream_json(&msg) {
                     let trimmed = res.transcript.trim();
                     if !trimmed.is_empty() {
+                        latest_uncommitted = trimmed.to_string();
                         let words: Vec<&str> = trimmed.split_whitespace().collect();
 
                         if res.is_final {
@@ -218,6 +220,7 @@ pub fn run_stream(
                                 full.push_str(&remaining.join(" "));
                             }
                             typed_word_count = 0; // reset for next clause
+                            latest_uncommitted.clear();
                         } else {
                             // Interim results: type completed words (all except the trailing partial word)
                             if words.len() > 1 && words.len() - 1 > typed_word_count {
@@ -243,6 +246,24 @@ pub fn run_stream(
                             stop_clone.store(true, Ordering::SeqCst);
                         }
                     }
+                }
+            }
+
+            // Flush any remaining words from the latest interim transcript upon stop/close
+            if !latest_uncommitted.is_empty() {
+                let words: Vec<&str> = latest_uncommitted.split_whitespace().collect();
+                if words.len() > typed_word_count {
+                    let remaining = &words[typed_word_count..];
+                    let mut to_type = remaining.join(" ");
+                    if has_typed_any {
+                        to_type = format!(" {to_type}");
+                    }
+                    let _ = paste::type_text(&to_type);
+                    let mut full = full_transcript_clone.lock().unwrap();
+                    if !full.is_empty() {
+                        full.push(' ');
+                    }
+                    full.push_str(&remaining.join(" "));
                 }
             }
         });
@@ -273,14 +294,27 @@ pub fn run_stream(
             }
         }
 
+        // Drain all remaining audio packets accumulated in rx before closing
+        while let Ok(packet_i16) = rx.try_recv() {
+            let slice_u8 = std::slice::from_raw_parts(
+                packet_i16.as_ptr() as *const u8,
+                packet_i16.len() * 2,
+            );
+            let _ = WinHttpWebSocketSend(
+                ws,
+                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                Some(slice_u8),
+            );
+        }
+
         // Signal close to Deepgram
         let close_msg = b"{\"type\": \"CloseStream\"}";
         let _ = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Some(close_msg));
 
-        // Wait up to 350ms for final response
-        let wait_deadline = Instant::now() + Duration::from_millis(350);
+        // Wait up to 1500ms for Deepgram to return the final transcription
+        let wait_deadline = Instant::now() + Duration::from_millis(1500);
         while Instant::now() < wait_deadline && !reader_done.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(15));
+            thread::sleep(Duration::from_millis(20));
         }
 
         reader_done.store(true, Ordering::SeqCst);

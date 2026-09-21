@@ -389,21 +389,11 @@ fn worker(
     hwnd_bits: usize,
 ) {
     let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
-
-    if let Err(e) = audio::preflight() {
-        log(&format!("preflight failed: {e}"));
-        *outcome.lock().unwrap() = Some((false, e));
-        unsafe {
-            let _ = PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0));
-        }
-        return;
-    }
-
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_audio = stop.clone();
     let max_seconds = cfg.max_seconds;
 
-    // 1. Immediately spawn audio capture thread! Audio begins recording into channel from t=0.
+    // 1. Immediately spawn audio capture thread at t=0ms!
     let audio_handle = thread::spawn(move || {
         audio::capture_to_channel(&stop_audio, max_seconds, tx, hwnd_bits)
     });
