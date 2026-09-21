@@ -2,7 +2,7 @@
 name = "mnvoice"
 version = "0.1.0"
 edition = "2021"
-description = "Push-to-talk dictation for Windows using Groq Whisper Large V3 Turbo"
+description = "Ultra-low-latency, hands-free push-to-talk dictation utility for Windows with real-time streaming and zero-clipboard typing"
 license = "MIT"
 
 [dependencies]

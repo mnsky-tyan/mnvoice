@@ -7,9 +7,9 @@
 
 mod audio;
 mod config;
-mod groq;
 mod orb;
 mod paste;
+mod rest;
 mod stream;
 
 use std::fs::OpenOptions;
@@ -116,9 +116,9 @@ fn main() {
     };
     let kw_count = config.as_ref().map(|c| c.keywords.len()).unwrap_or(0);
     log(&format!(
-        "mnvoice started (pid {}, provider {:?}, model {}, keywords: {})",
+        "mnvoice started (pid {}, protocol {:?}, model {}, keywords: {})",
         unsafe { GetCurrentProcessId() },
-        config.as_ref().map(|c| c.provider),
+        config.as_ref().map(|c| c.protocol),
         config.as_ref().map(|c| c.model.as_str()).unwrap_or("none"),
         kw_count
     ));
@@ -402,43 +402,45 @@ fn worker(
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
     let capture_done_rx = audio_engine.capture_to_channel(stop_audio, max_seconds, tx);
 
-    // 2. Concurrently run streaming transcription using pre-buffered + live audio chunks
-    let result = if cfg.provider == config::Provider::Deepgram {
-        match stream::run_stream(&cfg, &stop, rx) {
-            Ok(text) => {
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    (false, "No speech detected".into())
-                } else {
-                    (true, text)
-                }
-            }
-            Err(e) => {
-                log(&format!("streaming error: {e}"));
-                (false, e)
-            }
-        }
-    } else {
-        // Fallback batch mode
-        let mut samples = Vec::new();
-        while let Ok(chunk) = rx.recv() {
-            samples.extend_from_slice(&chunk);
-        }
-        let wav = audio::wav_bytes(&samples);
-        match groq::transcribe(&cfg, &wav) {
-            Ok(text) => {
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    (false, "No speech detected".into())
-                } else {
-                    let _ = paste::type_text(&text);
-                    if cfg.trailing_space {
-                        let _ = paste::type_text(" ");
+    // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
+    let result = match cfg.protocol {
+        config::Protocol::Streaming => {
+            match stream::run_stream(&cfg, &stop, rx) {
+                Ok(text) => {
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        (false, "No speech detected".into())
+                    } else {
+                        (true, text)
                     }
-                    (true, text)
+                }
+                Err(e) => {
+                    log(&format!("streaming error: {e}"));
+                    (false, e)
                 }
             }
-            Err(e) => (false, e),
+        }
+        config::Protocol::Rest => {
+            let mut samples = Vec::new();
+            while let Ok(chunk) = rx.recv() {
+                samples.extend_from_slice(&chunk);
+            }
+            let wav = audio::wav_bytes(&samples);
+            match rest::transcribe(&cfg, &wav) {
+                Ok(text) => {
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        (false, "No speech detected".into())
+                    } else {
+                        let _ = paste::type_text(&text);
+                        if cfg.trailing_space {
+                            let _ = paste::type_text(" ");
+                        }
+                        (true, text)
+                    }
+                }
+                Err(e) => (false, e),
+            }
         }
     };
 

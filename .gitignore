@@ -1,3 +1,5 @@
 /target
 *.pdb
 mnvoice.env
+*.env
+*.log

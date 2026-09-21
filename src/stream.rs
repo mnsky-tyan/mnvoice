@@ -41,10 +41,10 @@ pub struct StreamResult {
 }
 
 pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
-    if !json.contains("\"Results\"") {
+    if !json.contains("\"Results\"") && !json.contains("\"results\"") && !json.contains("\"text\"") {
         return None;
     }
-    let transcript = crate::groq::parse_deepgram_transcript(json).unwrap_or_default();
+    let transcript = crate::rest::parse_json_transcript(json).unwrap_or_default();
     let speech_final = json.contains("\"speech_final\":true") || json.contains("\"speech_final\": true");
     let is_final = json.contains("\"is_final\":true") || json.contains("\"is_final\": true");
     Some(StreamResult {
@@ -54,7 +54,7 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
     })
 }
 
-/// Connects to Deepgram WebSocket and streams audio chunks from `rx`.
+/// Connects to a real-time streaming WebSocket endpoint and streams audio chunks from `rx`.
 /// Directly types words into the active window in real-time as they are spoken.
 pub fn run_stream(
     cfg: &Config,
@@ -73,16 +73,24 @@ pub fn run_stream(
             return Err("cannot create HTTP session".into());
         }
 
-        let host_w = wide("api.deepgram.com");
-        let connect = WinHttpConnect(session, PCWSTR(host_w.as_ptr()), 443, 0);
+        let (host, port, secure, base_path) = crate::rest::parse_base_url(&cfg.base_url)
+            .unwrap_or_else(|_| ("api.deepgram.com".to_string(), 443, true, String::new()));
+        let host_w = wide(&host);
+        let connect = WinHttpConnect(session, PCWSTR(host_w.as_ptr()), port, 0);
         if connect.is_null() {
             let _ = WinHttpCloseHandle(session);
-            return Err("cannot connect to api.deepgram.com".into());
+            return Err(format!("cannot connect to {host}"));
         }
+
+        let prefix = if !base_path.is_empty() {
+            base_path
+        } else {
+            "/v1/listen".to_string()
+        };
 
         // endpointing=1500 allows natural relaxed pauses without abrupt cutoff
         let mut path = format!(
-            "/v1/listen?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500",
+            "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500",
             cfg.model
         );
         if !cfg.language.is_empty() {
@@ -114,7 +122,7 @@ pub fn run_stream(
             PCWSTR::null(),
             PCWSTR::null(),
             std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
+            if secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) },
         );
         if request.is_null() {
             let _ = WinHttpCloseHandle(connect);
@@ -130,7 +138,12 @@ pub fn run_stream(
             return Err("upgrade to websocket failed".into());
         }
 
-        let headers = format!("Authorization: Token {}\r\n", cfg.api_key);
+        let auth_prefix = if cfg.api_key.starts_with("Token ") || cfg.api_key.starts_with("Bearer ") {
+            ""
+        } else {
+            "Token "
+        };
+        let headers = format!("Authorization: {auth_prefix}{}\r\n", cfg.api_key);
         let headers_w = wide(&headers);
         let _ = WinHttpAddRequestHeaders(request, &headers_w[..headers_w.len() - 1], 0x2000_0000);
 
