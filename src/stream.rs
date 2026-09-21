@@ -1,20 +1,17 @@
 // Real-time streaming transcription for Deepgram over native WinHTTP WebSockets.
-// Streams raw 16 kHz 16-bit PCM in ~100ms packets, streams live tokens to screen,
-// and supports auto-stop via server-side endpointing and local VAD silence detection.
+// Directly types confirmed text input into the focused window via Win32 SendInput (KEYEVENTF_UNICODE).
+// Auto-stops smoothly when 2.0s of silence is detected.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::*;
 use windows::Win32::Networking::WinHttp::*;
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{w, PCWSTR};
 
 use crate::config::Config;
-
-pub const WM_APP_STREAM_TOKEN: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+use crate::paste;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -40,13 +37,11 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
     })
 }
 
-/// Runs a real-time streaming transcription session with Deepgram.
-/// Streams live tokens to the UI window via WM_APP_STREAM_TOKEN.
-/// Returns the finalized transcribed text.
+/// Runs a real-time streaming session with Deepgram.
+/// Directly types confirmed tokens into the active window.
 pub fn run_stream(
     cfg: &Config,
     stop: &Arc<AtomicBool>,
-    hwnd_bits: usize,
 ) -> Result<String, String> {
     unsafe {
         let session = WinHttpOpen(
@@ -67,8 +62,9 @@ pub fn run_stream(
             return Err("cannot connect to api.deepgram.com".into());
         }
 
+        // endpointing=1500ms allows natural relaxed speaking pauses
         let mut path = format!(
-            "/v1/listen?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=500",
+            "/v1/listen?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500",
             cfg.model
         );
         if !cfg.language.is_empty() {
@@ -140,13 +136,13 @@ pub fn run_stream(
         }
 
         let final_text = Arc::new(Mutex::new(String::new()));
-        let accumulated_text = Arc::new(Mutex::new(String::new()));
+        let typed_count = Arc::new(Mutex::new(0usize));
         let reader_done = Arc::new(AtomicBool::new(false));
 
-        // Reader thread: listens for incoming streaming tokens
+        // Reader thread: directly types confirmed tokens into the active window
         let ws_reader = ws as usize;
         let final_text_clone = final_text.clone();
-        let accum_clone = accumulated_text.clone();
+        let typed_clone = typed_count.clone();
         let stop_clone = stop.clone();
         let reader_done_clone = reader_done.clone();
 
@@ -171,29 +167,22 @@ pub fn run_stream(
                 let msg = String::from_utf8_lossy(&buf[..bytes_read as usize]);
                 if let Some(res) = parse_stream_json(&msg) {
                     if !res.transcript.is_empty() {
-                        let mut full_display = accum_clone.lock().unwrap().clone();
-                        if !full_display.is_empty() {
-                            full_display.push(' ');
-                        }
-                        full_display.push_str(&res.transcript);
-
-                        // Send live token to UI overlay
-                        let ptr = Box::into_raw(Box::new(full_display.clone()));
-                        let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
-                        let _ = PostMessageW(hwnd, WM_APP_STREAM_TOKEN, WPARAM(0), LPARAM(ptr as isize));
-
                         if res.is_final {
-                            let mut accum = accum_clone.lock().unwrap();
-                            if !accum.is_empty() {
-                                accum.push(' ');
+                            let mut full = final_text_clone.lock().unwrap();
+                            let mut chunk_to_type = res.transcript.clone();
+
+                            if !full.is_empty() {
+                                full.push(' ');
+                                chunk_to_type = format!(" {chunk_to_type}");
+                            } else {
+                                *full = chunk_to_type.clone();
                             }
-                            accum.push_str(&res.transcript);
-                            *final_text_clone.lock().unwrap() = accum.clone();
-                        } else {
-                            *final_text_clone.lock().unwrap() = full_display;
+
+                            // Directly type the confirmed text into the active window!
+                            let _ = paste::type_text(&chunk_to_type);
+                            *typed_clone.lock().unwrap() += chunk_to_type.len();
                         }
 
-                        // Auto-stop when server confirms end of speech
                         if res.speech_final {
                             stop_clone.store(true, Ordering::SeqCst);
                         }
@@ -202,7 +191,7 @@ pub fn run_stream(
             }
         });
 
-        // Capture and send audio packets via WASAPI with local VAD
+        // Capture and stream audio chunks via WASAPI with 2.0s silence VAD
         let stream_result = crate::audio::capture_stream(stop, cfg.max_seconds, |packet_i16| {
             let slice_u8 = std::slice::from_raw_parts(
                 packet_i16.as_ptr() as *const u8,
@@ -220,7 +209,7 @@ pub fn run_stream(
         let close_msg = b"{\"type\": \"CloseStream\"}";
         let _ = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Some(close_msg));
 
-        // Wait up to 350ms for final response
+        // Wait up to 350ms for final response from Deepgram
         let wait_deadline = Instant::now() + Duration::from_millis(350);
         while Instant::now() < wait_deadline && !reader_done.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(20));
@@ -238,7 +227,20 @@ pub fn run_stream(
             return Err(e);
         }
 
-        let result_text = final_text.lock().unwrap().trim().to_string();
-        Ok(result_text)
+        let full_text = final_text.lock().unwrap().trim().to_string();
+        let typed = *typed_count.lock().unwrap();
+
+        // If any text was finalized after CloseStream, type it
+        if full_text.len() > typed {
+            let remaining = &full_text[typed..];
+            let _ = paste::type_text(remaining);
+        }
+
+        // Add trailing space if configured
+        if cfg.trailing_space && !full_text.is_empty() {
+            let _ = paste::type_text(" ");
+        }
+
+        Ok(full_text)
     }
 }

@@ -1,6 +1,6 @@
-// Fancy animated glowing blue orb overlay with real-time streaming text for mnvoice.
+// Compact translucent glass orb with swirling fluid inside for mnvoice.
 // Rendered via Win32 layered window (UpdateLayeredWindow) with 32-bit premultiplied ARGB.
-// Centered at bottom-middle of the screen, just above the taskbar.
+// Centered right at the bottom edge of the screen, just above the taskbar.
 // Click-through, non-activating, zero interference with active apps.
 
 use windows::Win32::Foundation::*;
@@ -8,12 +8,13 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{w, PCWSTR};
 
-pub const ORB_WIDTH: i32 = 640;
-pub const ORB_HEIGHT: i32 = 160;
+pub const ORB_WIDTH: i32 = 56;
+pub const ORB_HEIGHT: i32 = 56;
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
 
-const ORB_CX: f32 = 320.0;
-const ORB_CY: f32 = 118.0;
+const ORB_CX: f32 = 28.0;
+const ORB_CY: f32 = 28.0;
+const ORB_RADIUS: f32 = 20.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OrbState {
@@ -25,12 +26,10 @@ pub struct Orb {
     hwnd: HWND,
     dc_mem: HDC,
     bitmap: HBITMAP,
-    font: HFONT,
     bits: *mut u32,
     pub state: OrbState,
     frame: u32,
     visible: bool,
-    text: String,
 }
 
 unsafe extern "system" fn orb_wndproc(
@@ -119,36 +118,14 @@ impl Orb {
 
             let _ = SelectObject(dc_mem, bitmap);
 
-            let font = CreateFontW(
-                -16,
-                0,
-                0,
-                0,
-                FW_SEMIBOLD.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                CLEARTYPE_QUALITY.0 as u32,
-                DEFAULT_PITCH.0 as u32,
-                windows::core::w!("Segoe UI"),
-            );
-            if !font.0.is_null() {
-                let _ = SelectObject(dc_mem, font);
-            }
-
             Ok(Self {
                 hwnd,
                 dc_mem,
                 bitmap,
-                font,
                 bits: bits_ptr as *mut u32,
                 state: OrbState::Recording,
                 frame: 0,
                 visible: false,
-                text: String::new(),
             })
         }
     }
@@ -156,22 +133,12 @@ impl Orb {
     pub fn show(&mut self, state: OrbState) {
         self.state = state;
         self.frame = 0;
-        self.text.clear();
         self.reposition();
         self.render_frame();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNA);
         }
         self.visible = true;
-    }
-
-    pub fn set_text(&mut self, text: &str) {
-        if self.text != text {
-            self.text = text.to_string();
-            if self.visible {
-                self.render_frame();
-            }
-        }
     }
 
     pub fn set_state(&mut self, state: OrbState) {
@@ -187,7 +154,6 @@ impl Orb {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
             self.visible = false;
-            self.text.clear();
         }
     }
 
@@ -221,18 +187,11 @@ impl Orb {
         let total_pixels = (ORB_WIDTH * ORB_HEIGHT) as usize;
         let buf = unsafe { std::slice::from_raw_parts_mut(self.bits, total_pixels) };
 
-        // 1. Procedural rendering of the blue orb
         match self.state {
-            OrbState::Recording => render_blue_recording(self.frame, buf),
-            OrbState::Transcribing => render_blue_loading(self.frame, buf),
+            OrbState::Recording => render_glass_fluid(self.frame, buf, false),
+            OrbState::Transcribing => render_glass_fluid(self.frame, buf, true),
         }
 
-        // 2. Render streaming text badge above the orb if present
-        if !self.text.is_empty() {
-            render_text_overlay(self.dc_mem, &self.text, buf);
-        }
-
-        // 3. Update layered window
         unsafe {
             let (pos_x, pos_y) = calc_position();
             let pt_dst = POINT { x: pos_x, y: pos_y };
@@ -266,9 +225,6 @@ impl Drop for Orb {
     fn drop(&mut self) {
         self.hide();
         unsafe {
-            if !self.font.0.is_null() {
-                let _ = DeleteObject(self.font);
-            }
             if !self.bitmap.0.is_null() {
                 let _ = DeleteObject(self.bitmap);
             }
@@ -294,8 +250,8 @@ fn calc_position() -> (i32, i32) {
     }
     let screen_w = work_area.right - work_area.left;
     let x = work_area.left + (screen_w - ORB_WIDTH) / 2;
-    // Lower position: sits just 8px above the taskbar / screen bottom
-    let y = (work_area.bottom - ORB_HEIGHT - 8).max(work_area.top);
+    // Sits right at the very bottom edge, 2px above taskbar
+    let y = (work_area.bottom - ORB_HEIGHT - 2).max(work_area.top);
     (x, y)
 }
 
@@ -324,30 +280,27 @@ fn pack_premul(r: f32, g: f32, b: f32, a: f32) -> u32 {
     (a_byte << 24) | (r_byte << 16) | (g_byte << 8) | b_byte
 }
 
-/// Recording: living blue/cyan orb with gentle breathing pulse and acoustic soundwave ripple.
-fn render_blue_recording(frame: u32, buf: &mut [u32]) {
-    let t = frame as f32 * 0.033;
+/// Render translucent glass sphere with undulating luminescent blue fluid inside.
+/// Pure blue aesthetic for both recording and loading.
+fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
+    let speed = if is_loading { 0.07 } else { 0.045 };
+    let t = frame as f32 * speed;
     let cx = ORB_CX;
     let cy = ORB_CY;
+    let r_sphere = ORB_RADIUS;
 
-    let pulse = 0.5 + 0.5 * (t * 3.5).sin();
-    let r_core = 17.0 + 3.0 * pulse;
+    let pulse = 0.5 + 0.5 * (t * 3.0).sin();
 
-    let wave = (t * 1.25).fract();
-    let r_wave = r_core + wave * 25.0;
-    let wave_alpha = (1.0 - wave) * (1.0 - wave) * 0.55;
-
-    // Clear entire buffer first
     buf.fill(0);
 
-    for y in 70..ORB_HEIGHT {
+    for y in 0..ORB_HEIGHT {
         let dy = y as f32 - cy + 0.5;
         let row_offset = (y * ORB_WIDTH) as usize;
-        for x in (ORB_WIDTH / 2 - 60)..(ORB_WIDTH / 2 + 60) {
+        for x in 0..ORB_WIDTH {
             let dx = x as f32 - cx + 0.5;
             let d_sq = dx * dx + dy * dy;
 
-            if d_sq > 54.0 * 54.0 {
+            if d_sq > (r_sphere + 5.0) * (r_sphere + 5.0) {
                 continue;
             }
 
@@ -357,195 +310,75 @@ fn render_blue_recording(frame: u32, buf: &mut [u32]) {
             let mut b = 0.0f32;
             let mut a = 0.0f32;
 
-            // 1. Ambient soft deep-blue aura
-            let aura = (-d_sq / 700.0).exp() * 0.35;
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.15, 0.45, 1.0, aura);
+            // 1. Ambient outer aura
+            let aura = (-d_sq / 360.0).exp() * 0.28;
+            add_light(&mut r, &mut g, &mut b, &mut a, 0.10, 0.45, 1.0, aura);
 
-            // 2. Core sphere: luminous cyan & cobalt blue gradient
-            if d < r_core + 2.5 {
-                let edge = ((r_core + 2.5 - d) / 2.5).clamp(0.0, 1.0);
-                let f = (d / r_core).clamp(0.0, 1.0);
-                let cr = 0.85 * (1.0 - f) + 0.10 * f;
-                let cg = 0.95 * (1.0 - f) + 0.60 * f;
-                let cb = 1.0;
-                let core_int = edge * (0.85 + 0.15 * pulse);
-                add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, core_int);
-            }
+            if d <= r_sphere + 1.5 {
+                let sphere_edge = ((r_sphere + 1.5 - d) / 2.0).clamp(0.0, 1.0);
+                let z = (0.0f32).max(1.0 - (d / r_sphere).powi(2)).sqrt();
+                let fresnel = (1.0 - z).powi(2);
 
-            // 3. Specular sheen (upper-left)
-            let hl_dx = dx + 5.0;
-            let hl_dy = dy + 5.0;
-            let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
-            let hl = (-hl_d_sq / 30.0).exp() * 0.55;
-            add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 1.0, 1.0, hl);
+                // --- FLUID INSIDE ---
+                // Fluid surface wave equation
+                let wave = (dx * 0.22 + t * 4.0).sin() * 2.4
+                    + (dx * 0.38 - t * 2.8).cos() * 1.4;
+                let fluid_surface_y = wave - 1.0; // slightly above equator
 
-            // 4. Acoustic soundwave ripple
-            let ring_dist = (d - r_wave).abs();
-            let ring_int = (-ring_dist * ring_dist / 6.0).exp() * wave_alpha;
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.25, 0.85, 1.0, ring_int);
+                // Fluid internal plasma swirl
+                let swirl = ((dx * 0.25 + (t * 2.2).sin()) * 1.4
+                    + (dy * 0.25 + (t * 2.2).cos()) * 1.4).sin();
 
-            buf[row_offset + x as usize] = pack_premul(r, g, b, a);
-        }
-    }
-}
+                // Depth below fluid surface
+                let depth = dy - fluid_surface_y;
 
-/// Loading/Transcribing: the same blue orb, smoothly glowing with a steady blue breathing pulse.
-/// (NO orange particles, NO fancy multi-colored constellation - pure blue theme).
-fn render_blue_loading(frame: u32, buf: &mut [u32]) {
-    let t = frame as f32 * 0.033;
-    let cx = ORB_CX;
-    let cy = ORB_CY;
+                if depth > -3.0 {
+                    // Inside fluid
+                    let fluid_mask = ((depth + 3.0) / 2.5).clamp(0.0, 1.0);
 
-    let pulse = 0.5 + 0.5 * (t * 5.0).sin();
-    let r_core = 16.0 + 2.5 * pulse;
+                    // Wave crest meniscus glow (bright cyan foam/luminescence)
+                    let meniscus = (-depth * depth / 4.5).exp() * 0.75;
+                    add_light(&mut r, &mut g, &mut b, &mut a, 0.40, 0.95, 1.0, meniscus * sphere_edge);
 
-    buf.fill(0);
+                    // Deep fluid body
+                    let body_intensity = (0.45 + 0.20 * swirl + 0.15 * pulse) * fluid_mask * sphere_edge;
+                    let cr = 0.05 * (1.0 - swirl * 0.5) + 0.15;
+                    let cg = 0.35 + 0.25 * swirl;
+                    let cb = 0.95;
+                    add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_intensity);
 
-    for y in 70..ORB_HEIGHT {
-        let dy = y as f32 - cy + 0.5;
-        let row_offset = (y * ORB_WIDTH) as usize;
-        for x in (ORB_WIDTH / 2 - 60)..(ORB_WIDTH / 2 + 60) {
-            let dx = x as f32 - cx + 0.5;
-            let d_sq = dx * dx + dy * dy;
-
-            if d_sq > 54.0 * 54.0 {
-                continue;
-            }
-
-            let d = d_sq.sqrt();
-            let mut r = 0.0f32;
-            let mut g = 0.0f32;
-            let mut b = 0.0f32;
-            let mut a = 0.0f32;
-
-            // 1. Ambient deep-blue aura
-            let aura = (-d_sq / 650.0).exp() * 0.40;
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.20, 0.55, 1.0, aura);
-
-            // 2. Concentric radiant pulse ring
-            let ring_dist = (d - (r_core + 8.0)).abs();
-            let ring_int = (-ring_dist * ring_dist / 8.0).exp() * (0.30 + 0.15 * pulse);
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.30, 0.80, 1.0, ring_int);
-
-            // 3. Core sphere: clean glowing electric blue
-            if d < r_core + 2.0 {
-                let edge = ((r_core + 2.0 - d) / 2.0).clamp(0.0, 1.0);
-                let f = (d / r_core).clamp(0.0, 1.0);
-                let cr = 0.90 * (1.0 - f) + 0.15 * f;
-                let cg = 0.95 * (1.0 - f) + 0.65 * f;
-                let cb = 1.0;
-                let core_int = edge * (0.80 + 0.20 * pulse);
-                add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, core_int);
-            }
-
-            // 4. Specular highlight
-            let hl_dx = dx + 4.5;
-            let hl_dy = dy + 4.5;
-            let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
-            let hl = (-hl_d_sq / 28.0).exp() * 0.50;
-            add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 1.0, 1.0, hl);
-
-            buf[row_offset + x as usize] = pack_premul(r, g, b, a);
-        }
-    }
-}
-
-/// Render a translucent dark rounded pill with Segoe UI text above the blue orb.
-fn render_text_overlay(dc: HDC, text: &str, buf: &mut [u32]) {
-    unsafe {
-        let mut text_w: Vec<u16> = text.encode_utf16().collect();
-        let mut size = SIZE::default();
-        let _ = GetTextExtentPoint32W(dc, &text_w, &mut size);
-
-        let max_text_w = 540;
-        let text_w_clamped = size.cx.clamp(40, max_text_w);
-        let pill_w = text_w_clamped + 36;
-        let pill_h = 36;
-        let pill_x = (ORB_WIDTH - pill_w) / 2;
-        let pill_y = 30;
-
-        // 1. Draw rounded translucent pill background directly into buffer
-        let pill_r = 14.0f32;
-        let px0 = pill_x as f32;
-        let py0 = pill_y as f32;
-        let px1 = (pill_x + pill_w) as f32;
-        let py1 = (pill_y + pill_h) as f32;
-
-        for y in pill_y..(pill_y + pill_h) {
-            let y_f = y as f32 + 0.5;
-            let row_offset = (y * ORB_WIDTH) as usize;
-            for x in pill_x..(pill_x + pill_w) {
-                let x_f = x as f32 + 0.5;
-
-                // Rounded corner distance
-                let dx = if x_f < px0 + pill_r {
-                    px0 + pill_r - x_f
-                } else if x_f > px1 - pill_r {
-                    x_f - (px1 - pill_r)
+                    // Fluid bubbles
+                    let bubble_y = (t * 8.0) % 24.0 - 12.0;
+                    let b_dist = ((dx - 3.5).powi(2) + (dy - bubble_y).powi(2)).sqrt();
+                    let bubble = (-b_dist * b_dist / 3.0).exp() * 0.65;
+                    add_light(&mut r, &mut g, &mut b, &mut a, 0.6, 0.95, 1.0, bubble * sphere_edge);
                 } else {
-                    0.0
-                };
-
-                let dy = if y_f < py0 + pill_r {
-                    py0 + pill_r - y_f
-                } else if y_f > py1 - pill_r {
-                    y_f - (py1 - pill_r)
-                } else {
-                    0.0
-                };
-
-                let d = (dx * dx + dy * dy).sqrt();
-                if d > pill_r {
-                    continue;
+                    // Vapor / empty space inside glass above fluid
+                    let vapor = (-d / r_sphere).exp() * 0.12 * sphere_edge;
+                    add_light(&mut r, &mut g, &mut b, &mut a, 0.15, 0.50, 0.95, vapor);
                 }
 
-                let edge = (pill_r - d).clamp(0.0, 1.0);
-                // Translucent dark slate pill: rgb(15, 20, 30), opacity 85%
-                let a = edge * 0.85;
-                let r = 0.06;
-                let g = 0.08;
-                let b = 0.12;
-                buf[row_offset + x as usize] = pack_premul(r, g, b, a);
+                // --- TRANSLUCENT GLASS SHELL ---
+                // 1. Fresnel edge glow (glass rim)
+                let rim = fresnel * (0.45 + 0.25 * pulse) * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.50, 0.88, 1.0, rim);
+
+                // 2. Primary glossy specular reflection (upper-left light source)
+                let hl_dx = dx + 6.0;
+                let hl_dy = dy + 7.0;
+                let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
+                let hl = (-hl_d_sq / 12.0).exp() * 0.92 * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 1.0, 1.0, hl);
+
+                // 3. Secondary bounce highlight (lower-right)
+                let hl2_dx = dx - 5.5;
+                let hl2_dy = dy - 6.0;
+                let hl2_d_sq = hl2_dx * hl2_dx + hl2_dy * hl2_dy;
+                let hl2 = (-hl2_d_sq / 18.0).exp() * 0.35 * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.35, 0.85, 1.0, hl2);
             }
-        }
 
-        // 2. Draw text using GDI
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, COLORREF(0x00FFFFFF));
-
-        let mut rect = RECT {
-            left: pill_x + 10,
-            top: pill_y,
-            right: pill_x + pill_w - 10,
-            bottom: pill_y + pill_h,
-        };
-
-        let _ = DrawTextW(
-            dc,
-            &mut text_w,
-            &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-
-        // 3. Fix alpha for text pixels (GDI draws RGB but leaves A=0)
-        for y in pill_y..(pill_y + pill_h) {
-            let row_offset = (y * ORB_WIDTH) as usize;
-            for x in pill_x..(pill_x + pill_w) {
-                let pixel = buf[row_offset + x as usize];
-                let b = (pixel & 0xFF) as u8;
-                let g = ((pixel >> 8) & 0xFF) as u8;
-                let r = ((pixel >> 16) & 0xFF) as u8;
-                let mut a = ((pixel >> 24) & 0xFF) as u8;
-
-                let text_val = r.max(g).max(b);
-                if text_val > a {
-                    a = text_val;
-                    buf[row_offset + x as usize] = ((a as u32) << 24)
-                        | ((r as u32) << 16)
-                        | ((g as u32) << 8)
-                        | (b as u32);
-                }
-            }
+            buf[row_offset + x as usize] = pack_premul(r, g, b, a);
         }
     }
 }
@@ -557,16 +390,16 @@ mod tests {
     #[test]
     fn test_render_recording_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_blue_recording(10, &mut buf);
+        render_glass_fluid(10, &mut buf, false);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 500, "Recording orb should render visible pixels");
+        assert!(non_zero > 300, "Glass fluid orb should render visible pixels");
     }
 
     #[test]
     fn test_render_loading_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_blue_loading(10, &mut buf);
+        render_glass_fluid(10, &mut buf, true);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 500, "Loading orb should render visible pixels");
+        assert!(non_zero > 300, "Glass fluid orb should render visible pixels");
     }
 }

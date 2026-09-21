@@ -156,8 +156,8 @@ pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
                     silence_ms = 0;
                 } else if speech_started {
                     silence_ms += 100;
-                    if silence_ms >= 1200 {
-                        // 1.2s silence after speech -> auto-stop!
+                    if silence_ms >= 2000 {
+                        // 2.0s silence after speech -> auto-stop!
                         stop.store(true, Ordering::SeqCst);
                     }
                 } else {
@@ -295,7 +295,7 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
                     silence_ms = 0;
                 } else if speech_started {
                     silence_ms += 100;
-                    if silence_ms >= 1200 {
+                    if silence_ms >= 2000 {
                         stop.store(true, Ordering::SeqCst);
                     }
                 }

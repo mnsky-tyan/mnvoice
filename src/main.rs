@@ -1,9 +1,9 @@
 #![windows_subsystem = "windows"]
 
 // mnvoice - push-to-talk dictation for Windows.
-// Alt+Space starts recording, speech is streamed in real-time to the screen,
-// auto-stops when silence is detected (or Esc stops), and text is pasted into
-// the focused window. Transcription runs via Deepgram Nova-3 or Groq.
+// Alt+Space starts recording, speech is streamed and typed directly into the focused window,
+// auto-stops when silence is detected (or Esc stops).
+// A compact translucent glass orb with flowing fluid inside indicates status at the screen bottom.
 
 mod audio;
 mod config;
@@ -245,17 +245,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
-            stream::WM_APP_STREAM_TOKEN => {
-                let ptr = lparam.0 as *mut String;
-                if !ptr.is_null() {
-                    let text = *Box::from_raw(ptr);
-                    let app = app_ref(hwnd);
-                    if let Some(orb) = &mut app.orb {
-                        orb.set_text(&text);
-                    }
-                }
-                LRESULT(0)
-            }
             WM_HOTKEY => {
                 let app = app_ref(hwnd);
                 match wparam.0 as i32 {
@@ -384,25 +373,22 @@ fn worker(
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     hwnd_bits: usize,
 ) {
-    let result = run_once(&stop, &cfg, hwnd_bits);
+    let result = run_once(&stop, &cfg);
     *outcome.lock().unwrap() = Some(result);
     let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
 }
 
-fn run_once(stop: &Arc<AtomicBool>, cfg: &config::Config, hwnd_bits: usize) -> (bool, String) {
-    // If Deepgram is the provider, use real-time streaming tokens on screen
+fn run_once(stop: &Arc<AtomicBool>, cfg: &config::Config) -> (bool, String) {
+    // 1. Direct streaming text input via Deepgram WebSocket
     if cfg.provider == config::Provider::Deepgram {
-        match stream::run_stream(cfg, stop, hwnd_bits) {
+        match stream::run_stream(cfg, stop) {
             Ok(text) => {
                 let text = text.trim().to_string();
                 if text.is_empty() {
                     return (false, "No speech detected".into());
                 }
-                if let Err(e) = paste::paste_text(&text, cfg.trailing_space) {
-                    log(&format!("paste error: {e}"));
-                    return (false, format!("Paste failed: {e}"));
-                }
+                // Text was typed directly into the active window via SendInput during streaming!
                 return (true, text);
             }
             Err(e) => {
@@ -411,7 +397,7 @@ fn run_once(stop: &Arc<AtomicBool>, cfg: &config::Config, hwnd_bits: usize) -> (
         }
     }
 
-    // Fallback batch mode
+    // 2. Fallback batch mode
     let samples = match audio::capture(stop, cfg.max_seconds) {
         Ok(s) => s,
         Err(e) => {
@@ -431,9 +417,12 @@ fn run_once(stop: &Arc<AtomicBool>, cfg: &config::Config, hwnd_bits: usize) -> (
             if text.is_empty() {
                 return (false, "No speech detected".into());
             }
-            if let Err(e) = paste::paste_text(&text, cfg.trailing_space) {
-                log(&format!("paste error: {e}"));
-                return (false, format!("Paste failed: {e}"));
+            if let Err(e) = paste::type_text(&text) {
+                log(&format!("type error: {e}"));
+                return (false, format!("Type failed: {e}"));
+            }
+            if cfg.trailing_space {
+                let _ = paste::type_text(" ");
             }
             (true, text)
         }
