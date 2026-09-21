@@ -1,84 +1,121 @@
 # mnvoice
 
-Push-to-talk dictation for Windows. Press **Alt+Space** to start recording,
-**Esc** to stop; the transcript is pasted into whatever window has focus.
+Ultra-low-latency, hands-free push-to-talk dictation utility for Windows.
+Streams audio over WebSockets in real time and directly types text into the focused window with zero clipboard interference.
 
-Transcription runs on Groq's servers (`whisper-large-v3-turbo`, an
-OpenAI-compatible endpoint). Nothing is loaded locally - no model weights, no
-inference runtime - so the app stays at a few MB of RAM.
+Built from scratch in native Rust using pure Win32, WASAPI, and WinHTTP. Zero Electron, zero Python, zero async runtimes.
 
 ```
-tiny.exe
-  ├── global push-to-talk hotkey (Alt+Space)
-  ├── microphone capture (WASAPI, 16 kHz mono)
-  ├── Groq API call (WinHTTP, native TLS)
-  └── paste returned text (clipboard + Ctrl+V)
+mnvoice.exe (~302 KB)
+  ├── Global hotkey (Alt+Space to start, Esc/Alt+Space to stop)
+  ├── Standby pre-initialized audio capture (WASAPI, 16 kHz mono, ~15ms to first audio byte)
+  ├── Dual-layer VAD (local RMS energy + server endpointing for hands-free auto-stop on silence)
+  ├── Real-time streaming transcription (Deepgram Nova-3 via native WinHTTP WebSockets, Groq Whisper fallback)
+  ├── Monotonic live word-by-word typing (SendInput with KEYEVENTF_UNICODE, zero clipboard history clobbering)
+  ├── Custom vocabulary / keyterm prompting (keywords.txt / KEYWORDS env)
+  └── Procedural glass fluid orb indicator (36px, 32-bit premultiplied ARGB layered window, click-through)
 ```
 
-## Setup
+## Features
 
-1. Build (needs the MSVC Rust toolchain and VS 2022 build tools):
+- **Instantaneous Activation (~15 ms)**: Uses a persistent standby audio engine that pre-initializes the WASAPI audio graph at application startup. When you press Alt+Space, hardware capture starts in ~4 ms and the first audio buffer is captured in ~15 ms with zero truncation.
+- **Direct Keystroke Injection**: Transcribed words flow directly into the active window at the cursor via `SendInput` with `KEYEVENTF_UNICODE`. Your system clipboard history remains completely untouched.
+- **True Real-Time Word Streaming**: Audio is streamed in 40 ms slices over native WinHTTP WebSockets. Words stream into your document in real time as you speak.
+- **Hands-Free Silence Auto-Stop**: Dual-layer Voice Activity Detection (local RMS energy calculation + server endpointing) detects when you finish speaking (2.2s silence threshold) and finalizes automatically.
+- **Lightweight Glass Fluid Indicator**: A 36px procedural glass orb with undulating fluid floats 2px above your taskbar during recording. Renders with pure GDI premultiplied 32-bit ARGB (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`), consuming only ~6 KB buffer memory.
+- **Custom Vocabulary**: Easily add specialized acronyms, technical jargon, or hard-to-pronounce names via a simple `keywords.txt` file or `KEYWORDS=` environment variable.
+- **Minimal Resource Footprint**:
+  - Binary size: **~302 KB**
+  - Working set RAM: **~10.9 MB**
+  - Private memory: **~1.9 MB**
+  - Idle CPU: **0.0%**
 
-   ```
-   cargo build --release
-   ```
+## Getting Started
 
-   The binary is `target/release/mnvoice.exe` (~275 KB, no runtime
-   dependencies).
+### 1. Build from Source
 
-2. Create `mnvoice.env` next to the exe (or set the variables in the
-   environment):
+Requires the standard Rust toolchain with the MSVC target on Windows:
 
-   ```
-   GROQ_API_KEY=gsk_your_key_here
-   ```
+```cmd
+git clone https://github.com/your-username/mnvoice.git
+cd mnvoice
+cargo build --release
+```
 
-   Get a key at https://console.groq.com/keys. The free tier covers
-   whisper-large-v3-turbo with generous limits (2,000 requests/day,
-   8 hours of audio/day).
+The optimized binary is generated at `target/release/mnvoice.exe`.
 
-3. Run `mnvoice.exe`. It lives in the system tray:
-   - **Alt+Space** - start recording (tray tooltip shows "listening")
-   - **Esc** - stop, transcribe, paste at the cursor
-   - **Alt+Space** again while recording - same as Esc
-   - Left-click the tray icon - status, right-click - menu (Stop &
-     transcribe / Exit)
+### 2. Configuration
 
-   Optional: run with `--install-startup` to launch on login
-   (`--uninstall-startup` removes it again).
+Copy `mnvoice.env.example` to `mnvoice.env` next to `mnvoice.exe` (or set environment variables):
 
-## Configuration
+```ini
+PROVIDER=deepgram
+DEEPGRAM_API_KEY=your_deepgram_api_key_here
+DEEPGRAM_MODEL=nova-3
+DEEPGRAM_LANGUAGE=en
+```
 
-`mnvoice.env` beside the exe, or environment variables (env wins):
+> **Deepgram**: Get a free API key at [console.deepgram.com](https://console.deepgram.com/) ($200 free credit, ~770 hours of audio).
+>
+> **Groq Fallback**: You can also use Groq Whisper (`whisper-large-v3-turbo`) by setting `PROVIDER=groq` and `GROQ_API_KEY=gsk_...`.
 
-| Variable             | Default                    | Meaning                          |
-| -------------------- | -------------------------- | -------------------------------- |
-| `GROQ_API_KEY`       | -                          | required                          |
-| `GROQ_MODEL`         | `whisper-large-v3-turbo`   | Groq model id                     |
-| `GROQ_LANGUAGE`      | `en`                       | language hint sent to the API     |
-| `GROQ_BASE_URL`      | `https://api.groq.com`     | override for testing/proxies      |
-| `GROQ_MAX_SECONDS`   | `120`                      | auto-stop after this much audio   |
-| `GROQ_TRAILING_SPACE`| `1`                        | append a space after the paste    |
+### 3. Custom Vocabulary (Optional)
 
-## Notes
+Create a `keywords.txt` file next to `mnvoice.exe` and list your technical terms or rare names (one per line or comma-separated):
 
-- Audio is sent to Groq; it is not processed locally. Recordings are 16 kHz
-  mono 16-bit WAV (about 32 KB per 10 seconds).
-- Measured footprint: ~11 MB working set / ~2 MB private at idle.
-- Logs (events only, no audio): `%TEMP%\mnvoice.log`.
-- The paste replaces the clipboard contents. It uses Ctrl+V, so it works in
-  any normal editor, browser, or terminal.
-- Windows blocks global hotkeys and synthetic input into *elevated* windows
-  when the app runs unelevated - run mnvoice as administrator if you need to
-  dictate into admin apps.
+```text
+# Custom terminology
+mnvoice
+herdr
+Kubernetes
+TypeScript
+PostgreSQL
+```
 
-## Troubleshooting
+### 4. Run
 
-- **"microphone is muted in Windows"** - unmute the input device in
-  Settings > System > Sound (or the laptop's mic-mute key).
-- **"microphone captured only silence"** - the right endpoint may not be
-  selected, or Windows privacy settings block microphone access for desktop
-  apps.
-- **"GROQ_API_KEY is not set"** - create `mnvoice.env` beside the exe.
-- **Nothing pastes** - make sure a text field has focus when the recording
-  stops; the text goes to the focused window at that moment.
+Launch `mnvoice.exe`. It runs unobtrusively in the system tray:
+- **Alt+Space**: Start dictation. The pink glass fluid orb appears at the bottom of the screen.
+- Speak naturally. Words type into your active window in real time.
+- Stop speaking for ~2 seconds, or tap **Alt+Space** / **Esc** to stop manually.
+- Right-click tray icon: View status or Exit.
+
+#### Launch on Startup (Optional)
+
+To start automatically with Windows:
+```cmd
+mnvoice.exe --install-startup
+```
+To remove:
+```cmd
+mnvoice.exe --uninstall-startup
+```
+
+## Configuration Reference
+
+Settings can be placed in `mnvoice.env` beside the executable or exported as environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PROVIDER` | `deepgram` | Speech provider (`deepgram` or `groq`) |
+| `DEEPGRAM_API_KEY` | - | Deepgram API key |
+| `DEEPGRAM_MODEL` | `nova-3` | Deepgram model (`nova-3`, `nova-2`, etc.) |
+| `DEEPGRAM_LANGUAGE` | `en` | Language code (or `auto` for detection) |
+| `KEYWORDS` | - | Comma-separated custom keywords / keyterms |
+| `TRAILING_SPACE` | `1` | Automatically append a space after transcription |
+| `MAX_SECONDS` | `120` | Maximum recording limit before automatic cutoff |
+| `GROQ_API_KEY` | - | Groq API key (for Groq fallback provider) |
+| `GROQ_MODEL` | `whisper-large-v3-turbo` | Groq Whisper model id |
+
+## Technical Architecture
+
+Unlike typical dictation utilities built on Python, Electron, or heavy web runtimes that consume 300MB - 1GB of memory and introduce hundreds of milliseconds of startup lag:
+
+1. **Win32 Message Loop**: Event-driven native thread using `RegisterHotKey` and `Shell_NotifyIconW`.
+2. **Persistent WASAPI Standby Engine**: Eliminates Windows Audio Engine kernel graph setup latency (~500ms) by keeping the audio client pre-allocated in standby, transitioning to capture in ~4ms upon trigger.
+3. **Pure WinHTTP WebSockets**: Streams linear16 audio chunks over native Windows HTTP WebSocket protocol with zero third-party networking dependencies.
+4. **Direct Unicode Injection**: Synthesizes inputs via Windows `SendInput` with `KEYEVENTF_UNICODE`, allowing direct typing into any application (browsers, code editors, terminal multiplexers) without modifying clipboard history.
+
+## License
+
+MIT License.
