@@ -2,12 +2,13 @@
 
 // mnvoice - push-to-talk dictation for Windows.
 // Alt+Space starts recording, Esc stops and transcribes, text is pasted
-// into the focused window. Transcription runs on Groq's servers
-// (whisper-large-v3-turbo), so nothing heavy is loaded locally.
+// into the focused window. Transcription runs on Deepgram Nova-3 or Groq
+// whisper-large-v3-turbo, so nothing heavy is loaded locally.
 
 mod audio;
 mod config;
 mod groq;
+mod orb;
 mod paste;
 
 use std::fs::OpenOptions;
@@ -26,8 +27,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIF_GUID, NIF_ICON, NIF_INFO,
-    NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIF_GUID, NIF_ICON,
+    NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -38,6 +39,7 @@ const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_ESC: i32 = 2;
 const IDM_STOP: usize = 1;
 const IDM_EXIT: usize = 2;
+const TIMER_ORB: usize = 101;
 
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
 const WINDOW_NAME: PCWSTR = w!("mnvoice");
@@ -63,6 +65,7 @@ struct App {
     stop: Arc<AtomicBool>,
     /// (ok, message) from the worker thread, consumed on WM_APP_WORKER.
     outcome: Arc<Mutex<Option<(bool, String)>>>,
+    orb: Option<orb::Orb>,
 }
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -119,10 +122,10 @@ fn main() {
     ));
 
     unsafe {
-        let hinstance = GetModuleHandleW(None).unwrap_or_default();
+        let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
-            hInstance: hinstance.into(),
+            hInstance: hinstance,
             lpszClassName: CLASS_NAME,
             ..Default::default()
         };
@@ -131,7 +134,7 @@ fn main() {
             return;
         }
 
-        let init = Box::into_raw(Box::new(AppInit { config }));
+        let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS_NAME,
@@ -174,6 +177,7 @@ fn main() {
 
 struct AppInit {
     config: Option<config::Config>,
+    instance: HINSTANCE,
 }
 
 fn app_ref(hwnd: HWND) -> &'static mut App {
@@ -212,45 +216,34 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-unsafe fn balloon(hwnd: HWND, title: &str, text: &str, error: bool) {
-    let mut nid = NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
-        uID: 1,
-        uFlags: NIF_INFO | NIF_TIP | NIF_GUID,
-        guidItem: TRAY_GUID,
-        dwInfoFlags: if error { NIIF_ERROR } else { NIIF_INFO },
-        ..Default::default()
-    };
-    let tip_w = wide("mnvoice");
-    let nt = tip_w.len().min(nid.szTip.len());
-    nid.szTip[..nt].copy_from_slice(&tip_w[..nt]);
-
-    let title_w = wide(title);
-    let nt = title_w.len().min(nid.szInfoTitle.len());
-    nid.szInfoTitle[..nt].copy_from_slice(&title_w[..nt]);
-
-    let info_w = wide(text);
-    let ni = info_w.len().min(nid.szInfo.len());
-    nid.szInfo[..ni].copy_from_slice(&info_w[..ni]);
-
-    let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
-
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_CREATE => {
                 let cs = &*(lparam.0 as *const CREATESTRUCTW);
                 let init = Box::from_raw(cs.lpCreateParams as *mut AppInit);
+                let orb = orb::Orb::new(init.instance).map_err(|e| {
+                    log(&format!("orb init: {e}"));
+                    e
+                }).ok();
                 let app = Box::into_raw(Box::new(App {
                     hwnd,
                     state: State::Idle,
                     config: init.config,
                     stop: Arc::new(AtomicBool::new(false)),
                     outcome: Arc::new(Mutex::new(None)),
+                    orb,
                 }));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                if wparam.0 == TIMER_ORB {
+                    let app = app_ref(hwnd);
+                    if let Some(orb) = &mut app.orb {
+                        orb.tick();
+                    }
+                }
                 LRESULT(0)
             }
             WM_HOTKEY => {
@@ -280,17 +273,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let app = app_ref(hwnd);
                 let outcome = app.outcome.lock().unwrap().take();
                 if let Some((ok, message)) = outcome {
-                    // The recording is over: release Esc no matter how it
-                    // ended, otherwise the hotkey outlives the recording.
+                    // Recording is over: release Esc hotkey, stop animation, hide orb.
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
+                    let _ = KillTimer(hwnd, TIMER_ORB);
+                    if let Some(orb) = &mut app.orb {
+                        orb.hide();
+                    }
                     app.state = State::Idle;
                     let _ = set_tray_tip(hwnd, "mnvoice - idle");
                     if ok {
                         let preview: String = message.chars().take(200).collect();
-                        balloon(hwnd, "mnvoice", &preview, false);
                         log(&format!("transcribed: {preview}"));
                     } else {
-                        balloon(hwnd, "mnvoice - error", &message, true);
                         log(&format!("error: {message}"));
                     }
                 }
@@ -338,14 +332,13 @@ fn toggle(app: &mut App) {
     match app.state {
         State::Idle => {
             let Some(cfg) = app.config.clone() else {
-                let _ = unsafe { balloon(app.hwnd, "mnvoice - error", "API key not set - see mnvoice.env", true) };
+                log("API key not set in mnvoice.env");
                 return;
             };
             // Pre-flight before registering the Esc hotkey: a blocked mic
             // must not leave global hotkeys in a half-registered state.
             if let Err(e) = audio::preflight() {
                 log(&format!("preflight failed: {e}"));
-                let _ = unsafe { balloon(app.hwnd, "mnvoice - error", &e, true) };
                 return;
             }
             app.stop.store(false, Ordering::SeqCst);
@@ -357,14 +350,20 @@ fn toggle(app: &mut App) {
             if let Err(e) = unsafe { RegisterHotKey(app.hwnd, HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) } {
                 log(&format!("RegisterHotKey(Esc) failed: {e} - use Alt+Space to stop"));
             }
+            if let Some(orb) = &mut app.orb {
+                orb.show(orb::OrbState::Recording);
+            }
+            let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
             let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (Esc to stop)") };
-            let _ = unsafe { balloon(app.hwnd, "mnvoice", "Listening - Esc to stop", false) };
             log("recording started");
         }
         State::Recording => {
             app.stop.store(true, Ordering::SeqCst);
             app.state = State::Transcribing;
             let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
+            if let Some(orb) = &mut app.orb {
+                orb.set_state(orb::OrbState::Transcribing);
+            }
             let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - transcribing...") };
             log("recording stopped, transcribing");
         }
