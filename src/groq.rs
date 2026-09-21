@@ -249,6 +249,9 @@ fn groq_multipart_body(cfg: &Config, wav: &[u8]) -> Vec<u8> {
     field(&mut body, "model", &cfg.model);
     field(&mut body, "language", &cfg.language);
     field(&mut body, "response_format", "text");
+    if !cfg.keywords.is_empty() {
+        field(&mut body, "prompt", &cfg.keywords.join(", "));
+    }
     body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
     body.extend_from_slice(
         b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",

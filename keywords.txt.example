@@ -1,0 +1,11 @@
+# mnvoice custom vocabulary / keyterm hints
+# Add common words, rare jargon, technical terms, or names here (one per line or comma-separated).
+# These words are biased in real-time into the speech recognition engine.
+mnvoice
+herdr
+Deepgram
+TypeSafe
+WASAPI
+WSL
+Neovim
+tmux

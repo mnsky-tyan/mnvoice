@@ -113,11 +113,13 @@ fn main() {
             None
         }
     };
+    let kw_count = config.as_ref().map(|c| c.keywords.len()).unwrap_or(0);
     log(&format!(
-        "mnvoice started (pid {}, provider {:?}, model {})",
+        "mnvoice started (pid {}, provider {:?}, model {}, keywords: {})",
         unsafe { GetCurrentProcessId() },
         config.as_ref().map(|c| c.provider),
-        config.as_ref().map(|c| c.model.as_str()).unwrap_or("none")
+        config.as_ref().map(|c| c.model.as_str()).unwrap_or("none"),
+        kw_count
     ));
 
     unsafe {

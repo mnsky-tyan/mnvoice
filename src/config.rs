@@ -1,4 +1,5 @@
-// Configuration: environment variables first, then mnvoice.env next to the exe.
+// Configuration: environment variables first, then mnvoice.env next to the exe,
+// plus optional keywords.txt / vocabulary.txt for custom terminology.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -15,6 +16,7 @@ pub struct Config {
     pub base_url: String,
     pub max_seconds: u32,
     pub trailing_space: bool,
+    pub keywords: Vec<String>,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -28,6 +30,17 @@ pub fn load() -> Result<Config, String> {
     let mut base_url = String::new();
     let mut max_seconds = 120u32;
     let mut trailing_space = true;
+    let mut keywords: Vec<String> = Vec::new();
+
+    // Check for keywords.txt / vocabulary.txt beside the executable
+    if let Ok(exe) = std::env::current_exe() {
+        for filename in ["keywords.txt", "vocabulary.txt", "words.txt"] {
+            let path = exe.with_file_name(filename);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                parse_keywords_text(&text, &mut keywords);
+            }
+        }
+    }
 
     // Lowest priority: mnvoice.env beside the executable.
     if let Ok(exe) = std::env::current_exe() {
@@ -46,6 +59,7 @@ pub fn load() -> Result<Config, String> {
                     &mut base_url,
                     &mut max_seconds,
                     &mut trailing_space,
+                    &mut keywords,
                 )
             });
         }
@@ -71,6 +85,9 @@ pub fn load() -> Result<Config, String> {
     }
     if let Ok(v) = std::env::var("TRAILING_SPACE").or_else(|_| std::env::var("GROQ_TRAILING_SPACE")) {
         trailing_space = v != "0";
+    }
+    if let Ok(v) = std::env::var("KEYWORDS").or_else(|_| std::env::var("KEYTERMS")) {
+        parse_keywords_text(&v, &mut keywords);
     }
 
     // Determine provider
@@ -134,7 +151,21 @@ pub fn load() -> Result<Config, String> {
         base_url,
         max_seconds,
         trailing_space,
+        keywords,
     })
+}
+
+pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        for part in line.split(',') {
+            let word = part.trim();
+            if !word.is_empty() && !keywords.iter().any(|k| k.eq_ignore_ascii_case(word)) {
+                keywords.push(word.to_string());
+            }
+        }
+    }
 }
 
 fn parse<F: FnMut(&str, &str)>(text: &str, mut f: F) {
@@ -161,6 +192,7 @@ fn apply(
     base_url: &mut String,
     max_seconds: &mut u32,
     trailing_space: &mut bool,
+    keywords: &mut Vec<String>,
 ) {
     match k {
         "PROVIDER" => *provider = v.to_string(),
@@ -176,6 +208,27 @@ fn apply(
             if let Ok(n) = v.parse() { *max_seconds = n; }
         }
         "TRAILING_SPACE" | "GROQ_TRAILING_SPACE" => *trailing_space = v != "0",
+        "KEYWORDS" | "KEYTERMS" | "CUSTOM_WORDS" | "VOCABULARY" => {
+            parse_keywords_text(v, keywords);
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_keywords_text() {
+        let mut kw = Vec::new();
+        let input = "
+        # comment
+        mnvoice, herdr
+        Kubernetes
+        TypeScript, kubernetes
+        ";
+        parse_keywords_text(input, &mut kw);
+        assert_eq!(kw, vec!["mnvoice", "herdr", "Kubernetes", "TypeScript"]);
     }
 }

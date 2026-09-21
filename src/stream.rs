@@ -18,6 +18,22 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+pub fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push_str("%20"),
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
 pub struct StreamResult {
     pub transcript: String,
     pub is_final: bool,
@@ -75,6 +91,18 @@ pub fn run_stream(
             } else {
                 path.push_str("&language=");
                 path.push_str(&cfg.language);
+            }
+        }
+        for kw in &cfg.keywords {
+            let trimmed = kw.trim();
+            if !trimmed.is_empty() {
+                let enc = url_encode(trimmed);
+                if cfg.model.contains("nova-3") {
+                    path.push_str("&keyterm=");
+                } else {
+                    path.push_str("&keywords=");
+                }
+                path.push_str(&enc);
             }
         }
         let path_w = wide(&path);
@@ -271,5 +299,17 @@ pub fn run_stream(
         }
 
         Ok(full_text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_encode() {
+        assert_eq!(url_encode("hello world"), "hello%20world");
+        assert_eq!(url_encode("C++"), "C%2B%2B");
+        assert_eq!(url_encode("mnvoice"), "mnvoice");
     }
 }
