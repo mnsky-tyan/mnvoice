@@ -1,6 +1,7 @@
-// Miniature translucent glass orb (28px) with swirling fluid inside for mnvoice.
+// Ethereal floating gas-fluid orb (36px) for mnvoice.
+// Simulates a supercritical fluid / zero-gravity luminescent gas nebula inside a translucent glass sphere.
 // Rendered via Win32 layered window (UpdateLayeredWindow) with 32-bit premultiplied ARGB.
-// Sits unobtrusively right at the bottom edge of the screen, just above the taskbar.
+// Sits unobtrusively right at the bottom edge of the screen, 2px above the taskbar.
 // Click-through, non-activating, zero interference with active apps.
 
 use windows::Win32::Foundation::*;
@@ -8,13 +9,13 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{w, PCWSTR};
 
-pub const ORB_WIDTH: i32 = 40;
-pub const ORB_HEIGHT: i32 = 40;
+pub const ORB_WIDTH: i32 = 48;
+pub const ORB_HEIGHT: i32 = 48;
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
 
-const ORB_CX: f32 = 20.0;
-const ORB_CY: f32 = 20.0;
-const ORB_RADIUS: f32 = 14.0;
+const ORB_CX: f32 = 24.0;
+const ORB_CY: f32 = 24.0;
+const ORB_RADIUS: f32 = 18.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OrbState {
@@ -188,8 +189,8 @@ impl Orb {
         let buf = unsafe { std::slice::from_raw_parts_mut(self.bits, total_pixels) };
 
         match self.state {
-            OrbState::Recording => render_glass_fluid(self.frame, buf, false),
-            OrbState::Transcribing => render_glass_fluid(self.frame, buf, true),
+            OrbState::Recording => render_gas_fluid(self.frame, buf, false),
+            OrbState::Transcribing => render_gas_fluid(self.frame, buf, true),
         }
 
         unsafe {
@@ -280,15 +281,13 @@ fn pack_premul(r: f32, g: f32, b: f32, a: f32) -> u32 {
     (a_byte << 24) | (r_byte << 16) | (g_byte << 8) | b_byte
 }
 
-/// Render miniature translucent glass sphere (28px) with undulating luminescent blue fluid inside.
-fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
-    let speed = if is_loading { 0.075 } else { 0.045 };
+/// Render 36px translucent glass sphere with floating zero-gravity gas-fluid nebula inside.
+fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
+    let speed = if is_loading { 0.065 } else { 0.038 };
     let t = frame as f32 * speed;
     let cx = ORB_CX;
     let cy = ORB_CY;
     let r_sphere = ORB_RADIUS;
-
-    let pulse = 0.5 + 0.5 * (t * 3.0).sin();
 
     buf.fill(0);
 
@@ -299,7 +298,7 @@ fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
             let dx = x as f32 - cx + 0.5;
             let d_sq = dx * dx + dy * dy;
 
-            if d_sq > (r_sphere + 4.0) * (r_sphere + 4.0) {
+            if d_sq > (r_sphere + 5.0) * (r_sphere + 5.0) {
                 continue;
             }
 
@@ -310,67 +309,76 @@ fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
             let mut a = 0.0f32;
 
             // 1. Ambient outer aura
-            let aura = (-d_sq / 180.0).exp() * 0.28;
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.12, 0.48, 1.0, aura);
+            let aura = (-d_sq / 260.0).exp() * 0.28;
+            add_light(&mut r, &mut g, &mut b, &mut a, 0.12, 0.45, 1.0, aura);
 
             if d <= r_sphere + 1.2 {
                 let sphere_edge = ((r_sphere + 1.2 - d) / 1.5).clamp(0.0, 1.0);
                 let z = (0.0f32).max(1.0 - (d / r_sphere).powi(2)).sqrt();
                 let fresnel = (1.0 - z).powi(2);
 
-                // --- FLUID INSIDE ---
-                let wave = (dx * 0.32 + t * 4.0).sin() * 1.6
-                    + (dx * 0.55 - t * 2.8).cos() * 0.9;
-                let fluid_surface_y = wave - 0.5;
+                // --- ZERO-GRAVITY GAS-FLUID NEBULA FLOATING ALL AROUND THE SPHERE ---
+                let nx = dx / r_sphere;
+                let ny = dy / r_sphere;
+                let r_norm = d / r_sphere;
+                let angle = ny.atan2(nx);
 
-                let swirl = ((dx * 0.35 + (t * 2.2).sin()) * 1.4
-                    + (dy * 0.35 + (t * 2.2).cos()) * 1.4).sin();
+                // Swirling convective gas vortices
+                let rot1 = angle + t * 1.8 + (r_norm * 3.5);
+                let g1 = (rot1 * 2.0).sin() * (nx * 2.5 + t * 1.2).cos() + (ny * 2.5 - t * 1.5).sin();
 
-                let depth = dy - fluid_surface_y;
+                let rot2 = angle - t * 2.2 - (r_norm * 4.0);
+                let g2 = (rot2 * 3.0).cos() * (nx * 3.2 - t * 2.0).sin() + (ny * 3.0 + t * 1.8).cos();
 
-                if depth > -2.0 {
-                    // Inside fluid
-                    let fluid_mask = ((depth + 2.0) / 2.0).clamp(0.0, 1.0);
+                // Wispy turbulence / domain warping
+                let warp_x = nx + 0.30 * (ny * 4.0 + t * 2.5).sin();
+                let warp_y = ny + 0.30 * (nx * 4.0 - t * 2.0).cos();
+                let g3 = ((warp_x * 4.5 + t * 3.0).sin() + (warp_y * 4.5 - t * 2.8).cos()) * 0.5;
 
-                    // Wave crest meniscus glow (bright cyan foam/luminescence)
-                    let meniscus = (-depth * depth / 3.0).exp() * 0.75;
-                    add_light(&mut r, &mut g, &mut b, &mut a, 0.40, 0.95, 1.0, meniscus * sphere_edge);
+                let density = (0.42 + 0.28 * g1 + 0.22 * g2 + 0.18 * g3).clamp(0.0, 1.0);
+                let core_falloff = (1.0 - (r_norm * 0.85).powi(2)).clamp(0.0, 1.0);
+                let gas_volume = (density * core_falloff).powf(1.15);
 
-                    // Deep fluid body
-                    let body_intensity = (0.45 + 0.20 * swirl + 0.15 * pulse) * fluid_mask * sphere_edge;
-                    let cr = 0.05 * (1.0 - swirl * 0.5) + 0.15;
-                    let cg = 0.35 + 0.25 * swirl;
-                    let cb = 0.95;
-                    add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_intensity);
+                // Gas-fluid body (between liquid and gas)
+                let body_int = gas_volume * 0.88 * sphere_edge;
+                let cr = 0.08 + 0.20 * density;
+                let cg = 0.38 + 0.38 * density;
+                let cb = 0.98;
+                add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_int);
 
-                    // Fluid micro-bubble
-                    let bubble_y = (t * 7.0) % 18.0 - 9.0;
-                    let b_dist = ((dx - 2.5).powi(2) + (dy - bubble_y).powi(2)).sqrt();
-                    let bubble = (-b_dist * b_dist / 2.2).exp() * 0.65;
-                    add_light(&mut r, &mut g, &mut b, &mut a, 0.6, 0.95, 1.0, bubble * sphere_edge);
-                } else {
-                    let vapor = (-d / r_sphere).exp() * 0.12 * sphere_edge;
-                    add_light(&mut r, &mut g, &mut b, &mut a, 0.15, 0.50, 0.95, vapor);
-                }
+                // Luminous gas filaments & tendrils
+                let filament = (gas_volume * 1.55 - 0.32).clamp(0.0, 1.0);
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.45, 0.92, 1.0, filament * 0.70 * sphere_edge);
+
+                // Floating ion micro-sparks drifting in zero-g gas
+                let sp1_x = (t * 1.3).sin() * 6.5;
+                let sp1_y = (t * 1.7).cos() * 6.5;
+                let sp1 = (-((dx - sp1_x).powi(2) + (dy - sp1_y).powi(2)) / 3.8).exp() * 0.85;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.65, 0.95, 1.0, sp1 * sphere_edge);
+
+                let sp2_x = (t * 2.1 + 2.0).cos() * 8.0;
+                let sp2_y = (t * 1.5 + 1.0).sin() * 8.0;
+                let sp2 = (-((dx - sp2_x).powi(2) + (dy - sp2_y).powi(2)) / 3.2).exp() * 0.75;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.55, 0.90, 1.0, sp2 * sphere_edge);
 
                 // --- TRANSLUCENT GLASS SHELL ---
                 // Fresnel rim
-                let rim = fresnel * (0.45 + 0.25 * pulse) * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.50, 0.88, 1.0, rim);
+                let rim = fresnel * (0.48 + 0.20 * (t * 2.5).sin()) * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.48, 0.85, 1.0, rim);
 
-                // Primary specular highlight (upper-left)
-                let hl_dx = dx + 4.2;
-                let hl_dy = dy + 4.8;
+                // Primary specular highlight (upper-left curve)
+                let hl_dx = dx + 5.2;
+                let hl_dy = dy + 5.8;
                 let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
-                let hl = (-hl_d_sq / 7.0).exp() * 0.92 * sphere_edge;
+                let hl = (-hl_d_sq / 8.5).exp() * 0.95 * sphere_edge;
                 add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 1.0, 1.0, hl);
 
                 // Secondary bounce highlight (lower-right)
-                let hl2_dx = dx - 3.8;
-                let hl2_dy = dy - 4.2;
+                let hl2_dx = dx - 4.8;
+                let hl2_dy = dy - 5.2;
                 let hl2_d_sq = hl2_dx * hl2_dx + hl2_dy * hl2_dy;
-                let hl2 = (-hl2_d_sq / 10.0).exp() * 0.35 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.35, 0.85, 1.0, hl2);
+                let hl2 = (-hl2_d_sq / 13.0).exp() * 0.36 * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.35, 0.80, 1.0, hl2);
             }
 
             buf[row_offset + x as usize] = pack_premul(r, g, b, a);
@@ -385,16 +393,16 @@ mod tests {
     #[test]
     fn test_render_recording_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_glass_fluid(10, &mut buf, false);
+        render_gas_fluid(10, &mut buf, false);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 150, "Glass fluid orb should render visible pixels");
+        assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }
 
     #[test]
     fn test_render_loading_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_glass_fluid(10, &mut buf, true);
+        render_gas_fluid(10, &mut buf, true);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 150, "Glass fluid orb should render visible pixels");
+        assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }
 }
