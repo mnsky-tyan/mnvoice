@@ -155,9 +155,9 @@ pub fn capture_to_channel(
                 .ReleaseBuffer(frames)
                 .map_err(|e| format!("capture release ({e})"))?;
 
-            // Push 100ms chunks (1600 samples)
-            while sample_buf.len() >= 1600 {
-                let chunk: Vec<i16> = sample_buf.drain(..1600).collect();
+            // Push 40ms chunks (640 samples) for ultra-low latency streaming
+            while sample_buf.len() >= 640 {
+                let chunk: Vec<i16> = sample_buf.drain(..640).collect();
 
                 // Compute RMS for Voice Activity Detection
                 let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
@@ -167,13 +167,13 @@ pub fn capture_to_channel(
                     speech_started = true;
                     silence_ms = 0;
                 } else if speech_started {
-                    silence_ms += 100;
+                    silence_ms += 40;
                     if silence_ms >= 2200 {
                         // 2.2s silence after speech -> auto-stop!
                         stop.store(true, Ordering::SeqCst);
                     }
                 } else {
-                    no_speech_ms += 100;
+                    no_speech_ms += 40;
                     if no_speech_ms >= 10000 {
                         // 10s with no speech at all -> auto-stop!
                         stop.store(true, Ordering::SeqCst);

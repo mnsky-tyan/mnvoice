@@ -1,7 +1,6 @@
-// Real-time streaming transcription for Deepgram over native WinHTTP WebSockets.
-// Directly types confirmed text input into the focused window via Win32 SendInput (KEYEVENTF_UNICODE).
-// Auto-stops smoothly when 2.0s of silence is detected.
-// Receives pre-buffered audio chunks from the audio thread via an mpsc Receiver to guarantee zero truncation.
+// Real-time word-by-word streaming transcription for Deepgram over native WinHTTP WebSockets.
+// Directly types confirmed tokens into the active cursor in real-time as speech happens.
+// Monotonic forward-only word streaming with zero backspaces.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -40,7 +39,7 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
 }
 
 /// Connects to Deepgram WebSocket and streams audio chunks from `rx`.
-/// Any audio captured before the connection completed is immediately drained from `rx` and sent.
+/// Directly types words into the active window in real-time as they are spoken.
 pub fn run_stream(
     cfg: &Config,
     stop: &Arc<AtomicBool>,
@@ -65,7 +64,7 @@ pub fn run_stream(
             return Err("cannot connect to api.deepgram.com".into());
         }
 
-        // endpointing=1500 allows natural relaxed pauses without cutting off
+        // endpointing=1500 allows natural relaxed pauses without abrupt cutoff
         let mut path = format!(
             "/v1/listen?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500",
             cfg.model
@@ -138,20 +137,20 @@ pub fn run_stream(
             return Err("CompleteUpgrade failed".into());
         }
 
-        let final_text = Arc::new(Mutex::new(String::new()));
-        let typed_count = Arc::new(Mutex::new(0usize));
+        let full_transcript = Arc::new(Mutex::new(String::new()));
         let reader_done = Arc::new(AtomicBool::new(false));
 
-        // Reader thread: directly types confirmed tokens into the active window
+        // Reader thread: streams words token-by-token directly into active cursor
         let ws_reader = ws as usize;
-        let final_text_clone = final_text.clone();
-        let typed_clone = typed_count.clone();
+        let full_transcript_clone = full_transcript.clone();
         let stop_clone = stop.clone();
         let reader_done_clone = reader_done.clone();
 
         let reader_thread = thread::spawn(move || {
             let ws = ws_reader as *const std::ffi::c_void;
             let mut buf = vec![0u8; 16384];
+            let mut typed_word_count = 0usize;
+            let mut has_typed_any = false;
 
             while !reader_done_clone.load(Ordering::SeqCst) {
                 let mut bytes_read = 0u32;
@@ -169,21 +168,47 @@ pub fn run_stream(
 
                 let msg = String::from_utf8_lossy(&buf[..bytes_read as usize]);
                 if let Some(res) = parse_stream_json(&msg) {
-                    if !res.transcript.is_empty() {
+                    let trimmed = res.transcript.trim();
+                    if !trimmed.is_empty() {
+                        let words: Vec<&str> = trimmed.split_whitespace().collect();
+
                         if res.is_final {
-                            let mut full = final_text_clone.lock().unwrap();
-                            let mut chunk_to_type = res.transcript.clone();
+                            // Sentence/clause finalized: type all remaining words to the end
+                            if words.len() > typed_word_count {
+                                let remaining = &words[typed_word_count..];
+                                let mut to_type = remaining.join(" ");
+                                if has_typed_any {
+                                    to_type = format!(" {to_type}");
+                                }
+                                let _ = paste::type_text(&to_type);
+                                has_typed_any = true;
 
-                            if !full.is_empty() {
-                                full.push(' ');
-                                chunk_to_type = format!(" {chunk_to_type}");
-                            } else {
-                                *full = chunk_to_type.clone();
+                                let mut full = full_transcript_clone.lock().unwrap();
+                                if !full.is_empty() {
+                                    full.push(' ');
+                                }
+                                full.push_str(&remaining.join(" "));
                             }
+                            typed_word_count = 0; // reset for next clause
+                        } else {
+                            // Interim results: type completed words (all except the trailing partial word)
+                            if words.len() > 1 && words.len() - 1 > typed_word_count {
+                                let completed = &words[typed_word_count..words.len() - 1];
+                                let mut to_type = completed.join(" ");
+                                if has_typed_any {
+                                    to_type = format!(" {to_type}");
+                                }
+                                let _ = paste::type_text(&to_type);
+                                has_typed_any = true;
 
-                            // Directly type confirmed text into active window
-                            let _ = paste::type_text(&chunk_to_type);
-                            *typed_clone.lock().unwrap() += chunk_to_type.len();
+                                let mut full = full_transcript_clone.lock().unwrap();
+                                if !full.is_empty() {
+                                    full.push(' ');
+                                }
+                                full.push_str(&completed.join(" "));
+
+                                typed_word_count = words.len() - 1;
+                            }
                         }
 
                         if res.speech_final {
@@ -194,7 +219,7 @@ pub fn run_stream(
             }
         });
 
-        // Drain pre-buffered audio and stream live audio until stop is signaled or capture ends
+        // Drain audio chunks from channel and stream to Deepgram
         while !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(packet_i16) => {
@@ -220,14 +245,14 @@ pub fn run_stream(
             }
         }
 
-        // Close stream cleanly
+        // Signal close to Deepgram
         let close_msg = b"{\"type\": \"CloseStream\"}";
         let _ = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Some(close_msg));
 
         // Wait up to 350ms for final response
         let wait_deadline = Instant::now() + Duration::from_millis(350);
         while Instant::now() < wait_deadline && !reader_done.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(15));
         }
 
         reader_done.store(true, Ordering::SeqCst);
@@ -238,14 +263,7 @@ pub fn run_stream(
 
         let _ = reader_thread.join();
 
-        let full_text = final_text.lock().unwrap().trim().to_string();
-        let typed = *typed_count.lock().unwrap();
-
-        // If any text was finalized after CloseStream, type it
-        if full_text.len() > typed {
-            let remaining = &full_text[typed..];
-            let _ = paste::type_text(remaining);
-        }
+        let full_text = full_transcript.lock().unwrap().trim().to_string();
 
         // Add trailing space if configured
         if cfg.trailing_space && !full_text.is_empty() {

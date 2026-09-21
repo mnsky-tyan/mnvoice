@@ -1,6 +1,6 @@
-// Compact translucent glass orb with swirling fluid inside for mnvoice.
+// Miniature translucent glass orb (28px) with swirling fluid inside for mnvoice.
 // Rendered via Win32 layered window (UpdateLayeredWindow) with 32-bit premultiplied ARGB.
-// Centered right at the bottom edge of the screen, just above the taskbar.
+// Sits unobtrusively right at the bottom edge of the screen, just above the taskbar.
 // Click-through, non-activating, zero interference with active apps.
 
 use windows::Win32::Foundation::*;
@@ -8,13 +8,13 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{w, PCWSTR};
 
-pub const ORB_WIDTH: i32 = 56;
-pub const ORB_HEIGHT: i32 = 56;
+pub const ORB_WIDTH: i32 = 40;
+pub const ORB_HEIGHT: i32 = 40;
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
 
-const ORB_CX: f32 = 28.0;
-const ORB_CY: f32 = 28.0;
-const ORB_RADIUS: f32 = 20.0;
+const ORB_CX: f32 = 20.0;
+const ORB_CY: f32 = 20.0;
+const ORB_RADIUS: f32 = 14.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OrbState {
@@ -250,7 +250,7 @@ fn calc_position() -> (i32, i32) {
     }
     let screen_w = work_area.right - work_area.left;
     let x = work_area.left + (screen_w - ORB_WIDTH) / 2;
-    // Sits right at the very bottom edge, 2px above taskbar
+    // Anchored right at the bottom edge, 2px above taskbar
     let y = (work_area.bottom - ORB_HEIGHT - 2).max(work_area.top);
     (x, y)
 }
@@ -280,10 +280,9 @@ fn pack_premul(r: f32, g: f32, b: f32, a: f32) -> u32 {
     (a_byte << 24) | (r_byte << 16) | (g_byte << 8) | b_byte
 }
 
-/// Render translucent glass sphere with undulating luminescent blue fluid inside.
-/// Pure blue aesthetic for both recording and loading.
+/// Render miniature translucent glass sphere (28px) with undulating luminescent blue fluid inside.
 fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
-    let speed = if is_loading { 0.07 } else { 0.045 };
+    let speed = if is_loading { 0.075 } else { 0.045 };
     let t = frame as f32 * speed;
     let cx = ORB_CX;
     let cy = ORB_CY;
@@ -300,7 +299,7 @@ fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
             let dx = x as f32 - cx + 0.5;
             let d_sq = dx * dx + dy * dy;
 
-            if d_sq > (r_sphere + 5.0) * (r_sphere + 5.0) {
+            if d_sq > (r_sphere + 4.0) * (r_sphere + 4.0) {
                 continue;
             }
 
@@ -311,33 +310,30 @@ fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
             let mut a = 0.0f32;
 
             // 1. Ambient outer aura
-            let aura = (-d_sq / 360.0).exp() * 0.28;
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.10, 0.45, 1.0, aura);
+            let aura = (-d_sq / 180.0).exp() * 0.28;
+            add_light(&mut r, &mut g, &mut b, &mut a, 0.12, 0.48, 1.0, aura);
 
-            if d <= r_sphere + 1.5 {
-                let sphere_edge = ((r_sphere + 1.5 - d) / 2.0).clamp(0.0, 1.0);
+            if d <= r_sphere + 1.2 {
+                let sphere_edge = ((r_sphere + 1.2 - d) / 1.5).clamp(0.0, 1.0);
                 let z = (0.0f32).max(1.0 - (d / r_sphere).powi(2)).sqrt();
                 let fresnel = (1.0 - z).powi(2);
 
                 // --- FLUID INSIDE ---
-                // Fluid surface wave equation
-                let wave = (dx * 0.22 + t * 4.0).sin() * 2.4
-                    + (dx * 0.38 - t * 2.8).cos() * 1.4;
-                let fluid_surface_y = wave - 1.0; // slightly above equator
+                let wave = (dx * 0.32 + t * 4.0).sin() * 1.6
+                    + (dx * 0.55 - t * 2.8).cos() * 0.9;
+                let fluid_surface_y = wave - 0.5;
 
-                // Fluid internal plasma swirl
-                let swirl = ((dx * 0.25 + (t * 2.2).sin()) * 1.4
-                    + (dy * 0.25 + (t * 2.2).cos()) * 1.4).sin();
+                let swirl = ((dx * 0.35 + (t * 2.2).sin()) * 1.4
+                    + (dy * 0.35 + (t * 2.2).cos()) * 1.4).sin();
 
-                // Depth below fluid surface
                 let depth = dy - fluid_surface_y;
 
-                if depth > -3.0 {
+                if depth > -2.0 {
                     // Inside fluid
-                    let fluid_mask = ((depth + 3.0) / 2.5).clamp(0.0, 1.0);
+                    let fluid_mask = ((depth + 2.0) / 2.0).clamp(0.0, 1.0);
 
                     // Wave crest meniscus glow (bright cyan foam/luminescence)
-                    let meniscus = (-depth * depth / 4.5).exp() * 0.75;
+                    let meniscus = (-depth * depth / 3.0).exp() * 0.75;
                     add_light(&mut r, &mut g, &mut b, &mut a, 0.40, 0.95, 1.0, meniscus * sphere_edge);
 
                     // Deep fluid body
@@ -347,34 +343,33 @@ fn render_glass_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
                     let cb = 0.95;
                     add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_intensity);
 
-                    // Fluid bubbles
-                    let bubble_y = (t * 8.0) % 24.0 - 12.0;
-                    let b_dist = ((dx - 3.5).powi(2) + (dy - bubble_y).powi(2)).sqrt();
-                    let bubble = (-b_dist * b_dist / 3.0).exp() * 0.65;
+                    // Fluid micro-bubble
+                    let bubble_y = (t * 7.0) % 18.0 - 9.0;
+                    let b_dist = ((dx - 2.5).powi(2) + (dy - bubble_y).powi(2)).sqrt();
+                    let bubble = (-b_dist * b_dist / 2.2).exp() * 0.65;
                     add_light(&mut r, &mut g, &mut b, &mut a, 0.6, 0.95, 1.0, bubble * sphere_edge);
                 } else {
-                    // Vapor / empty space inside glass above fluid
                     let vapor = (-d / r_sphere).exp() * 0.12 * sphere_edge;
                     add_light(&mut r, &mut g, &mut b, &mut a, 0.15, 0.50, 0.95, vapor);
                 }
 
                 // --- TRANSLUCENT GLASS SHELL ---
-                // 1. Fresnel edge glow (glass rim)
+                // Fresnel rim
                 let rim = fresnel * (0.45 + 0.25 * pulse) * sphere_edge;
                 add_light(&mut r, &mut g, &mut b, &mut a, 0.50, 0.88, 1.0, rim);
 
-                // 2. Primary glossy specular reflection (upper-left light source)
-                let hl_dx = dx + 6.0;
-                let hl_dy = dy + 7.0;
+                // Primary specular highlight (upper-left)
+                let hl_dx = dx + 4.2;
+                let hl_dy = dy + 4.8;
                 let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
-                let hl = (-hl_d_sq / 12.0).exp() * 0.92 * sphere_edge;
+                let hl = (-hl_d_sq / 7.0).exp() * 0.92 * sphere_edge;
                 add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 1.0, 1.0, hl);
 
-                // 3. Secondary bounce highlight (lower-right)
-                let hl2_dx = dx - 5.5;
-                let hl2_dy = dy - 6.0;
+                // Secondary bounce highlight (lower-right)
+                let hl2_dx = dx - 3.8;
+                let hl2_dy = dy - 4.2;
                 let hl2_d_sq = hl2_dx * hl2_dx + hl2_dy * hl2_dy;
-                let hl2 = (-hl2_d_sq / 18.0).exp() * 0.35 * sphere_edge;
+                let hl2 = (-hl2_d_sq / 10.0).exp() * 0.35 * sphere_edge;
                 add_light(&mut r, &mut g, &mut b, &mut a, 0.35, 0.85, 1.0, hl2);
             }
 
@@ -392,7 +387,7 @@ mod tests {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
         render_glass_fluid(10, &mut buf, false);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 300, "Glass fluid orb should render visible pixels");
+        assert!(non_zero > 150, "Glass fluid orb should render visible pixels");
     }
 
     #[test]
@@ -400,6 +395,6 @@ mod tests {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
         render_glass_fluid(10, &mut buf, true);
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 300, "Glass fluid orb should render visible pixels");
+        assert!(non_zero > 150, "Glass fluid orb should render visible pixels");
     }
 }
