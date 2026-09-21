@@ -308,9 +308,9 @@ fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
             let mut b = 0.0f32;
             let mut a = 0.0f32;
 
-            // 1. Ambient outer aura
-            let aura = (-d_sq / 260.0).exp() * 0.28;
-            add_light(&mut r, &mut g, &mut b, &mut a, 0.12, 0.45, 1.0, aura);
+            // 1. Ambient soft pink aura
+            let aura = (-d_sq / 260.0).exp() * 0.26;
+            add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.18, 0.58, aura);
 
             if d <= r_sphere + 1.2 {
                 let sphere_edge = ((r_sphere + 1.2 - d) / 1.5).clamp(0.0, 1.0);
@@ -335,54 +335,55 @@ fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
                 let warp_y = ny + 0.30 * (nx * 4.0 - t * 2.0).cos();
                 let g3 = ((warp_x * 4.5 + t * 3.0).sin() + (warp_y * 4.5 - t * 2.8).cos()) * 0.5;
 
-                let density = (0.58 + 0.24 * g1 + 0.18 * g2 + 0.15 * g3).clamp(0.0, 1.0);
-                let core_falloff = (1.0 - (r_norm * 0.65).powi(3)).clamp(0.0, 1.0);
+                // Balanced, airy fluid density with breathing room
+                let density = (0.46 + 0.26 * g1 + 0.20 * g2 + 0.16 * g3).clamp(0.0, 1.0);
+                let core_falloff = (1.0 - (r_norm * 0.78).powi(2)).clamp(0.0, 1.0);
                 let gas_volume = density * core_falloff;
 
-                // Base volumetric fluid fill
-                let ambient_fluid = 0.28 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.08, 0.38, 1.0, ambient_fluid);
+                // Subtle ambient pink vapor fill
+                let ambient_fluid = 0.12 * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.15, 0.55, ambient_fluid);
 
-                // Rich swirling gas-fluid body (between liquid and gas)
-                let body_int = gas_volume * 0.92 * sphere_edge;
-                let cr = 0.06 + 0.18 * density;
-                let cg = 0.35 + 0.35 * density;
-                let cb = 1.0;
+                // Real vibrant hot pink fluid body
+                let body_int = gas_volume * 0.88 * sphere_edge;
+                let cr = 1.0;
+                let cg = 0.10 + 0.18 * density;
+                let cb = 0.50 + 0.28 * density;
                 add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_int);
 
-                // Luminous gas filaments & tendrils
-                let filament = (gas_volume * 1.40 - 0.25).clamp(0.0, 1.0);
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.42, 0.88, 1.0, filament * 0.72 * sphere_edge);
+                // Luminous neon pink filaments & tendrils
+                let filament = (gas_volume * 1.45 - 0.28).clamp(0.0, 1.0);
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.40, 0.78, filament * 0.72 * sphere_edge);
 
-                // Floating ion micro-sparks drifting in zero-g gas
+                // Floating pink-white ion sparks drifting in zero-g gas
                 let sp1_x = (t * 1.3).sin() * 6.5;
                 let sp1_y = (t * 1.7).cos() * 6.5;
                 let sp1 = (-((dx - sp1_x).powi(2) + (dy - sp1_y).powi(2)) / 3.8).exp() * 0.85;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.65, 0.95, 1.0, sp1 * sphere_edge);
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.70, 0.90, sp1 * sphere_edge);
 
                 let sp2_x = (t * 2.1 + 2.0).cos() * 8.0;
                 let sp2_y = (t * 1.5 + 1.0).sin() * 8.0;
                 let sp2 = (-((dx - sp2_x).powi(2) + (dy - sp2_y).powi(2)) / 3.2).exp() * 0.75;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.55, 0.90, 1.0, sp2 * sphere_edge);
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.55, 0.82, sp2 * sphere_edge);
 
                 // --- TRANSLUCENT GLASS SHELL ---
-                // Fresnel rim
-                let rim = fresnel * (0.48 + 0.20 * (t * 2.5).sin()) * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.48, 0.85, 1.0, rim);
+                // Rose crystal Fresnel rim
+                let rim = fresnel * (0.46 + 0.20 * (t * 2.5).sin()) * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.40, 0.75, rim);
 
-                // Primary specular highlight (upper-left curve)
+                // Primary specular highlight (crisp white with faint rose tint)
                 let hl_dx = dx + 5.2;
                 let hl_dy = dy + 5.8;
                 let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
                 let hl = (-hl_d_sq / 8.5).exp() * 0.95 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 1.0, 1.0, hl);
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.95, 0.98, hl);
 
-                // Secondary bounce highlight (lower-right)
+                // Secondary bounce highlight
                 let hl2_dx = dx - 4.8;
                 let hl2_dy = dy - 5.2;
                 let hl2_d_sq = hl2_dx * hl2_dx + hl2_dy * hl2_dy;
                 let hl2 = (-hl2_d_sq / 13.0).exp() * 0.36 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.35, 0.80, 1.0, hl2);
+                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.45, 0.70, hl2);
             }
 
             buf[row_offset + x as usize] = pack_premul(r, g, b, a);
