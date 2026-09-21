@@ -112,8 +112,9 @@ fn main() {
         }
     };
     log(&format!(
-        "mnvoice started (pid {}, model {})",
+        "mnvoice started (pid {}, provider {:?}, model {})",
         unsafe { GetCurrentProcessId() },
+        config.as_ref().map(|c| c.provider),
         config.as_ref().map(|c| c.model.as_str()).unwrap_or("none")
     ));
 
@@ -337,7 +338,7 @@ fn toggle(app: &mut App) {
     match app.state {
         State::Idle => {
             let Some(cfg) = app.config.clone() else {
-                let _ = unsafe { balloon(app.hwnd, "mnvoice - error", "GROQ_API_KEY not set - see mnvoice.env", true) };
+                let _ = unsafe { balloon(app.hwnd, "mnvoice - error", "API key not set - see mnvoice.env", true) };
                 return;
             };
             // Pre-flight before registering the Esc hotkey: a blocked mic
@@ -410,7 +411,7 @@ fn run_once(stop: &AtomicBool, cfg: &config::Config) -> (bool, String) {
             (true, text)
         }
         Err(e) => {
-            log(&format!("groq error: {e}"));
+            log(&format!("transcription error: {e}"));
             (false, e)
         }
     }
