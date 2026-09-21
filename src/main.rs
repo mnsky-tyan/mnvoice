@@ -346,10 +346,13 @@ fn toggle(app: &mut App) {
                 log("API key not set in mnvoice.env");
                 return;
             };
-            if let Err(e) = audio::preflight() {
-                log(&format!("preflight failed: {e}"));
-                return;
+
+            // Summon the orb IMMEDIATELY with zero perceptible latency
+            if let Some(orb) = &mut app.orb {
+                orb.show(orb::OrbState::Recording);
             }
+            let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
+
             app.stop.store(false, Ordering::SeqCst);
             let stop = app.stop.clone();
             let outcome = app.outcome.clone();
@@ -386,6 +389,16 @@ fn worker(
     hwnd_bits: usize,
 ) {
     let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
+
+    if let Err(e) = audio::preflight() {
+        log(&format!("preflight failed: {e}"));
+        *outcome.lock().unwrap() = Some((false, e));
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0));
+        }
+        return;
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_audio = stop.clone();
     let max_seconds = cfg.max_seconds;
