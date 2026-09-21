@@ -163,13 +163,13 @@ pub fn capture_to_channel(
                 let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
                 let rms = (sum_sq / chunk.len() as f64).sqrt();
 
-                if rms > 550.0 {
+                if rms > 350.0 {
                     speech_started = true;
                     silence_ms = 0;
                 } else if speech_started {
                     silence_ms += 100;
-                    if silence_ms >= 2000 {
-                        // 2.0s silence after speech -> auto-stop!
+                    if silence_ms >= 2200 {
+                        // 2.2s silence after speech -> auto-stop!
                         stop.store(true, Ordering::SeqCst);
                     }
                 } else {

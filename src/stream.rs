@@ -194,19 +194,29 @@ pub fn run_stream(
             }
         });
 
-        // Drain pre-buffered audio from channel and continue streaming live
-        while let Ok(packet_i16) = rx.recv_timeout(Duration::from_millis(50)) {
-            let slice_u8 = std::slice::from_raw_parts(
-                packet_i16.as_ptr() as *const u8,
-                packet_i16.len() * 2,
-            );
-            let send_res = WinHttpWebSocketSend(
-                ws,
-                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                Some(slice_u8),
-            );
-            if send_res != 0 || stop.load(Ordering::SeqCst) {
-                break;
+        // Drain pre-buffered audio and stream live audio until stop is signaled or capture ends
+        while !stop.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(packet_i16) => {
+                    let slice_u8 = std::slice::from_raw_parts(
+                        packet_i16.as_ptr() as *const u8,
+                        packet_i16.len() * 2,
+                    );
+                    let send_res = WinHttpWebSocketSend(
+                        ws,
+                        WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                        Some(slice_u8),
+                    );
+                    if send_res != 0 {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
             }
         }
 
