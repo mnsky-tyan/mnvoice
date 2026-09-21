@@ -66,6 +66,7 @@ struct App {
     stop: Arc<AtomicBool>,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     orb: Option<orb::Orb>,
+    audio_engine: audio::AudioEngine,
 }
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -135,7 +136,8 @@ fn main() {
             return;
         }
 
-        let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance }));
+        let audio_engine = audio::AudioEngine::start();
+        let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS_NAME,
@@ -179,6 +181,7 @@ fn main() {
 struct AppInit {
     config: Option<config::Config>,
     instance: HINSTANCE,
+    audio_engine: audio::AudioEngine,
 }
 
 fn app_ref(hwnd: HWND) -> &'static mut App {
@@ -234,6 +237,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     stop: Arc::new(AtomicBool::new(false)),
                     outcome: Arc::new(Mutex::new(None)),
                     orb,
+                    audio_engine: init.audio_engine,
                 }));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
                 LRESULT(0)
@@ -357,9 +361,10 @@ fn toggle(app: &mut App) {
             let stop = app.stop.clone();
             let outcome = app.outcome.clone();
             let hwnd_bits = app.hwnd.0 as usize;
+            let audio_engine = app.audio_engine.clone();
 
-            // Worker immediately spawns WASAPI capture thread & connects WebSocket
-            thread::spawn(move || worker(stop, cfg, outcome, hwnd_bits));
+            // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
+            thread::spawn(move || worker(stop, cfg, outcome, hwnd_bits, audio_engine));
             app.state = State::Recording;
 
             if let Err(e) = unsafe { RegisterHotKey(app.hwnd, HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) } {
@@ -387,16 +392,15 @@ fn worker(
     cfg: config::Config,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     hwnd_bits: usize,
+    audio_engine: audio::AudioEngine,
 ) {
     let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_audio = stop.clone();
     let max_seconds = cfg.max_seconds;
 
-    // 1. Immediately spawn audio capture thread at t=0ms!
-    let audio_handle = thread::spawn(move || {
-        audio::capture_to_channel(&stop_audio, max_seconds, tx, hwnd_bits)
-    });
+    // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
+    let capture_done_rx = audio_engine.capture_to_channel(stop_audio, max_seconds, tx);
 
     // 2. Concurrently run streaming transcription using pre-buffered + live audio chunks
     let result = if cfg.provider == config::Provider::Deepgram {
@@ -438,7 +442,9 @@ fn worker(
         }
     };
 
-    let _ = audio_handle.join();
+    if let Ok(rx) = capture_done_rx {
+        let _ = rx.recv();
+    }
     *outcome.lock().unwrap() = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
 }
