@@ -335,20 +335,24 @@ fn render_gas_fluid(frame: u32, buf: &mut [u32], is_loading: bool) {
                 let warp_y = ny + 0.30 * (nx * 4.0 - t * 2.0).cos();
                 let g3 = ((warp_x * 4.5 + t * 3.0).sin() + (warp_y * 4.5 - t * 2.8).cos()) * 0.5;
 
-                let density = (0.42 + 0.28 * g1 + 0.22 * g2 + 0.18 * g3).clamp(0.0, 1.0);
-                let core_falloff = (1.0 - (r_norm * 0.85).powi(2)).clamp(0.0, 1.0);
-                let gas_volume = (density * core_falloff).powf(1.15);
+                let density = (0.58 + 0.24 * g1 + 0.18 * g2 + 0.15 * g3).clamp(0.0, 1.0);
+                let core_falloff = (1.0 - (r_norm * 0.65).powi(3)).clamp(0.0, 1.0);
+                let gas_volume = density * core_falloff;
 
-                // Gas-fluid body (between liquid and gas)
-                let body_int = gas_volume * 0.88 * sphere_edge;
-                let cr = 0.08 + 0.20 * density;
-                let cg = 0.38 + 0.38 * density;
-                let cb = 0.98;
+                // Base volumetric fluid fill
+                let ambient_fluid = 0.28 * sphere_edge;
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.08, 0.38, 1.0, ambient_fluid);
+
+                // Rich swirling gas-fluid body (between liquid and gas)
+                let body_int = gas_volume * 0.92 * sphere_edge;
+                let cr = 0.06 + 0.18 * density;
+                let cg = 0.35 + 0.35 * density;
+                let cb = 1.0;
                 add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_int);
 
                 // Luminous gas filaments & tendrils
-                let filament = (gas_volume * 1.55 - 0.32).clamp(0.0, 1.0);
-                add_light(&mut r, &mut g, &mut b, &mut a, 0.45, 0.92, 1.0, filament * 0.70 * sphere_edge);
+                let filament = (gas_volume * 1.40 - 0.25).clamp(0.0, 1.0);
+                add_light(&mut r, &mut g, &mut b, &mut a, 0.42, 0.88, 1.0, filament * 0.72 * sphere_edge);
 
                 // Floating ion micro-sparks drifting in zero-g gas
                 let sp1_x = (t * 1.3).sin() * 6.5;
