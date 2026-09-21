@@ -38,11 +38,14 @@ pub fn preflight() -> Result<(), String> {
     }
 }
 
-/// Records until `stop` is set or `max_seconds` elapses.
-/// Returns mono 16 kHz i16 samples.
-pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> {
+/// Records in streaming chunks (~100ms packets) and invokes `on_chunk`.
+/// Includes automatic silence detection (VAD) to auto-stop when speech ends.
+pub fn capture_stream<F: FnMut(&[i16]) -> bool>(
+    stop: &AtomicBool,
+    max_seconds: u32,
+    mut on_chunk: F,
+) -> Result<(), String> {
     unsafe {
-        // COM may already be initialized on this thread; that is fine.
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -51,8 +54,6 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
             .GetDefaultAudioEndpoint(eCapture, eConsole)
             .map_err(|e| format!("no default microphone ({e})"))?;
 
-        // Fail fast with a clear message when the endpoint is muted;
-        // recording digital silence would only confuse.
         if let Ok(vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
             if let Ok(muted) = vol.GetMute() {
                 if muted.as_bool() {
@@ -74,9 +75,6 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
             cbSize: 0,
         };
 
-        // Preferred: ask the shared-mode engine to convert to 16 kHz mono
-        // 16-bit. IsFormatSupported is not a reliable gate (it can refuse a
-        // format that Initialize converts to happily), so just try it.
         let (format, native, mix_ptr) = if client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -90,10 +88,151 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
         {
             (desired, true, None)
         } else {
-            // Fall back to the device mix format on a fresh client and
-            // convert in software. Keep the pointer, not a copy: an
-            // extensible mix format carries 22 extra bytes that a copy
-            // would truncate.
+            client = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| format!("cannot open microphone ({e})"))?;
+            let mix_ptr = client
+                .GetMixFormat()
+                .map_err(|e| format!("GetMixFormat ({e})"))?;
+            let mix = *mix_ptr;
+            client
+                .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None)
+                .map_err(|e| format!("audio client init ({e})"))?;
+            (mix, false, Some(mix_ptr))
+        };
+        let block_align = format.nBlockAlign.max(1) as usize;
+
+        let capture_client: IAudioCaptureClient = client
+            .GetService()
+            .map_err(|e| format!("capture client ({e})"))?;
+        client.Start().map_err(|e| format!("capture start ({e})"))?;
+
+        let deadline = Instant::now() + Duration::from_secs(max_seconds as u64);
+        let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
+
+        // VAD state
+        let mut speech_started = false;
+        let mut silence_ms = 0u32;
+        let mut no_speech_ms = 0u32;
+
+        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let packet = capture_client
+                .GetNextPacketSize()
+                .map_err(|e| format!("capture read ({e})"))?;
+            if packet == 0 {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            let mut frames = packet;
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut dwflags = 0u32;
+            capture_client
+                .GetBuffer(&mut ptr, &mut frames, &mut dwflags, None, None)
+                .map_err(|e| format!("capture buffer ({e})"))?;
+            if frames > 0 && !ptr.is_null() {
+                let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
+                if native {
+                    for c in bytes.chunks_exact(2) {
+                        sample_buf.push(i16::from_le_bytes([c[0], c[1]]));
+                    }
+                } else if let Ok(s) = convert_mix(bytes, &format) {
+                    sample_buf.extend_from_slice(&s);
+                }
+            }
+            capture_client
+                .ReleaseBuffer(frames)
+                .map_err(|e| format!("capture release ({e})"))?;
+
+            // Send when we have at least 100ms (1600 samples)
+            while sample_buf.len() >= 1600 {
+                let chunk: Vec<i16> = sample_buf.drain(..1600).collect();
+
+                // Compute RMS for Voice Activity Detection
+                let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                let rms = (sum_sq / chunk.len() as f64).sqrt();
+
+                if rms > 550.0 {
+                    speech_started = true;
+                    silence_ms = 0;
+                } else if speech_started {
+                    silence_ms += 100;
+                    if silence_ms >= 1200 {
+                        // 1.2s silence after speech -> auto-stop!
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                } else {
+                    no_speech_ms += 100;
+                    if no_speech_ms >= 8000 {
+                        // 8s with no speech at all -> auto-stop!
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                }
+
+                if !on_chunk(&chunk) {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+        let _ = client.Stop();
+        if let Some(p) = mix_ptr {
+            CoTaskMemFree(Some(p as *const std::ffi::c_void));
+        }
+
+        if !sample_buf.is_empty() {
+            let _ = on_chunk(&sample_buf);
+        }
+
+        Ok(())
+    }
+}
+
+/// Records until `stop` is set or `max_seconds` elapses.
+/// Includes auto-stop on silence. Returns mono 16 kHz i16 samples.
+pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| format!("audio backend unavailable ({e})"))?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .map_err(|e| format!("no default microphone ({e})"))?;
+
+        if let Ok(vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+            if let Ok(muted) = vol.GetMute() {
+                if muted.as_bool() {
+                    return Err("microphone is muted in Windows (unmute it in Settings > System > Sound, or the mic-mute key)".into());
+                }
+            }
+        }
+        let mut client: IAudioClient = device
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| format!("cannot open microphone ({e})"))?;
+
+        let desired = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: 1,
+            nSamplesPerSec: SAMPLE_RATE,
+            nAvgBytesPerSec: SAMPLE_RATE * 2,
+            nBlockAlign: 2,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+
+        let (format, native, mix_ptr) = if client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                0,
+                0,
+                &desired,
+                None,
+            )
+            .is_ok()
+        {
+            (desired, true, None)
+        } else {
             client = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|e| format!("cannot open microphone ({e})"))?;
@@ -115,6 +254,10 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
 
         let deadline = Instant::now() + Duration::from_secs(max_seconds as u64);
         let mut raw: Vec<u8> = Vec::new();
+        let mut vad_buf: Vec<i16> = Vec::new();
+        let mut speech_started = false;
+        let mut silence_ms = 0u32;
+
         while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
             let packet = capture_client
                 .GetNextPacketSize()
@@ -132,10 +275,31 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
             if frames > 0 && !ptr.is_null() {
                 let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
                 raw.extend_from_slice(bytes);
+                if native {
+                    for c in bytes.chunks_exact(2) {
+                        vad_buf.push(i16::from_le_bytes([c[0], c[1]]));
+                    }
+                }
             }
             capture_client
                 .ReleaseBuffer(frames)
                 .map_err(|e| format!("capture release ({e})"))?;
+
+            // VAD check every 100ms
+            if vad_buf.len() >= 1600 {
+                let sum_sq: f64 = vad_buf.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                let rms = (sum_sq / vad_buf.len() as f64).sqrt();
+                vad_buf.clear();
+                if rms > 550.0 {
+                    speech_started = true;
+                    silence_ms = 0;
+                } else if speech_started {
+                    silence_ms += 100;
+                    if silence_ms >= 1200 {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
         }
         let _ = client.Stop();
         if let Some(p) = mix_ptr {
@@ -150,8 +314,6 @@ pub fn capture(stop: &AtomicBool, max_seconds: u32) -> Result<Vec<i16>, String> 
             convert_mix(&raw, &format)?
         };
 
-        // Digital silence means the mic is disabled or blocked; say so
-        // instead of sending a silent clip to the API.
         let peak = samples.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
         if peak < 50 {
             return Err("microphone captured only silence (check the input device and Windows mic privacy settings)".into());
@@ -173,7 +335,6 @@ fn convert_mix(raw: &[u8], fmt: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
         1 => false, // PCM
         3 => true,  // IEEE float
         0xFFFE => {
-            // WAVE_FORMAT_EXTENSIBLE: the real kind lives in SubFormat.
             let ext_ptr = fmt as *const WAVEFORMATEX as *const WAVEFORMATEXTENSIBLE;
             let sub = unsafe { (*ext_ptr).SubFormat };
             sub.data1 == 3
@@ -193,7 +354,6 @@ fn convert_mix(raw: &[u8], fmt: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
     }
     let frames = raw.len() / frame;
 
-    // Downmix to mono f32.
     let mut mono: Vec<f32> = Vec::with_capacity(frames);
     for f in 0..frames {
         let base = f * frame;
@@ -213,7 +373,6 @@ fn convert_mix(raw: &[u8], fmt: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
         mono.push(acc / channels as f32);
     }
 
-    // Linear resample to 16 kHz.
     let step = rate as f64 / SAMPLE_RATE as f64;
     let mut out = Vec::with_capacity((mono.len() as f64 / step) as usize + 1);
     let mut pos = 0f64;
@@ -237,15 +396,15 @@ pub fn wav_bytes(samples: &[i16]) -> Vec<u8> {
     v.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
     v.extend_from_slice(b"WAVEfmt ");
     v.extend_from_slice(&16u32.to_le_bytes());
-    v.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    v.extend_from_slice(&1u16.to_le_bytes()); // channels
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
     v.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
     v.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
-    v.extend_from_slice(&2u16.to_le_bytes()); // block align
-    v.extend_from_slice(&16u16.to_le_bytes()); // bits
+    v.extend_from_slice(&2u16.to_le_bytes());
+    v.extend_from_slice(&16u16.to_le_bytes());
     v.extend_from_slice(b"data");
     v.extend_from_slice(&(data_len as u32).to_le_bytes());
-    for s in samples {
+    for &s in samples {
         v.extend_from_slice(&s.to_le_bytes());
     }
     v

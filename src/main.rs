@@ -1,15 +1,16 @@
 #![windows_subsystem = "windows"]
 
 // mnvoice - push-to-talk dictation for Windows.
-// Alt+Space starts recording, Esc stops and transcribes, text is pasted
-// into the focused window. Transcription runs on Deepgram Nova-3 or Groq
-// whisper-large-v3-turbo, so nothing heavy is loaded locally.
+// Alt+Space starts recording, speech is streamed in real-time to the screen,
+// auto-stops when silence is detected (or Esc stops), and text is pasted into
+// the focused window. Transcription runs via Deepgram Nova-3 or Groq.
 
 mod audio;
 mod config;
 mod groq;
 mod orb;
 mod paste;
+mod stream;
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -63,7 +64,6 @@ struct App {
     state: State,
     config: Option<config::Config>,
     stop: Arc<AtomicBool>,
-    /// (ok, message) from the worker thread, consumed on WM_APP_WORKER.
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     orb: Option<orb::Orb>,
 }
@@ -100,7 +100,6 @@ fn main() {
         return;
     }
 
-    // Single instance: a second launch would fight over the global hotkey.
     let _mutex = unsafe { CreateMutexW(None, true, MUTEX_NAME) }.ok();
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log("second instance blocked, exiting");
@@ -246,6 +245,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            stream::WM_APP_STREAM_TOKEN => {
+                let ptr = lparam.0 as *mut String;
+                if !ptr.is_null() {
+                    let text = *Box::from_raw(ptr);
+                    let app = app_ref(hwnd);
+                    if let Some(orb) = &mut app.orb {
+                        orb.set_text(&text);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_HOTKEY => {
                 let app = app_ref(hwnd);
                 match wparam.0 as i32 {
@@ -262,7 +272,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let app = app_ref(hwnd);
                     let tip = match app.state {
                         State::Idle => "mnvoice - idle. Alt+Space to dictate.",
-                        State::Recording => "mnvoice - listening... (Esc stops)",
+                        State::Recording => "mnvoice - listening... (auto-stops on silence)",
                         State::Transcribing => "mnvoice - transcribing...",
                     };
                     let _ = set_tray_tip(hwnd, tip);
@@ -273,7 +283,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let app = app_ref(hwnd);
                 let outcome = app.outcome.lock().unwrap().take();
                 if let Some((ok, message)) = outcome {
-                    // Recording is over: release Esc hotkey, stop animation, hide orb.
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     let _ = KillTimer(hwnd, TIMER_ORB);
                     if let Some(orb) = &mut app.orb {
@@ -335,8 +344,6 @@ fn toggle(app: &mut App) {
                 log("API key not set in mnvoice.env");
                 return;
             };
-            // Pre-flight before registering the Esc hotkey: a blocked mic
-            // must not leave global hotkeys in a half-registered state.
             if let Err(e) = audio::preflight() {
                 log(&format!("preflight failed: {e}"));
                 return;
@@ -348,13 +355,13 @@ fn toggle(app: &mut App) {
             thread::spawn(move || worker(stop, cfg, outcome, hwnd_bits));
             app.state = State::Recording;
             if let Err(e) = unsafe { RegisterHotKey(app.hwnd, HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) } {
-                log(&format!("RegisterHotKey(Esc) failed: {e} - use Alt+Space to stop"));
+                log(&format!("RegisterHotKey(Esc) failed: {e}"));
             }
             if let Some(orb) = &mut app.orb {
                 orb.show(orb::OrbState::Recording);
             }
             let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
-            let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (Esc to stop)") };
+            let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (auto-stops on silence)") };
             log("recording started");
         }
         State::Recording => {
@@ -377,13 +384,34 @@ fn worker(
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     hwnd_bits: usize,
 ) {
-    let result = run_once(&stop, &cfg);
+    let result = run_once(&stop, &cfg, hwnd_bits);
     *outcome.lock().unwrap() = Some(result);
     let hwnd = HWND(hwnd_bits as *mut std::ffi::c_void);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
 }
 
-fn run_once(stop: &AtomicBool, cfg: &config::Config) -> (bool, String) {
+fn run_once(stop: &Arc<AtomicBool>, cfg: &config::Config, hwnd_bits: usize) -> (bool, String) {
+    // If Deepgram is the provider, use real-time streaming tokens on screen
+    if cfg.provider == config::Provider::Deepgram {
+        match stream::run_stream(cfg, stop, hwnd_bits) {
+            Ok(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return (false, "No speech detected".into());
+                }
+                if let Err(e) = paste::paste_text(&text, cfg.trailing_space) {
+                    log(&format!("paste error: {e}"));
+                    return (false, format!("Paste failed: {e}"));
+                }
+                return (true, text);
+            }
+            Err(e) => {
+                log(&format!("streaming error ({e}), falling back to batch"));
+            }
+        }
+    }
+
+    // Fallback batch mode
     let samples = match audio::capture(stop, cfg.max_seconds) {
         Ok(s) => s,
         Err(e) => {
@@ -394,7 +422,7 @@ fn run_once(stop: &AtomicBool, cfg: &config::Config) -> (bool, String) {
     let secs = samples.len() as f32 / audio::SAMPLE_RATE as f32;
     log(&format!("captured {secs:.1}s of audio"));
     if samples.is_empty() {
-        return (false, "No audio captured - is the microphone working?".into());
+        return (false, "No audio captured".into());
     }
     let wav = audio::wav_bytes(&samples);
     match groq::transcribe(cfg, &wav) {
@@ -426,15 +454,12 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, IDM_STOP, w!("Stop && transcribe"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
     if !recording {
-        // Grey out the stop item when nothing is being recorded.
         let _ = EnableMenuItem(menu, IDM_STOP as u32, MF_GRAYED);
     }
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
     let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
-    // Dismiss-the-menu trick: posting WM_NULL right after TrackPopupMenu
-    // makes the menu close when the mouse is released outside it.
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 }
 
@@ -461,7 +486,7 @@ fn install_startup(install: bool) -> Result<(), String> {
         "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
     )
     .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
-    .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+    .creation_flags(0x0800_0000)
     .status()
     .map_err(|e| e.to_string())?;
     if status.success() {
