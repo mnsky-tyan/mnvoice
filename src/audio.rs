@@ -20,6 +20,8 @@ pub const WM_APP_RECORDING_READY: u32 = windows::Win32::UI::WindowsAndMessaging:
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
     max_seconds: u32,
+    vad_silence_ms: u32,
+    vad_rms_threshold: f64,
     tx: Sender<Vec<i16>>,
     done_tx: Sender<Result<(), String>>,
 }
@@ -42,6 +44,8 @@ impl AudioEngine {
         &self,
         stop: Arc<AtomicBool>,
         max_seconds: u32,
+        vad_silence_ms: u32,
+        vad_rms_threshold: f64,
         tx: Sender<Vec<i16>>,
     ) -> Result<Receiver<Result<(), String>>, String> {
         let (done_tx, done_rx) = channel();
@@ -49,6 +53,8 @@ impl AudioEngine {
             .send(CaptureRequest {
                 stop,
                 max_seconds,
+                vad_silence_ms,
+                vad_rms_threshold,
                 tx,
                 done_tx,
             })
@@ -145,6 +151,8 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     let mut silence_ms = 0u32;
     let mut no_speech_ms = 0u32;
     let block_align = engine.format.nBlockAlign.max(1) as usize;
+    let vad_silence_ms = req.vad_silence_ms;
+    let vad_rms_threshold = req.vad_rms_threshold;
 
     while !req.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let packet = engine
@@ -183,19 +191,19 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
             let rms = (sum_sq / chunk.len() as f64).sqrt();
 
-            if rms > 350.0 {
+            if rms > vad_rms_threshold {
                 speech_started = true;
                 silence_ms = 0;
             } else if speech_started {
                 silence_ms += 40;
-                if silence_ms >= 2200 {
-                    // 2.2s silence after speech -> auto-stop!
+                if silence_ms >= vad_silence_ms {
+                    // silence after speech -> auto-stop
                     req.stop.store(true, Ordering::SeqCst);
                 }
             } else {
                 no_speech_ms += 40;
                 if no_speech_ms >= 10000 {
-                    // 10s with no speech at all -> auto-stop!
+                    // 10s with no speech at all -> auto-stop
                     req.stop.store(true, Ordering::SeqCst);
                 }
             }

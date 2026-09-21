@@ -423,7 +423,13 @@ fn worker(
     let max_seconds = cfg.max_seconds;
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
-    let capture_done_rx = audio_engine.capture_to_channel(stop_audio, max_seconds, tx);
+    let capture_done_rx = audio_engine.capture_to_channel(
+        stop_audio,
+        max_seconds,
+        cfg.vad_silence_ms,
+        cfg.vad_rms_threshold,
+        tx,
+    );
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
     let result = match cfg.protocol {

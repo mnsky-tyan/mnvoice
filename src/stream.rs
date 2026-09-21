@@ -88,9 +88,10 @@ pub fn run_stream(
             "/v1/listen".to_string()
         };
 
-        // endpointing=1500 allows natural relaxed pauses without abrupt cutoff
+        // no_delay=true: release words immediately without buffering for more context (Nova-3)
+        // vad_events=true: receive SpeechStarted/UtteranceEnd events from Deepgram's own VAD
         let mut path = format!(
-            "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500",
+            "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500&no_delay=true&vad_events=true&filler_words=true",
             cfg.model
         );
         if !cfg.language.is_empty() {

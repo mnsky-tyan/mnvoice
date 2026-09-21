@@ -20,10 +20,12 @@ pub struct Config {
     pub keywords: Vec<String>,
     pub orb_color: (f32, f32, f32),
     pub orb_fluid_level: f32,
-    pub hotkey: (u32, u32),       // (modifiers, vk)
+    pub hotkey: (u32, u32),
     pub hotkey_str: String,
-    pub cancel_key: (u32, u32),   // (modifiers, vk)
+    pub cancel_key: (u32, u32),
     pub cancel_key_str: String,
+    pub vad_silence_ms: u32,
+    pub vad_rms_threshold: f64,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -39,6 +41,8 @@ pub fn load() -> Result<Config, String> {
     let mut orb_fluid_str = String::new();
     let mut hotkey_str = String::new();
     let mut cancel_key_str = String::new();
+    let mut vad_silence_ms = 3000u32;
+    let mut vad_rms_threshold = 400.0f64;
 
     // Check for keywords.txt beside the executable
     if let Ok(exe) = std::env::current_exe() {
@@ -70,6 +74,8 @@ pub fn load() -> Result<Config, String> {
                     &mut orb_fluid_str,
                     &mut hotkey_str,
                     &mut cancel_key_str,
+                    &mut vad_silence_ms,
+                    &mut vad_rms_threshold,
                 )
             });
         }
@@ -127,6 +133,12 @@ pub fn load() -> Result<Config, String> {
     }
     if let Ok(v) = std::env::var("CANCEL_KEY").or_else(|_| std::env::var("CANCEL_HOTKEY")) {
         cancel_key_str = v;
+    }
+    if let Ok(v) = std::env::var("VAD_SILENCE_MS").or_else(|_| std::env::var("SILENCE_MS")) {
+        if let Ok(n) = v.parse() { vad_silence_ms = n; }
+    }
+    if let Ok(v) = std::env::var("VAD_RMS_THRESHOLD").or_else(|_| std::env::var("RMS_THRESHOLD")) {
+        if let Ok(n) = v.parse() { vad_rms_threshold = n; }
     }
 
     // Determine protocol: streaming vs rest
@@ -194,6 +206,8 @@ pub fn load() -> Result<Config, String> {
         hotkey_str: hotkey_actual_str,
         cancel_key,
         cancel_key_str: cancel_key_actual_str,
+        vad_silence_ms,
+        vad_rms_threshold,
     })
 }
 
@@ -237,6 +251,8 @@ fn apply(
     orb_fluid_str: &mut String,
     hotkey_str: &mut String,
     cancel_key_str: &mut String,
+    vad_silence_ms: &mut u32,
+    vad_rms_threshold: &mut f64,
 ) {
     match k {
         "PROTOCOL" | "MODE" | "PROVIDER" => *protocol_str = v.to_string(),
@@ -271,6 +287,12 @@ fn apply(
         "ORB_FLUID_LEVEL" | "ORB_FLUID_AMOUNT" | "FLUID_LEVEL" => *orb_fluid_str = v.to_string(),
         "HOTKEY" | "TRIGGER_HOTKEY" | "KEYBIND" => *hotkey_str = v.to_string(),
         "CANCEL_KEY" | "CANCEL_HOTKEY" => *cancel_key_str = v.to_string(),
+        "VAD_SILENCE_MS" | "SILENCE_MS" => {
+            if let Ok(n) = v.parse() { *vad_silence_ms = n; }
+        }
+        "VAD_RMS_THRESHOLD" | "RMS_THRESHOLD" => {
+            if let Ok(n) = v.parse() { *vad_rms_threshold = n; }
+        }
         _ => {}
     }
 }
