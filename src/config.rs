@@ -215,10 +215,7 @@ pub fn load() -> Result<Config, String> {
 
     // AUTO_UPDATE is opt-in: silently replacing a binary is a decision the user
     // must make, so absence and typos both mean "off".
-    let auto_update = matches!(
-        auto_update_str.trim().to_lowercase().as_str(),
-        "1" | "true" | "on" | "yes"
-    );
+    let auto_update = parse_auto_update(&auto_update_str);
 
     Ok(Config {
         protocol,
@@ -240,6 +237,12 @@ pub fn load() -> Result<Config, String> {
         strip_fillers,
         auto_update,
     })
+}
+
+/// Whether an `AUTO_UPDATE` value asks for automatic installs. Opt-in, so an
+/// empty string, a typo and every other spelling all mean "off".
+pub fn parse_auto_update(s: &str) -> bool {
+    matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
 
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
@@ -461,6 +464,16 @@ mod tests {
         assert_eq!(parse_fluid_level("1.0"), 1.0);
         assert_eq!(parse_fluid_level("150%"), 1.0);
         assert_eq!(parse_fluid_level("0.01"), 0.05);
+    }
+
+    #[test]
+    fn test_auto_update_is_opt_in_ignoring_typo_and_empty() {
+        for on in ["1", "true", "TRUE", " On ", "yes", "yes\n", "1 "] {
+            assert!(parse_auto_update(on), "{on:?} should arm auto-update");
+        }
+        for off in ["", "  ", "0", "false", "no", "off", "ture", "enabled"] {
+            assert!(!parse_auto_update(off), "{off:?} must not arm auto-update");
+        }
     }
 
     #[test]
