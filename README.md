@@ -253,6 +253,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `CANCEL_KEY` | `Escape` | Discard the recording mid-speech (`none` to disable) |
 | `FILLER_WORDS` | `0` | `0` strips "uh"/"um"/"erm", `1` keeps them verbatim |
 | `KEYWORDS` | - | Comma-separated vocabulary hints. `keywords.txt` beside the exe is auto-loaded too. |
+| `AUTO_UPDATE` | off | `1` installs a newer published release automatically. Off by default; see [Updates](#updates). |
 | `VAD_SILENCE_MS` | `3000` | Silence after speech that stops recording. Raise if it cuts you off. |
 | `VAD_RMS_THRESHOLD` | `400` | Mic energy counted as speech, `0`-`32767`. Raise if noise keeps it listening. |
 | `MAX_SECONDS` | `120` | Hard recording limit before forced stop |
@@ -276,6 +277,49 @@ Deepgram is the **recommended** provider rather than a requirement - the REST pa
 Provider-named aliases (`DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `DEEPGRAM_MODEL`, and so on) are also accepted for convenience.
 
 ---
+
+## Updates
+
+mnvoice can update itself. There is no installer and no package manager, so an
+update means: download the new `mnvoice.exe`, move the old one aside, put the new
+one in its place, relaunch.
+
+**Automatic.** Set `AUTO_UPDATE=1` in `mnvoice.env`. mnvoice then checks the
+release feed at most once per day, and only installs when it is idle - it will
+never swap the binary out from under a transcript in flight.
+
+It is off by default on purpose. Replacing a running binary is a decision you
+should make, not one that happens silently because a default pointed that way.
+Absence, an empty value, or a typo all mean off, so a misspelling cannot quietly
+switch it on.
+
+**Manual.** Tray menu > `Check for updates`. Same result, whenever you ask.
+
+**Your settings survive.** `mnvoice.env` and `keywords.txt` sit beside the exe as
+separate files and are never touched by an update, so your key, vocabulary and
+preferences carry across every version.
+
+### Verifying a download
+
+Every release publishes two files:
+
+| File | For |
+|---|---|
+| `mnvoice.exe` | Direct download, and what the updater fetches |
+| `mnvoice-windows-x64.zip` | `mnvoice.exe` + `mnvoice.env.example` + `keywords.txt.example` |
+
+Windows will show a SmartScreen prompt on the first run of any newly downloaded
+copy. That is a reputation check on an unsigned binary, not a virus detection -
+nothing has ever been flagged in mnvoice. To satisfy yourself, compare the hash:
+
+```powershell
+(Get-FileHash ~\Downloads\mnvoice.exe -Algorithm SHA256).Hash
+```
+
+The published SHA-256 for each release is in that release's notes. If they match,
+the file is exactly what CI built from the tagged public source. Because the
+update path fetches from the same release feed, a self-updated copy is verifiable
+the same way.
 
 ## Building from Source
 
