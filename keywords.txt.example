@@ -1,14 +1,15 @@
 # mnvoice custom vocabulary / keyterm hints
-# Add common words, rare jargon, technical terms, or names here (one per line or comma-separated).
-pi
-herdr
-chocobar
-mn
-AGENTS.md
-mnvoice
-Deepgram
-TypeSafe
-WASAPI
-WSL
-Neovim
-tmux
+# Copy to keywords.txt next to mnvoice.exe and add your own words.
+#
+# These words bias the speech model toward recognizing them correctly.
+# Use this for technical jargon, project names, acronyms, or names the
+# model tends to mishear. One word per line, or comma-separated.
+# Lines starting with # are comments.
+#
+# This file is intentionally empty - your keywords.txt is personal and is
+# gitignored so it never gets committed with the project.
+#
+# Example entries:
+# Kubernetes
+# PostgreSQL
+# TypeScript, PyInstaller

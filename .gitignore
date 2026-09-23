@@ -3,3 +3,8 @@
 mnvoice.env
 *.env
 *.log
+
+# Personal vocabulary stays local - never commit your own keyword list
+keywords.txt
+vocabulary.txt
+words.txt
