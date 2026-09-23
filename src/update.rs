@@ -11,16 +11,17 @@ use crate::rest;
 /// Repository that publishes mnvoice releases.
 const REPO: &str = "mnsky-tyan/mnvoice";
 
-/// The `releases/latest` **web** page.
+/// GitHub's release feed, `https://github.com/<repo>/releases.atom`.
 ///
 /// This deliberately avoids the GitHub REST API. Unauthenticated API calls are
 /// capped at 60 requests per hour *per source IP*, so on a shared, NAT'd or
 /// carrier-grade address that budget can already be spent by unrelated traffic
 /// and every check would fail with HTTP 403 - exactly the failure observed
-/// during verification. The web endpoint has no such limit, and WinHTTP follows
-/// its 302 redirect to the tag page, so the body already names the live
+/// during verification. The feed is served from the web endpoint: no per-IP
+/// quota, no token, and a small machine-readable document instead of a 200 KB
+/// page. Releases are listed newest first, so the first entry names the current
 /// version.
-const LATEST_PAGE: &str = "https://github.com/mnsky-tyan/mnvoice/releases/latest";
+const RELEASES_FEED: &str = "https://github.com/mnsky-tyan/mnvoice/releases.atom";
 
 /// Name of the standalone executable asset published alongside the zip.
 const EXE_ASSET: &str = "mnvoice.exe";
@@ -192,16 +193,16 @@ fn asset_url(tag: &str) -> String {
 
 /// Ask GitHub what the latest published version is, and where its exe lives.
 pub fn check_latest() -> Result<Release, String> {
-    check_latest_from(LATEST_PAGE)
+    check_latest_from(RELEASES_FEED)
 }
 
 /// The lookup proper, split out so the network path can be driven from a test
 /// endpoint without reaching github.com.
-fn check_latest_from(page_url: &str) -> Result<Release, String> {
-    let body = http_get(page_url, "text/html")?;
-    let page = String::from_utf8_lossy(&body);
+fn check_latest_from(feed_url: &str) -> Result<Release, String> {
+    let body = http_get(feed_url, "application/atom+xml")?;
+    let feed = String::from_utf8_lossy(&body);
     let version =
-        parse_version_from_page(&page).ok_or("latest-release page does not name a version")?;
+        parse_version_from_page(&feed).ok_or("release feed does not name a version")?;
     let tag = format!("v{version}");
     Ok(Release {
         version,
@@ -396,20 +397,29 @@ mod tests {
 
     // --- reading a release page -------------------------------------------
 
-    /// Shaped like the page github.com/.../releases/latest redirects to: its
-    /// canonical URL carries the tag, and the page is served over the web
-    /// endpoint rather than the rate-limited API.
-    fn sample_page() -> String {
-        r#"<!DOCTYPE html>
-        <html><head>
-        <link rel="canonical" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.11">
-        </head><body><h1>v0.1.11</h1></body></html>"#
+    /// Shaped like GitHub's real releases.atom: newest entry first, each one
+    /// carrying its tag as a `/releases/tag/vX` link, and the summary of older
+    /// releases escaping entities the way the feed does.
+    fn sample_feed() -> String {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en-US">
+          <id>tag:github.com,2008:https://github.com/mnsky-tyan/mnvoice/releases</id>
+          <title>Release notes from mnvoice</title>
+          <entry>
+            <id>tag:github.com,2008:https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.11</id>
+            <link rel="alternate" type="text/html" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.11"/>
+            <title>v0.1.11</title>
+          </entry>
+          <entry>
+            <id>tag:github.com,2008:https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.10</id>
+          </entry>
+        </feed>"#
             .to_string()
     }
 
     #[test]
     fn reads_the_tag_out_of_the_page_and_derives_the_exe_url() {
-        let version = parse_version_from_page(&sample_page()).unwrap();
+        let version = parse_version_from_page(&sample_feed()).unwrap();
         // The `v` is stripped so the tag can be compared against the version
         // build.rs baked from that same tag.
         assert_eq!(version, "0.1.11");
@@ -421,7 +431,7 @@ mod tests {
 
     #[test]
     fn a_published_tag_beats_the_version_the_binary_knows_itself_to_be() {
-        let version = parse_version_from_page(&sample_page()).unwrap();
+        let version = parse_version_from_page(&sample_feed()).unwrap();
         assert!(
             is_newer(&version, "0.1.10"),
             "a v0.1.10 build must recognise this release as the update it wants"
@@ -429,15 +439,27 @@ mod tests {
     }
 
     #[test]
-    fn a_page_with_no_tag_is_reported() {
+    fn a_feed_with_no_tag_is_reported() {
+        // A 404 or an error page names no tag, so the caller must hear about it
+        // rather than fall back to some assumed version.
         let page = "<!DOCTYPE html><html><body>404 Not Found</body></html>";
         assert!(parse_version_from_page(page).is_none());
+        assert!(parse_version_from_page("<feed><title>empty</title></feed>").is_none());
     }
 
     #[test]
     fn a_tag_written_without_the_v_still_resolves() {
-        let page = r#"<link rel="canonical" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/1.2.3">"#;
-        assert_eq!(parse_version_from_page(page).as_deref(), Some("1.2.3"));
+        let feed = r#"<entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/1.2.3"/></entry>"#;
+        assert_eq!(parse_version_from_page(feed).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn html_entities_in_the_feed_do_not_bleed_into_the_version() {
+        // The real feed writes an id as "...releases/tag/v0.1.10&#39;, <summary>",
+        // so the tag is followed immediately by an escaped entity. A scanner
+        // that ran past the digits and dots would swallow it into the version.
+        let feed = r#"<id>tag:github.com,2008:https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.10&#39;, older release</id>"#;
+        assert_eq!(parse_version_from_page(feed).as_deref(), Some("0.1.10"));
     }
 
     #[test]
@@ -475,7 +497,7 @@ mod tests {
                     let mut buf = [0u8; 8192];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
-                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n";
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/atom+xml\r\nConnection: close\r\n";
                     let _ = stream.write_all(
                         format!("{head}Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
                     );
@@ -499,7 +521,7 @@ mod tests {
 
     #[test]
     fn a_release_page_is_read_end_to_end_over_http() {
-        let feed = MockFeed::once(sample_page().as_bytes(), "mnsky-tyan/mnvoice/releases/latest");
+        let feed = MockFeed::once(sample_feed().as_bytes(), "mnsky-tyan/mnvoice/releases.atom");
         let rel = check_latest_from(&feed.url).unwrap();
         assert_eq!(rel.version, "0.1.11");
         assert_eq!(
@@ -510,7 +532,10 @@ mod tests {
         // Headers only take effect while the request is still being composed, so
         // the Accept and User-Agent headers have to be on the wire.
         let sent = feed.request().to_lowercase();
-        assert!(sent.contains("accept: text/html"), "request was: {sent}");
+        assert!(
+            sent.contains("accept: application/atom+xml"),
+            "request was: {sent}"
+        );
         assert!(sent.contains("user-agent: mnvoice-update"), "request was: {sent}");
     }
 
@@ -538,7 +563,7 @@ mod tests {
             &downloaded_exe(),
             "mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe",
         );
-        let release = MockFeed::once(sample_page().as_bytes(), "mnsky-tyan/mnvoice/releases/latest");
+        let release = MockFeed::once(sample_feed().as_bytes(), "mnsky-tyan/mnvoice/releases.atom");
 
         let rel = check_latest_from(&release.url).unwrap();
         assert_eq!(rel.version, "0.1.11");
