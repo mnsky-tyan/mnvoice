@@ -293,11 +293,12 @@ should make, not one that happens silently because a default pointed that way.
 Absence, an empty value, or a typo all mean off, so a misspelling cannot quietly
 switch it on.
 
-The check reads GitHub's web `releases/latest` page rather than the REST API.
-That matters: the unauthenticated API allows 60 requests per hour **per source
-IP**, so on a shared or NAT'd address the budget can already be spent by other
-traffic and every check would fail with `HTTP 403`. The web endpoint has no such
-limit, and it needs no token either.
+The check reads GitHub's `releases.atom` feed rather than the REST API. That
+matters: the unauthenticated API allows 60 requests per hour **per source IP**,
+so on a shared or NAT'd address the budget can already be spent by unrelated
+traffic and every check would fail with `HTTP 403`. The feed is served from the
+web endpoint, so it has no per-IP quota, needs no token, and is a small
+machine-readable document instead of a 200 KB page.
 
 **Manual.** Tray menu > `Check for updates`. Same result, whenever you ask.
 
