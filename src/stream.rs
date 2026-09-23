@@ -59,6 +59,7 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
 pub fn run_stream(
     cfg: &Config,
     stop: &Arc<AtomicBool>,
+    cancelled: &Arc<AtomicBool>,
     rx: Receiver<Vec<i16>>,
 ) -> Result<String, String> {
     unsafe {
@@ -192,6 +193,7 @@ pub fn run_stream(
         let ws_reader = ws as usize;
         let full_transcript_clone = full_transcript.clone();
         let stop_clone = stop.clone();
+        let cancelled_clone = cancelled.clone();
         let reader_done_clone = reader_done.clone();
 
         let reader_thread = thread::spawn(move || {
@@ -202,6 +204,11 @@ pub fn run_stream(
             let mut latest_uncommitted = String::new();
 
             while !reader_done_clone.load(Ordering::SeqCst) {
+                // Cancel is honoured at the word boundary: stop reading and stop
+                // typing immediately rather than waiting for speech to end.
+                if cancelled_clone.load(Ordering::SeqCst) {
+                    break;
+                }
                 let mut bytes_read = 0u32;
                 let mut buf_type = WINHTTP_WEB_SOCKET_BUFFER_TYPE::default();
                 let res = WinHttpWebSocketReceive(
@@ -281,8 +288,9 @@ pub fn run_stream(
                 }
             }
 
-            // Flush any remaining words from the latest interim transcript upon stop/close
-            if !latest_uncommitted.is_empty() {
+            // Flush any remaining words from the latest interim transcript upon stop/close.
+            // Skipped entirely on cancel so a discarded session leaves nothing behind.
+            if !latest_uncommitted.is_empty() && !cancelled_clone.load(Ordering::SeqCst) {
                 let words: Vec<&str> = latest_uncommitted.split_whitespace().collect();
                 if words.len() > typed_word_count {
                     let remaining = &words[typed_word_count..];
@@ -359,8 +367,8 @@ pub fn run_stream(
 
         let full_text = full_transcript.lock().unwrap().trim().to_string();
 
-        // Add trailing space if configured
-        if cfg.trailing_space && !full_text.is_empty() {
+        // Add trailing space if configured, but never on a cancelled session
+        if cfg.trailing_space && !full_text.is_empty() && !cancelled.load(Ordering::SeqCst) {
             let _ = paste::type_text(" ");
         }
 

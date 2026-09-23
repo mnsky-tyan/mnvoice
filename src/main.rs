@@ -68,6 +68,9 @@ struct App {
     state: State,
     config: Option<config::Config>,
     stop: Arc<AtomicBool>,
+    /// Set by the cancel key. Once set, the streaming reader types nothing
+    /// further and the final flush is skipped, so a cancel really discards.
+    cancelled: Arc<AtomicBool>,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
@@ -290,6 +293,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     state: State::Idle,
                     config: init.config,
                     stop: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     outcome: Arc::new(Mutex::new(None)),
                     orb,
                     audio_engine: init.audio_engine,
@@ -320,7 +324,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_HOTKEY => {
                 let app = app_ref(hwnd);
                 match wparam.0 as i32 {
-                    HOTKEY_TOGGLE | HOTKEY_ESC => toggle(app),
+                    HOTKEY_TOGGLE => toggle(app),
+                    // Esc cancels and hides the orb at once. It must not "finish"
+                    // the phrase, which used to leave the orb sitting on screen.
+                    HOTKEY_ESC => cancel(app),
                     _ => {}
                 }
                 LRESULT(0)
@@ -342,6 +349,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_APP_WORKER => {
                 let app = app_ref(hwnd);
+                let cancelled = app.cancelled.load(Ordering::SeqCst);
                 let outcome = app.outcome.lock().unwrap().take();
                 if let Some((ok, message)) = outcome {
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
@@ -351,7 +359,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     app.state = State::Idle;
                     let _ = set_tray_tip(hwnd, "mnvoice - idle");
-                    if ok {
+                    // A cancelled session was already closed by cancel(); whatever
+                    // the worker scraped together afterwards is deliberately dropped
+                    // and must not be reported as a transcription.
+                    if cancelled {
+                        log("session cancelled, nothing typed");
+                    } else if ok {
                         let preview: String = message.chars().take(200).collect();
                         log(&format!("transcribed: {preview}"));
                     } else {
@@ -432,23 +445,9 @@ fn toggle(app: &mut App) {
                 return;
             };
 
-            // Summon the orb IMMEDIATELY with zero perceptible latency
-            if let Some(orb) = &mut app.orb {
-                orb.show(orb::OrbState::Recording);
-            }
-            let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
-
-            app.stop.store(false, Ordering::SeqCst);
-            let stop = app.stop.clone();
-            let outcome = app.outcome.clone();
-            let hwnd_bits = app.hwnd.0 as usize;
-            let audio_engine = app.audio_engine.clone();
-
-            // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
-            let worker_cfg = cfg.clone();
-            thread::spawn(move || worker(stop, worker_cfg, outcome, hwnd_bits, audio_engine));
-            app.state = State::Recording;
-
+            // Claim the cancel key BEFORE anything else becomes visible.
+            // The orb appearing used to leave a gap where Esc was dead, which
+            // read as "Esc does not work right after the orb shows".
             if cfg.cancel_key.1 != 0 {
                 if let Err(e) = unsafe {
                     RegisterHotKey(
@@ -461,6 +460,25 @@ fn toggle(app: &mut App) {
                     log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
                 }
             }
+
+            app.stop.store(false, Ordering::SeqCst);
+            app.cancelled.store(false, Ordering::SeqCst);
+            let stop = app.stop.clone();
+            let cancelled = app.cancelled.clone();
+            let outcome = app.outcome.clone();
+            let hwnd_bits = app.hwnd.0 as usize;
+            let audio_engine = app.audio_engine.clone();
+
+            // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
+            let worker_cfg = cfg.clone();
+            thread::spawn(move || worker(stop, cancelled, worker_cfg, outcome, hwnd_bits, audio_engine));
+            app.state = State::Recording;
+
+            // Summon the orb last, once cancel is already live.
+            if let Some(orb) = &mut app.orb {
+                orb.show(orb::OrbState::Recording);
+            }
+            let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
             let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (auto-stops on silence)") };
             log("recording started");
         }
@@ -478,8 +496,29 @@ fn toggle(app: &mut App) {
     }
 }
 
+/// Cancel the current session outright: stop capture, discard anything already
+/// transcribed, and hide the orb in the same instant. This is what the cancel key
+/// (Esc by default) must do.
+fn cancel(app: &mut App) {
+    if app.state == State::Idle {
+        return;
+    }
+    // Tell the worker and the streaming reader to stop typing further words.
+    app.cancelled.store(true, Ordering::SeqCst);
+    app.stop.store(true, Ordering::SeqCst);
+    app.state = State::Idle;
+    let _ = unsafe { KillTimer(app.hwnd, TIMER_ORB) };
+    let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
+    if let Some(orb) = &mut app.orb {
+        orb.hide();
+    }
+    let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - idle") };
+    log("recording cancelled");
+}
+
 fn worker(
     stop: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
     cfg: config::Config,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     hwnd_bits: usize,
@@ -502,7 +541,7 @@ fn worker(
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
     let result = match cfg.protocol {
         config::Protocol::Streaming => {
-            match stream::run_stream(&cfg, &stop, rx) {
+            match stream::run_stream(&cfg, &stop, &cancelled, rx) {
                 Ok(text) => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
