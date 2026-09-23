@@ -37,5 +37,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: mnvoice-windows-x64.zip
+          # Fail loudly if nothing matched. Without this the step can exit 0
+          # while uploading nothing, which ships an empty release silently.
+          fail_on_unmatched_files: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
