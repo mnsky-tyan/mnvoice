@@ -8,3 +8,6 @@ mnvoice.env
 keywords.txt
 vocabulary.txt
 words.txt
+
+# generated icon verification artifact
+assets/mnvoice-from-exe-32.png

@@ -36,6 +36,22 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_WORKER: u32 = WM_APP + 2;
 
+/// Resource id of the icon embedded by build.rs via assets/mnvoice.ico.
+const IDI_APP: PCWSTR = PCWSTR(1 as *const u16);
+
+/// Loads the embedded mnvoice icon. Falls back to the OS generic icon if the
+/// resource is somehow missing, so the tray icon is never blank.
+unsafe fn app_icon() -> HICON {
+    if let Ok(mod_) = GetModuleHandleW(None) {
+        if let Ok(h) = LoadIconW(HINSTANCE(mod_.0), IDI_APP) {
+            if !h.is_invalid() {
+                return h;
+            }
+        }
+    }
+    unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default()
+}
+
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_ESC: i32 = 2;
 const IDM_STOP: usize = 1;
@@ -160,10 +176,12 @@ fn main() {
 
     unsafe {
         let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+        let icon = app_icon();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
+            hIcon: icon,
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS.into() {
@@ -251,7 +269,7 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID,
         uCallbackMessage: WM_APP_TRAY,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+        hIcon: unsafe { app_icon() },
         guidItem: TRAY_GUID,
         ..Default::default()
     };
