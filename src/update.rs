@@ -110,33 +110,23 @@ fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
         }
 
         let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"));
-        let sent = WinHttpSendRequest(
-            request,
-            None,
-            None,
-            0,
-            0,
-            0,
-        );
-        if sent.is_err() {
-            let e = sent.err().map(|e| e.to_string()).unwrap_or_default();
+        // Headers are only picked up by WinHTTP while the request is still being
+        // composed, so they have to go in before the send - never after it.
+        let result = (|| {
+            WinHttpAddRequestHeaders(
+                request,
+                &headers[..headers.len() - 1],
+                0x2000_0000,
+            )?;
+            WinHttpSendRequest(request, None, None, 0, 0, 0)?;
+            WinHttpReceiveResponse(request, std::ptr::null_mut())?;
+            Ok::<(), windows::core::Error>(())
+        })();
+        if let Err(e) = result {
             let _ = WinHttpCloseHandle(request);
             let _ = WinHttpCloseHandle(connect);
             let _ = WinHttpCloseHandle(session);
             return Err(format!("request failed ({e})"));
-        }
-        let _ = WinHttpAddRequestHeaders(
-            request,
-            &headers[..headers.len() - 1],
-            0x2000_0000,
-        );
-
-        let received = WinHttpReceiveResponse(request, std::ptr::null_mut());
-        if let Err(e) = received {
-            let _ = WinHttpCloseHandle(request);
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("no response ({e})"));
         }
 
         let mut status: u32 = 0;
@@ -236,10 +226,13 @@ fn clean_old(exe: &Path) {
 }
 
 /// Download the latest exe, swap it in beside the running binary, and relaunch.
+/// `busy` reports whether a dictation session is in flight; it is re-checked
+/// after the download, immediately before the running image is touched, so a
+/// session that starts mid-download still stops the install.
 ///
-/// On success this function does not return - it spawns the new process and
+/// On success this function does not return - it starts the new process and
 /// exits the current one. Errors return a message for the tray to display.
-pub fn install_and_relaunch() -> Result<String, String> {
+pub fn install_and_relaunch(busy: impl Fn() -> bool) -> Result<(), String> {
     let rel = check_latest()?;
     let url = rel.exe_url;
     let version = rel.version;
@@ -260,6 +253,13 @@ pub fn install_and_relaunch() -> Result<String, String> {
     let mut old = exe.as_os_str().to_os_string();
     old.push(".old");
 
+    // The gate was read before the download started. Re-read it now: a session
+    // may have begun while the bytes were in flight, and the swap must never
+    // land mid-dictation.
+    if busy() {
+        return Err("install skipped, a dictation session started during the download".into());
+    }
+
     // Rename the running image out of the way, then move the new one in.
     fs::rename(&exe, &old).map_err(|e| format!("cannot move current exe aside ({e})"))?;
     if let Err(e) = fs::rename(&staged, &exe) {
@@ -268,11 +268,16 @@ pub fn install_and_relaunch() -> Result<String, String> {
         return Err(format!("cannot install new exe ({e})"));
     }
 
-    Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("new exe spawned failed ({e})"))?;
-
-    Ok(version)
+    // --restart hands the hotkey and the single-instance mutex over cleanly, and
+    // exiting here releases them from this side too - the new image takes this
+    // exe's path, so the old process must not keep running the renamed one.
+    let spawned = Command::new(&exe).arg("--restart").spawn();
+    if let Err(e) = spawned {
+        let _ = fs::rename(&old, &exe);
+        return Err(format!("cannot start the new exe ({e})"));
+    }
+    crate::log(&format!("updated to v{version}, relaunching"));
+    std::process::exit(0);
 }
 
 fn stamp_path() -> Option<PathBuf> {
@@ -311,26 +316,16 @@ fn mark_checked() {
 }
 
 /// Background self-update check. Intended to be called once from a temporary
-/// thread started at launch, so it can never delay startup. Only installs when
-/// the run is idle - see the caller.
+/// thread started at launch, so it can never delay startup. Everything it finds
+/// goes through the same idle-gated install path as a manual check, so an
+/// automatic install can never land mid-dictation either.
 pub fn background_check_auto() {
     if !should_check_today() {
         return;
     }
     mark_checked();
-    // Only report a problem in the automatic path; a quiet run is the whole point.
-    match check_latest() {
-        Ok(rel) => {
-            if is_newer(&rel.version, current_version()) {
-                crate::log(&format!(
-                    "background update: v{} available (running v{}), will install when idle",
-                    rel.version,
-                    current_version()
-                ));
-            }
-        }
-        Err(e) => crate::log(&format!("background update check failed: {e}")),
-    }
+    // quiet: an automatic run reports only problems, never balloons.
+    crate::check_for_updates_async(true);
 }
 
 /// Called once at startup: tidy up after the previous update, then hand the

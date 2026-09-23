@@ -310,16 +310,20 @@ Every release publishes two files:
 
 Windows will show a SmartScreen prompt on the first run of any newly downloaded
 copy. That is a reputation check on an unsigned binary, not a virus detection -
-nothing has ever been flagged in mnvoice. To satisfy yourself, compare the hash:
+nothing has ever been flagged in mnvoice.
+
+Releases carry no separate checksum file, so verifying means a comparison you run
+yourself: download `mnvoice.exe` from the release page, then hash that file and
+the `mnvoice.exe` you are running. Equal hashes mean you are running exactly what
+CI built from the tagged public source.
 
 ```powershell
-(Get-FileHash ~\Downloads\mnvoice.exe -Algorithm SHA256).Hash
+Get-FileHash ~\Downloads\mnvoice.exe -Algorithm SHA256
+Get-FileHash "C:\path\to\mnvoice.exe" -Algorithm SHA256
 ```
 
-The published SHA-256 for each release is in that release's notes. If they match,
-the file is exactly what CI built from the tagged public source. Because the
-update path fetches from the same release feed, a self-updated copy is verifiable
-the same way.
+The updater fetches that same release asset, so a copy it installed itself passes
+the same comparison.
 
 ## Building from Source
 
