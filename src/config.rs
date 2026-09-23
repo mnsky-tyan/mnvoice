@@ -26,6 +26,9 @@ pub struct Config {
     pub cancel_key_str: String,
     pub vad_silence_ms: u32,
     pub vad_rms_threshold: f64,
+    /// Drop disfluencies (uh, um, erm). Streaming uses the provider's native
+    /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
+    pub strip_fillers: bool,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -43,6 +46,7 @@ pub fn load() -> Result<Config, String> {
     let mut cancel_key_str = String::new();
     let mut vad_silence_ms = 3000u32;
     let mut vad_rms_threshold = 400.0f64;
+    let mut filler_words_str = String::new();
 
     // Check for keywords.txt beside the executable
     if let Ok(exe) = std::env::current_exe() {
@@ -76,6 +80,7 @@ pub fn load() -> Result<Config, String> {
                     &mut cancel_key_str,
                     &mut vad_silence_ms,
                     &mut vad_rms_threshold,
+                    &mut filler_words_str,
                 )
             });
         }
@@ -140,6 +145,9 @@ pub fn load() -> Result<Config, String> {
     if let Ok(v) = std::env::var("VAD_RMS_THRESHOLD").or_else(|_| std::env::var("RMS_THRESHOLD")) {
         if let Ok(n) = v.parse() { vad_rms_threshold = n; }
     }
+    if let Ok(v) = std::env::var("FILLER_WORDS") {
+        filler_words_str = v;
+    }
 
     // Determine protocol: streaming vs rest
     let protocol = match protocol_str.to_lowercase().as_str() {
@@ -191,6 +199,13 @@ pub fn load() -> Result<Config, String> {
     };
     let cancel_key = parse_hotkey(&cancel_key_actual_str).unwrap_or((0x4000, 0x1B)); // MOD_NOREPEAT, VK_ESCAPE
 
+    // FILLER_WORDS=0 (default) strips disfluencies; =1 keeps them verbatim.
+    // Empty or unset strips, so a typo can never silently re-enable fillers.
+    let strip_fillers = !matches!(
+        filler_words_str.trim().to_lowercase().as_str(),
+        "1" | "true" | "on" | "yes" | "keep"
+    );
+
     Ok(Config {
         protocol,
         api_key,
@@ -208,6 +223,7 @@ pub fn load() -> Result<Config, String> {
         cancel_key_str: cancel_key_actual_str,
         vad_silence_ms,
         vad_rms_threshold,
+        strip_fillers,
     })
 }
 
@@ -253,6 +269,7 @@ fn apply(
     cancel_key_str: &mut String,
     vad_silence_ms: &mut u32,
     vad_rms_threshold: &mut f64,
+    filler_words_str: &mut String,
 ) {
     match k {
         "PROTOCOL" | "MODE" | "PROVIDER" => *protocol_str = v.to_string(),
@@ -293,6 +310,7 @@ fn apply(
         "VAD_RMS_THRESHOLD" | "RMS_THRESHOLD" => {
             if let Ok(n) = v.parse() { *vad_rms_threshold = n; }
         }
+        "FILLER_WORDS" => *filler_words_str = v.to_string(),
         _ => {}
     }
 }

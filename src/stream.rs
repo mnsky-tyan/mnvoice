@@ -90,9 +90,11 @@ pub fn run_stream(
 
         // no_delay=true: release words immediately without buffering for more context (Nova-3)
         // vad_events=true: receive SpeechStarted/UtteranceEnd events from Deepgram's own VAD
-        // filler_words=false: drop disfluencies (uh, um, erm) instead of transcribing them
+        // filler_words: strip disfluencies when the provider supports it natively.
+        // Providers that ignore it are still covered by the local filter below.
+        let filler_words = if cfg.strip_fillers { "false" } else { "true" };
         let mut path = format!(
-            "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500&no_delay=true&vad_events=true&filler_words=false",
+            "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500&no_delay=true&vad_events=true&filler_words={filler_words}",
             cfg.model
         );
         if !cfg.language.is_empty() {
@@ -183,6 +185,9 @@ pub fn run_stream(
         let full_transcript = Arc::new(Mutex::new(String::new()));
         let reader_done = Arc::new(AtomicBool::new(false));
 
+        // Capture this before the thread moves in, so the borrow cannot escape.
+        let strip_fillers = cfg.strip_fillers;
+
         // Reader thread: streams words token-by-token directly into active cursor
         let ws_reader = ws as usize;
         let full_transcript_clone = full_transcript.clone();
@@ -214,8 +219,20 @@ pub fn run_stream(
                 if let Some(res) = parse_stream_json(&msg) {
                     let trimmed = res.transcript.trim();
                     if !trimmed.is_empty() {
-                        latest_uncommitted = trimmed.to_string();
-                        let words: Vec<&str> = trimmed.split_whitespace().collect();
+                        // Filter fillers before this frame is typed, so the word
+                        // indices below stay aligned frame to frame.
+                        let words: Vec<&str> = if strip_fillers {
+                            trimmed
+                                .split_whitespace()
+                                .filter(|w| !crate::rest::is_disfluency(w))
+                                .collect()
+                        } else {
+                            trimmed.split_whitespace().collect()
+                        };
+
+                        // Keep the filtered text for the end-of-stream flush, so
+                        // the word indices used there match what was typed.
+                        latest_uncommitted = words.join(" ");
 
                         if res.is_final {
                             // Sentence/clause finalized: type all remaining words to the end

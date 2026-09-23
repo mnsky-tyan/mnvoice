@@ -40,6 +40,10 @@ const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_ESC: i32 = 2;
 const IDM_STOP: usize = 1;
 const IDM_EXIT: usize = 2;
+const IDM_STARTUP: usize = 3;
+const IDM_RESTART: usize = 4;
+const IDM_OPEN_CONFIG: usize = 5;
+const IDM_OPEN_KEYWORDS: usize = 6;
 const TIMER_ORB: usize = 101;
 
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
@@ -111,16 +115,8 @@ fn kill_running_instances() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--install-startup") {
-        if let Err(e) = install_startup(true) { log(&format!("install-startup failed: {e}")); }
-        return;
-    }
-    if args.iter().any(|a| a == "--uninstall-startup") {
-        if let Err(e) = install_startup(false) { log(&format!("uninstall-startup failed: {e}")); }
-        return;
-    }
     if args.iter().any(|a| a == "--restart") {
-        // Graceful self-heal: ask any running instance to exit, wait for it to
+        // Graceful self-heal: terminate any running instance, wait for it to
         // release the global hotkey, then continue starting fresh.
         kill_running_instances();
         thread::sleep(std::time::Duration::from_millis(700));
@@ -390,6 +386,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if app.state == State::Recording {
                         toggle(app);
                     }
+                } else if id == IDM_STARTUP {
+                    // Toggle the registry entry. Re-checked on next open, so the
+                    // checkbox can never drift out of sync with reality.
+                    let enable = !autostart_enabled();
+                    if let Err(e) = set_autostart(enable) {
+                        log(&format!("autostart toggle failed: {e}"));
+                    }
+                } else if id == IDM_RESTART {
+                    relaunch_for_restart();
+                } else if id == IDM_OPEN_CONFIG {
+                    open_companion_file(
+                        "mnvoice.env",
+                        "# mnvoice - see mnvoice.env.example for every key\nPROTOCOL=streaming\nAPI_KEY=\n",
+                    );
+                } else if id == IDM_OPEN_KEYWORDS {
+                    open_companion_file(
+                        "keywords.txt",
+                        "# one word per line, or comma-separated\n",
+                    );
                 }
                 LRESULT(0)
             }
@@ -510,7 +525,13 @@ fn worker(
             let wav = audio::wav_bytes(&samples);
             match rest::transcribe(&cfg, &wav) {
                 Ok(text) => {
-                    let text = text.trim().to_string();
+                    // No provider here exposes a native filler_words parameter, so
+                    // disfluencies are removed locally before anything is typed.
+                    let text = if cfg.strip_fillers {
+                        rest::strip_disfluencies(text.trim())
+                    } else {
+                        text.trim().to_string()
+                    };
                     if text.is_empty() {
                         (false, "No speech detected".into())
                     } else {
@@ -540,11 +561,23 @@ unsafe fn show_menu(hwnd: HWND) {
         Ok(m) => m,
         Err(_) => return,
     };
+
+    // Checkbox reflects live system state, so it is evaluated on every open.
+    let startup_flags = if autostart_enabled() { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
+    let _ = AppendMenuW(menu, MF_STRING | startup_flags, IDM_STARTUP, w!("Start with Windows"));
+
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, w!("Open config"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_KEYWORDS, w!("Open keywords"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART, w!("Restart"));
+
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, IDM_STOP, w!("Stop && transcribe"));
-    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
     if !recording {
         let _ = EnableMenuItem(menu, IDM_STOP as u32, MF_GRAYED);
     }
+    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
+
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
@@ -552,36 +585,76 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 }
 
-fn install_startup(install: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe.parent().ok_or("no exe directory")?;
-    let link = std::env::var("APPDATA")
-        .map(|a| {
-            std::path::PathBuf::from(a)
-                .join("Microsoft\\Windows\\Start Menu\\Programs\\Startup\\mnvoice.lnk")
-        })
-        .map_err(|_| "APPDATA not set")?;
-    let script = if install {
-        format!(
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');$s.TargetPath='{}';$s.WorkingDirectory='{}';$s.Description='mnvoice dictation';$s.Save()",
-            link.display(),
-            exe.display(),
-            dir.display()
-        )
-    } else {
-        format!("Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue", link.display())
+const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE: &str = "mnvoice";
+
+/// reg.exe with CREATE_NO_WINDOW, so toggling autostart never flashes a console.
+fn reg_cmd() -> std::process::Command {
+    let mut c = std::process::Command::new("C:\\Windows\\System32\\reg.exe");
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+/// True when a mnvoice autostart entry exists for the current user.
+fn autostart_enabled() -> bool {
+    let Ok(out) = reg_cmd()
+        .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
+        .output()
+    else {
+        return false;
     };
-    let status = std::process::Command::new(
-        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-    )
-    .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
-    .creation_flags(0x0800_0000)
-    .status()
-    .map_err(|e| e.to_string())?;
+    out.status.success()
+}
+
+/// Register or remove the current-user autostart entry. Reversible, no admin
+/// rights needed, and visible in Task Manager's Startup tab.
+fn set_autostart(enable: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut cmd = reg_cmd();
+    if enable {
+        cmd.args([
+            "add",
+            AUTOSTART_RUN_KEY,
+            "/v",
+            AUTOSTART_VALUE,
+            "/t",
+            "REG_SZ",
+            "/d",
+            exe.display().to_string().as_str(),
+            "/f",
+        ]);
+    } else {
+        cmd.args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"]);
+    }
+    let status = cmd.status().map_err(|e| e.to_string())?;
     if status.success() {
-        log(if install { "startup shortcut installed" } else { "startup shortcut removed" });
+        log(if enable { "autostart enabled" } else { "autostart disabled" });
         Ok(())
     } else {
-        Err("powershell exited non-zero".into())
+        Err("reg.exe exited non-zero".into())
     }
+}
+
+/// Open a companion file beside the exe in Notepad, creating it from a stub if
+/// the user has not made one yet, so nobody gets a "file not found" dialog.
+fn open_companion_file(name: &str, stub: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let path = dir.join(name);
+    if !path.exists() {
+        let _ = std::fs::write(&path, stub);
+    }
+    let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+}
+
+/// Relaunch this exe with --restart so a fresh instance takes over, then exit.
+fn relaunch_for_restart() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(&exe).arg("--restart").spawn();
+    }
+    unsafe { PostQuitMessage(0) };
 }

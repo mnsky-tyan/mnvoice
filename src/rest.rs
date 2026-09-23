@@ -196,6 +196,36 @@ fn read_all(request: *mut std::ffi::c_void) -> Vec<u8> {
     }
 }
 
+/// Disfluency tokens. These are vocal stumbles that carry no meaning in
+/// dictation, so dropping them cannot change what was said.
+///
+/// Deliberately excluded: "er" (ER / emergency room), "like" ("I'd like"),
+/// "you know" and "i mean" - all common real speech. An over-eager list that
+/// eats meaningful words is far worse than a missed filler.
+const DISFLUENCIES: &[&str] = &[
+    "uh", "uhh", "uh-huh", "uhh-huh", "um", "umm", "umm-hmm", "erm", "errm", "hmm", "hm", "mm",
+    "mmm", "mm-hmm", "mhm", "uh-hum",
+];
+
+/// True if the token is a disfluency, ignoring surrounding punctuation and case.
+pub fn is_disfluency(word: &str) -> bool {
+    let norm = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+    if norm.is_empty() {
+        return false;
+    }
+    DISFLUENCIES.iter().any(|d| norm.eq_ignore_ascii_case(d))
+}
+
+/// Remove disfluency tokens from a transcript and normalise whitespace.
+/// Used on the REST path, where no provider has a native filler_words parameter,
+/// and on the streaming path as a safety net for providers that ignore it.
+pub fn strip_disfluencies(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|w| !is_disfluency(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> {
     let (scheme, rest) = url
         .split_once("://")
@@ -278,5 +308,42 @@ mod tests {
         assert_eq!(port, 8000);
         assert!(!secure);
         assert_eq!(path, "");
+    }
+
+    #[test]
+    fn test_strip_disfluencies_removes_fillers() {
+        assert_eq!(strip_disfluencies("so um this is uh the plan"), "so this is the plan");
+    }
+
+    #[test]
+    fn test_strip_disfluencies_punctuation_and_case() {
+        assert_eq!(strip_disfluencies("well, Um... hmm the results, erm, look good"),
+                   "well, the results, look good");
+    }
+
+    #[test]
+    fn test_strip_disfluencies_keeps_meaningful_repeats() {
+        // Consecutive duplicates are legitimate speech, not fillers.
+        assert_eq!(strip_disfluencies("it was very very good"), "it was very very good");
+        assert_eq!(strip_disfluencies("no no no wait"), "no no no wait");
+    }
+
+    #[test]
+    fn test_strip_disfluencies_keeps_ambiguous_words() {
+        // These are real speech, so they must survive untouched.
+        assert_eq!(strip_disfluencies("I would like a er scan"), "I would like a er scan");
+        assert_eq!(strip_disfluencies("no, like, seriously"), "no, like, seriously");
+    }
+
+    #[test]
+    fn test_is_disfluency() {
+        // Every entry in the list, plus case and punctuation variants, must match.
+        for w in ["uh", "uhh", "um", "umm", "erm", "errm", "hmm", "hm", "mm", "mhm", "Mm,", "HMM."] {
+            assert!(is_disfluency(w), "{w} should be a filler");
+        }
+        // Ambiguous tokens must NOT match - eating these would corrupt real speech.
+        for w in ["like", "er", "very", "so", "the", "you", "mean"] {
+            assert!(!is_disfluency(w), "{w} should NOT be a filler");
+        }
     }
 }

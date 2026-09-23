@@ -13,7 +13,8 @@ mnvoice.exe (~302 KB)
   ├── Provider-agnostic STT (real-time WebSocket streaming or standard REST)
   ├── Monotonic live word-by-word typing (SendInput KEYEVENTF_UNICODE, zero clipboard touch)
   ├── Custom vocabulary / keyterm prompting (keywords.txt or KEYWORDS= env)
-  └── Procedural glass fluid orb indicator (color + fluid level configurable)
+  ├── Filler-word stripping (provider-native on streaming, local filter on REST)
+  └── System tray control (start with Windows, config, keywords, restart)
 ```
 
 ## Features
@@ -22,7 +23,8 @@ mnvoice.exe (~302 KB)
 - **Zero clipboard pollution** - words are injected directly at the cursor via `SendInput` with `KEYEVENTF_UNICODE`.
 - **Real-time word streaming** - 40 ms audio slices over native WinHTTP WebSockets; words appear as you speak.
 - **Hands-free auto-stop** - dual VAD (local RMS + server endpointing) detects ~2.2 s of silence and finalizes automatically.
-- **Fully configurable** - hotkey, cancel key, orb color, fluid level, STT provider, model, language, and vocabulary all set in one plain text file.
+- **Fully configurable** - hotkey, cancel key, orb color, fluid level, filler words, STT provider, model, language, and vocabulary. All in one plain text file, none of it required.
+- **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, config, keywords, and restart.
 - **Privacy focused** - zero audio written to disk, point-to-point TLS, zero telemetry. See [SECURITY.md](SECURITY.md).
 - **Tiny footprint** - ~302 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
 
@@ -52,7 +54,9 @@ MODEL=nova-3
 LANGUAGE=en
 ```
 
-Get a free API key from [Deepgram](https://console.deepgram.com/) (streaming, ~$200 free credit) or [Groq](https://console.groq.com/) (REST, free tier).
+Get a free API key from [Deepgram](https://console.deepgram.com/) (streaming, ~$200 free credit, recommended) or [Groq](https://console.groq.com/) (REST, free tier). See the Configuration Reference below for every key.
+
+Everything else is optional - delete `mnvoice.env` entirely and mnvoice runs on its defaults, which strip filler words.
 
 ### 3. Run
 
@@ -62,63 +66,99 @@ Double-click `mnvoice.exe`, or from a terminal:
 mnvoice.exe
 ```
 
-A small icon appears in the system tray. Press **Alt+Space** to start dictating into whatever window is focused.
+There is no window and no taskbar entry. A small icon appears in the **system tray** (bottom-right, near the clock) and stays there in the background.
+
+Press **Alt+Space** in any app to start dictating. A pink orb appears at the bottom of your screen while you speak, then text is typed straight into your focused window.
+
+### What you get
+
+```
+system tray icon  - right-click for autostart, config, keywords, restart, exit
+orb               - appears only while recording, then disappears
+no windows        - nothing in the taskbar, nothing to close
+no terminal       - no command needed after install
+```
 
 ---
 
-## Running Automatically at Shell / System Startup
+## Start with Windows
 
-mnvoice is designed to run silently in the background. You never interact with it directly - just use your hotkey.
+One click, no commands. Right-click the tray icon and check **Start with Windows**:
 
-### Option A - Windows Startup folder (recommended for most users)
+- **Checked** - mnvoice is added to the current user's startup list
+- **Unchecked** - it is removed again
 
-Run once from a terminal beside `mnvoice.exe`:
+The entry is visible and reversible in Windows Task Manager under **Startup apps**, and it needs no admin rights.
 
-```cmd
-mnvoice.exe --install-startup
-```
-
-This creates a shortcut in your Windows Startup folder. mnvoice launches automatically (hidden, no window) every time you log in. To remove it:
+If you prefer a terminal, the same change is one command (swap in your own path):
 
 ```cmd
-mnvoice.exe --uninstall-startup
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v mnvoice /t REG_SZ /d "C:\Users\you\mnvoice.exe" /f
 ```
 
-### Option B - PowerShell profile (starts with every PowerShell / Windows Terminal session)
+To remove it:
 
-Add to your PowerShell profile (`$PROFILE`):
+```cmd
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v mnvoice /f
+```
+
+---
+
+## The tray menu
+
+```
+system tray icon
+    -> Start with Windows   (checkbox)
+    -> Open config          (opens mnvoice.env in Notepad)
+    -> Open keywords        (opens keywords.txt in Notepad)
+    -> Restart              (frees the hotkey and starts fresh)
+    -> Stop & transcribe
+    -> Exit
+```
+
+---
+
+## Command line
+
+There is only one flag, and it is for recovery, not normal use:
+
+| Command | Purpose |
+|---|---|
+| `mnvoice.exe` | Run normally |
+| `mnvoice.exe --restart` | Kill stale instances, free the hotkey, start fresh |
+
+`--restart` is what to reach for if **Alt+Space silently stops working** - almost always another app (Gemini, PowerToys, AutoHotkey) has grabbed the same hotkey and left it held. Starting with `--restart` lets mnvoice claim it again.
+
+---
+
+### Start it with your shell (advanced)
+
+Most users want the checkbox above. These are for people who also want mnvoice to launch only when a shell is open:
+
+PowerShell profile (`$PROFILE`):
 
 ```powershell
-# Start mnvoice in the background if it is not already running
 if (-not (Get-Process mnvoice -ErrorAction SilentlyContinue)) {
     Start-Process -WindowStyle Hidden "C:\path\to\mnvoice.exe"
 }
 ```
 
-Replace `C:\path\to\mnvoice.exe` with the actual path. The `-WindowStyle Hidden` flag keeps it completely invisible.
-
-### Option C - WSL / bash profile (starts with every WSL shell)
-
-Add to `~/.bashrc` or `~/.zshrc`:
+WSL `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-# Start mnvoice on Windows side if not already running
 if ! powershell.exe -NoProfile -Command \
     "if (Get-Process mnvoice -EA SilentlyContinue) { exit 0 } else { exit 1 }" \
     > /dev/null 2>&1; then
     powershell.exe -NoProfile -WindowStyle Hidden \
-        -Command "Start-Process 'C:\path\to\mnvoice.exe'" \
-        > /dev/null 2>&1 &
+        -Command "Start-Process 'C:\path\to\mnvoice.exe'" > /dev/null 2>&1 &
 fi
 ```
 
-### Option D - Task Scheduler (most robust, survives session restarts)
+Task Scheduler (works even if Explorer is restarting):
 
 ```cmd
 schtasks /create /tn "mnvoice" /tr "C:\path\to\mnvoice.exe" /sc onlogon /rl limited /f
 ```
-
-This registers mnvoice to start on every login via Windows Task Scheduler with no UAC prompt.
 
 ---
 
@@ -198,24 +238,42 @@ KEYWORDS=Kubernetes, TypeScript, PostgreSQL, herdr, mnvoice
 
 One word per line or comma-separated. Lines starting with `#` are comments.
 
-### All Options
+### All options
+
+Every key below works with any provider and any API key unless marked otherwise.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROTOCOL` | `streaming` | `streaming` (WebSocket) or `rest` (HTTP) |
+| `PROTOCOL` | `streaming` | `streaming` (WebSocket, real-time) or `rest` (OpenAI-compatible batch) |
 | `API_KEY` | - | API key / auth token |
-| `MODEL` | `nova-3` / `whisper-large-v3-turbo` | STT model identifier |
-| `BASE_URL` | provider default | Custom endpoint URL |
+| `MODEL` | `nova-3` / `whisper-large-v3-turbo` | Model identifier (default depends on `PROTOCOL`) |
+| `BASE_URL` | provider default | Custom endpoint, port, or reverse proxy |
 | `LANGUAGE` | `en` | Language code, or `auto` for detection |
-| `HOTKEY` | `Alt+Space` | Start / stop hotkey |
-| `CANCEL_KEY` | `Escape` | Cancel hotkey (`none` to disable) |
-| `ORB_COLOR` | `hot_pink` | Orb fluid color (preset name or `#RRGGBB`) |
-| `ORB_FLUID_LEVEL` | `0.75` | Orb fill level `0.0`-`1.0` or `0%`-`100%` |
-| `KEYWORDS` | - | Comma-separated custom vocabulary |
-| `TRAILING_SPACE` | `1` | Append space after each dictation (`0` to disable) |
-| `MAX_SECONDS` | `120` | Max recording duration before auto-stop |
+| `HOTKEY` | `Alt+Space` | Trigger hotkey. See Keybindings above for syntax. |
+| `CANCEL_KEY` | `Escape` | Discard the recording mid-speech (`none` to disable) |
+| `FILLER_WORDS` | `0` | `0` strips "uh"/"um"/"erm", `1` keeps them verbatim |
+| `KEYWORDS` | - | Comma-separated vocabulary hints. `keywords.txt` beside the exe is auto-loaded too. |
+| `VAD_SILENCE_MS` | `3000` | Silence after speech that stops recording. Raise if it cuts you off. |
+| `VAD_RMS_THRESHOLD` | `400` | Mic energy counted as speech, `0`-`32767`. Raise if noise keeps it listening. |
+| `MAX_SECONDS` | `120` | Hard recording limit before forced stop |
+| `TRAILING_SPACE` | `1` | Appends a space after each dictation (`0` to disable) |
+| `ORB_COLOR` | `hot_pink` | Orb fluid color: preset name or `#RRGGBB` |
+| `ORB_FLUID_LEVEL` | `0.75` | Orb fill `0.0`-`1.0`, or `0%`-`100%` |
 
-Provider-specific aliases (`DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, etc.) are also recognized for convenience.
+Delete `mnvoice.env` at any time to fall back to every default above.
+
+#### How filler-word stripping works
+
+`FILLER_WORDS=0` is one setting that adapts to the provider, because not every API offers a switch for it:
+
+| Path | Method |
+|---|---|
+| Streaming with a provider that supports it (Deepgram) | asks the provider via `filler_words=false` - model-native, best quality |
+| REST (Groq, OpenAI, self-hosted Whisper) | no such parameter exists anywhere, so mnvoice filters the returned text locally |
+
+Deepgram is the **recommended** provider rather than a requirement - the REST path works fully, just with the small quality difference above.
+
+Provider-named aliases (`DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `DEEPGRAM_MODEL`, and so on) are also accepted for convenience.
 
 ---
 
