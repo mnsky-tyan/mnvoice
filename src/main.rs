@@ -11,6 +11,7 @@ mod orb;
 mod paste;
 mod rest;
 mod stream;
+mod update;
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -28,8 +29,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIF_GUID, NIF_ICON,
-    NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIF_GUID, NIF_ICON,
+    NIF_INFO, NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -60,6 +61,7 @@ const IDM_STARTUP: usize = 3;
 const IDM_RESTART: usize = 4;
 const IDM_OPEN_CONFIG: usize = 5;
 const IDM_OPEN_KEYWORDS: usize = 6;
+const IDM_UPDATE: usize = 7;
 const TIMER_ORB: usize = 101;
 
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
@@ -77,6 +79,15 @@ enum State {
     Idle,
     Recording,
     Transcribing,
+}
+
+/// Human-readable state for logs and notifications.
+fn state_name(s: State) -> &'static str {
+    match s {
+        State::Idle => "idle",
+        State::Recording => "recording",
+        State::Transcribing => "transcribing",
+    }
 }
 
 struct App {
@@ -190,6 +201,9 @@ fn main() {
         }
 
         let audio_engine = audio::AudioEngine::start();
+        // Best-effort housekeeping: drop the leftover .old from a previous
+        // update and arm the periodic background check when AUTO_UPDATE=1.
+        update::startup_cleanup();
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -426,6 +440,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 } else if id == IDM_RESTART {
                     relaunch_for_restart();
+                } else if id == IDM_UPDATE {
+                    check_for_updates_async(false);
                 } else if id == IDM_OPEN_CONFIG {
                     open_companion_file(
                         "mnvoice.env",
@@ -624,6 +640,7 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING | startup_flags, IDM_STARTUP, w!("Start with Windows"));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, IDM_UPDATE, w!("Check for updates"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, w!("Open config"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_KEYWORDS, w!("Open keywords"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART, w!("Restart"));
@@ -706,6 +723,96 @@ fn open_companion_file(name: &str, stub: &str) {
         let _ = std::fs::write(&path, stub);
     }
     let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+}
+
+/// Ask GitHub whether a newer release exists. `quiet` suppresses the
+/// "up to date" balloon so the periodic background check stays silent.
+///
+/// Runs on a worker thread: the request can take seconds and the tray menu
+/// must not freeze. Installation only ever happens when idle, because swapping
+/// the exe mid-dictation would lose the transcript in flight.
+fn check_for_updates_async(quiet: bool) {
+    thread::spawn(move || {
+        let rel = match update::check_latest() {
+            Ok(r) => r,
+            Err(e) => {
+                log(&format!("update check failed: {e}"));
+                if !quiet {
+                    balloon("Update check failed", &e);
+                }
+                return;
+            }
+        };
+        let current = update::current_version().to_string();
+        if !update::is_newer(&rel.version, &current) {
+            log("mnvoice is up to date");
+            if !quiet {
+                balloon("mnvoice is up to date", &format!("v{current} is the latest version"));
+            }
+            return;
+        }
+
+        // Never install while the user is speaking or a transcript is in flight.
+        if let Some(app) = current_app() {
+            if app.state != State::Idle {
+                log(&format!(
+                    "update v{} available, deferred until idle (currently {})",
+                    rel.version, state_name(app.state)
+                ));
+                if !quiet {
+                    balloon(
+                        "Update available",
+                        &format!("v{} will install when you next release the hotkey", rel.version),
+                    );
+                }
+                return;
+            }
+        }
+
+        log(&format!("installing v{}", rel.version));
+        match update::install_and_relaunch() {
+            Ok(v) => log(&format!("updated to v{v}, relaunching")),
+            Err(e) => log(&format!("update failed: {e}")),
+        }
+    });
+}
+
+fn current_app() -> Option<&'static mut App> {
+    unsafe {
+        let hwnd = FindWindowW(w!("mnvoiceTrayClass"), w!("mnvoice")).ok()?;
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(&mut *ptr)
+        }
+    }
+}
+
+/// Transient notification from the tray icon. Balloon timeouts are only
+/// advisory, so the tip is dismissed on the next interaction either way.
+fn balloon(title: &str, body: &str) {
+    unsafe {
+        let Ok(hwnd) = FindWindowW(w!("mnvoiceTrayClass"), w!("mnvoice")) else {
+            return;
+        };
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_INFO | NIF_GUID,
+            guidItem: TRAY_GUID,
+            ..Default::default()
+        };
+        let t = wide(title);
+        let n = t.len().min(nid.szInfoTitle.len());
+        nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
+        let b = wide(body);
+        let n = b.len().min(nid.szInfo.len());
+        nid.szInfo[..n].copy_from_slice(&b[..n]);
+        nid.dwInfoFlags = NIIF_INFO;
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
 }
 
 /// Relaunch this exe with --restart so a fresh instance takes over, then exit.

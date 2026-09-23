@@ -24,6 +24,8 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      # The raw exe is the asset the in-app updater downloads, and it is also
+      # what a user gets when they would rather not unpack a zip.
       - name: Package artifacts
         run: |
           mkdir dist
@@ -42,12 +44,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = "${{ github.ref_name }}"
-          if (!(Test-Path mnvoice-windows-x64.zip)) { throw "mnvoice-windows-x64.zip was not produced" }
+          foreach ($f in @('mnvoice.exe','mnvoice-windows-x64.zip')) {
+            if (!(Test-Path $f)) { throw "$f was not produced" }
+          }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag mnvoice-windows-x64.zip --clobber
+            gh release upload $tag mnvoice.exe mnvoice-windows-x64.zip --clobber
           } else {
-            gh release create $tag --title $tag --verify-tag mnvoice-windows-x64.zip
+            gh release create $tag --title $tag --verify-tag mnvoice.exe mnvoice-windows-x64.zip
           }
           if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
           Write-Host "published $tag"
@@ -61,7 +65,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = "${{ github.ref_name }}"
           $names = gh release view $tag --json assets --jq '.assets[].name'
-          if ((($names -split "`n") -notcontains 'mnvoice-windows-x64.zip')) {
-            throw "release $tag is missing mnvoice-windows-x64.zip. Assets found: '$names'"
+          # mnvoice.exe is mandatory: it is what the updater fetches.
+          foreach ($need in @('mnvoice.exe','mnvoice-windows-x64.zip')) {
+            if ((($names -split "`n") -notcontains $need)) {
+              throw "release $tag is missing $need. Assets found: '$names'"
+            }
           }
-          Write-Host "confirmed asset on $tag"
+          Write-Host "confirmed assets on $tag"
