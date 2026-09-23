@@ -753,28 +753,42 @@ fn check_for_updates_async(quiet: bool) {
         }
 
         // Never install while the user is speaking or a transcript is in flight.
-        if let Some(app) = current_app() {
-            if app.state != State::Idle {
-                log(&format!(
-                    "update v{} available, deferred until idle (currently {})",
-                    rel.version, state_name(app.state)
-                ));
-                if !quiet {
-                    balloon(
-                        "Update available",
-                        &format!("v{} will install when you next release the hotkey", rel.version),
-                    );
-                }
-                return;
+        let state = session_state();
+        if state != State::Idle {
+            log(&format!(
+                "update v{} available, deferred (currently {})",
+                rel.version,
+                state_name(state)
+            ));
+            if !quiet {
+                balloon(
+                    "Update available",
+                    &format!(
+                        "v{} is available. Not installed while mnvoice is busy - check again when idle.",
+                        rel.version
+                    ),
+                );
             }
+            return;
         }
 
         log(&format!("installing v{}", rel.version));
-        match update::install_and_relaunch() {
-            Ok(v) => log(&format!("updated to v{v}, relaunching")),
-            Err(e) => log(&format!("update failed: {e}")),
+        if let Err(e) = update::install_and_relaunch(session_active) {
+            log(&format!("update failed: {e}"));
         }
     });
+}
+
+/// True while a dictation session is in flight. The install path checks this
+/// both before downloading and again right before the binary is swapped, so a
+/// transcript can never be stranded mid-swap.
+fn session_active() -> bool {
+    session_state() != State::Idle
+}
+
+/// Current session state, or Idle when no window is up to ask.
+fn session_state() -> State {
+    current_app().map(|app| app.state).unwrap_or(State::Idle)
 }
 
 fn current_app() -> Option<&'static mut App> {
