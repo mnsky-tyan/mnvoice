@@ -30,6 +30,9 @@ jobs:
         run: |
           mkdir dist
           cp target/release/mnvoice.exe dist/
+          # The raw exe is also left at the workspace root so the publish step can
+          # hand it to gh; only the zip is created from dist.
+          cp target/release/mnvoice.exe mnvoice.exe
           cp mnvoice.env.example dist/
           cp keywords.txt.example dist/
           Compress-Archive -Path dist/* -DestinationPath mnvoice-windows-x64.zip
