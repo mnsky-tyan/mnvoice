@@ -90,6 +90,25 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Terminate any other running mnvoice.exe instances so they release the global
+/// hotkey before this instance tries to claim it. Uses the Windows taskkill utility
+/// which is present on every supported Windows version.
+fn kill_running_instances() {
+    let exe = std::env::current_exe().ok();
+    let name = exe
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("mnvoice.exe")
+        .to_string();
+    let self_pid = unsafe { GetCurrentProcessId() };
+    let _ = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
+        .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
+        .creation_flags(0x0800_0000)
+        .status();
+    log(&format!("restart: terminated other {name} instances"));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--install-startup") {
@@ -99,6 +118,12 @@ fn main() {
     if args.iter().any(|a| a == "--uninstall-startup") {
         if let Err(e) = install_startup(false) { log(&format!("uninstall-startup failed: {e}")); }
         return;
+    }
+    if args.iter().any(|a| a == "--restart") {
+        // Graceful self-heal: ask any running instance to exit, wait for it to
+        // release the global hotkey, then continue starting fresh.
+        kill_running_instances();
+        thread::sleep(std::time::Duration::from_millis(700));
     }
 
     let _mutex = unsafe { CreateMutexW(None, true, MUTEX_NAME) }.ok();
@@ -170,16 +195,37 @@ fn main() {
             }
         };
 
-        if let Err(e) = RegisterHotKey(
-            hwnd,
-            HOTKEY_TOGGLE,
-            HOT_KEY_MODIFIERS(hk_mod),
-            hk_vk,
-        ) {
-            log(&format!("RegisterHotKey({hk_str}) failed: {e}"));
+        // Register the global hotkey. If another process (or a stale registration
+        // from a previously killed instance) still owns it, retry for a few seconds
+        // before giving up, then surface a visible tray warning instead of silently
+        // running with a dead hotkey.
+        let mut hotkey_ok = false;
+        for attempt in 0..10 {
+            match RegisterHotKey(hwnd, HOTKEY_TOGGLE, HOT_KEY_MODIFIERS(hk_mod), hk_vk) {
+                Ok(()) => {
+                    hotkey_ok = true;
+                    if attempt > 0 {
+                        log(&format!("RegisterHotKey({hk_str}) succeeded on attempt {}", attempt + 1));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 9 {
+                        log(&format!(
+                            "RegisterHotKey({hk_str}) FAILED after retries: {e} - another app or a stale mnvoice instance is holding this hotkey"
+                        ));
+                    } else {
+                        thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
         }
 
-        add_tray(hwnd, "mnvoice - idle");
+        if hotkey_ok {
+            add_tray(hwnd, &format!("mnvoice - idle ({hk_str})"));
+        } else {
+            add_tray(hwnd, &format!("mnvoice - HOTKEY {hk_str} UNAVAILABLE (in use by another app)"));
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -331,6 +377,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             ..Default::default()
                         },
                     );
+                    // Release the global hotkey so the next launch can claim it.
+                    // Without this, a killed or exited instance can leave Windows
+                    // still believing the hotkey is owned, breaking the next start.
+                    let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+                    let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     let app = app_ref(hwnd);
                     app.state = State::Idle;
                     PostQuitMessage(0);
@@ -343,6 +394,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+                let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
