@@ -284,14 +284,20 @@ mnvoice can update itself. There is no installer and no package manager, so an
 update means: download the new `mnvoice.exe`, move the old one aside, put the new
 one in its place, relaunch.
 
-**Automatic.** Set `AUTO_UPDATE=1` in `mnvoice.env`. mnvoice then checks the
-release feed at most once per day, and only installs when it is idle - it will
+**Automatic.** Set `AUTO_UPDATE=1` in `mnvoice.env`. mnvoice then checks
+the release feed at most once per day, and only installs when it is idle - it will
 never swap the binary out from under a transcript in flight.
 
 It is off by default on purpose. Replacing a running binary is a decision you
 should make, not one that happens silently because a default pointed that way.
 Absence, an empty value, or a typo all mean off, so a misspelling cannot quietly
 switch it on.
+
+The check reads GitHub's web `releases/latest` page rather than the REST API.
+That matters: the unauthenticated API allows 60 requests per hour **per source
+IP**, so on a shared or NAT'd address the budget can already be spent by other
+traffic and every check would fail with `HTTP 403`. The web endpoint has no such
+limit, and it needs no token either.
 
 **Manual.** Tray menu > `Check for updates`. Same result, whenever you ask.
 

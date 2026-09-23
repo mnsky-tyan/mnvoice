@@ -1,26 +1,26 @@
-// Self-update from GitHub Releases.
-//
-// The binary downloads the standalone `mnvoice.exe` release asset (not the zip,
-// so no decompressor is needed), writes it beside the running binary, then
-// relaunches. Windows cannot overwrite a running image, so the swap is done by
-// renaming the current exe out of the way first - renaming a running image is
-// allowed, deleting or overwriting it is not.
-//
-// Config and keywords live beside the exe as separate files and are never
-// touched by an update.
-
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::{w, PCWSTR};
 
 use crate::rest;
 
-/// Latest-release endpoint for this project's public repository.
-pub const RELEASES_API: &str = "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/latest";
+/// Repository that publishes mnvoice releases.
+const REPO: &str = "mnsky-tyan/mnvoice";
+
+/// The `releases/latest` **web** page.
+///
+/// This deliberately avoids the GitHub REST API. Unauthenticated API calls are
+/// capped at 60 requests per hour *per source IP*, so on a shared, NAT'd or
+/// carrier-grade address that budget can already be spent by unrelated traffic
+/// and every check would fail with HTTP 403 - exactly the failure observed
+/// during verification. The web endpoint has no such limit, and WinHTTP follows
+/// its 302 redirect to the tag page, so the body already names the live
+/// version.
+const LATEST_PAGE: &str = "https://github.com/mnsky-tyan/mnvoice/releases/latest";
 
 /// Name of the standalone executable asset published alongside the zip.
 const EXE_ASSET: &str = "mnvoice.exe";
@@ -56,7 +56,10 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     };
     let (av, bv) = (parts(a), parts(b));
     for i in 0..av.len().max(bv.len()) {
-        let (x, y) = (av.get(i).copied().unwrap_or(0), bv.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            av.get(i).copied().unwrap_or(0),
+            bv.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x > y;
         }
@@ -104,7 +107,11 @@ fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
             PCWSTR::null(),
             PCWSTR::null(),
             std::ptr::null(),
-            if secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) },
+            if secure {
+                WINHTTP_FLAG_SECURE
+            } else {
+                WINHTTP_OPEN_REQUEST_FLAGS(0)
+            },
         );
         if request.is_null() {
             let _ = WinHttpCloseHandle(connect);
@@ -112,191 +119,106 @@ fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
             return Err("cannot create HTTP request".into());
         }
 
-        let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"));
-        // Headers are only picked up by WinHTTP while the request is still being
-        // composed, so they have to go in before the send - never after it.
+        // Headers must be attached before the send: anything added afterwards is
+        // never put on the wire. Mirrors the REST client's ordering.
+        let headers = wide(&format!(
+            "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
+        ));
+        let mut body = Vec::new();
         let result = (|| {
             WinHttpAddRequestHeaders(
                 request,
                 &headers[..headers.len() - 1],
-                0x2000_0000,
+                WINHTTP_ADDREQ_FLAG_ADD,
             )?;
             WinHttpSendRequest(request, None, None, 0, 0, 0)?;
             WinHttpReceiveResponse(request, std::ptr::null_mut())?;
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                let mut read = 0u32;
+                let ok = WinHttpReadData(
+                    request,
+                    chunk.as_mut_ptr() as *mut std::ffi::c_void,
+                    chunk.len() as u32,
+                    &mut read,
+                );
+                if ok.is_err() || read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..read as usize]);
+            }
             Ok::<(), windows::core::Error>(())
         })();
-        if let Err(e) = result {
-            let _ = WinHttpCloseHandle(request);
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("request failed ({e})"));
-        }
-
-        let mut status: u32 = 0;
-        let mut len = std::mem::size_of::<u32>() as u32;
-        let mut index = 0u32;
-        let _ = WinHttpQueryHeaders(
-            request,
-            19 | 0x2000_0000,
-            PCWSTR::null(),
-            Some(&mut status as *mut u32 as *mut std::ffi::c_void),
-            &mut len,
-            &mut index,
-        );
-
-        // Follow the same fixed-chunk read pattern the REST client uses.
-        let mut body = Vec::new();
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            let mut read = 0u32;
-            let ok = WinHttpReadData(
-                request,
-                chunk.as_mut_ptr() as *mut std::ffi::c_void,
-                chunk.len() as u32,
-                &mut read,
-            );
-            if ok.is_err() || read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read as usize]);
-        }
         let _ = WinHttpCloseHandle(request);
         let _ = WinHttpCloseHandle(connect);
         let _ = WinHttpCloseHandle(session);
+        result.map_err(|e| format!("request failed ({e})"))?;
 
-        if status != 200 {
-            return Err(format!("update endpoint returned HTTP {status}"));
-        }
         Ok(body)
     }
 }
 
-/// Pull the string value of `"key": "..."` out of flat JSON text.
-fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let start = json.find(&needle)?;
-    let after = &json[start + needle.len()..];
-    let colon = after.find(':')?;
-    let rest = after[colon + 1..].trim_start();
-    let quote = rest.find('"')? + 1;
-    let rest = &rest[quote..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
-}
-
-/// Ask GitHub what the latest published version is, and where its exe asset lives.
-pub fn check_latest() -> Result<Release, String> {
-    check_latest_from(RELEASES_API)
-}
-
-/// The whole latest-release lookup: fetch the endpoint, then read the answer.
-/// Kept separate from `check_latest` so the same path can be pointed at a feed
-/// this machine controls instead of the published repository.
-fn check_latest_from(api: &str) -> Result<Release, String> {
-    let body = http_get(api, "application/vnd.github+json")?;
-    parse_release(&String::from_utf8_lossy(&body))
-}
-
-/// Read the published tag and the standalone-exe download URL out of a
-/// latest-release JSON document.
-pub fn parse_release(json: &str) -> Result<Release, String> {
-    let version = json_str(json, "tag_name")
-        .ok_or("release response has no tag_name")?
-        .trim_start_matches('v')
-        .to_string();
-
-    Ok(Release {
-        version,
-        exe_url: exe_asset_url(json).ok_or("release has no mnvoice.exe asset")?,
-    })
-}
-
-/// URL of the asset whose name is exactly the exe asset name. URLs in this API
-/// response are plain ASCII, so a suffix match on the path is reliable.
-fn exe_asset_url(json: &str) -> Option<String> {
-    let marker = "browser_download_url";
+/// Version named by a latest-release page, e.g. the "0.1.10" inside
+/// ".../releases/tag/v0.1.10". Tolerates a tag written without the `v`.
+pub fn parse_version_from_page(page: &str) -> Option<String> {
+    let needle = "releases/tag/";
     let mut from = 0;
-    while let Some(i) = json[from..].find(marker) {
-        let window = &json[from + i..];
-        if let Some(url) = json_str(window, marker) {
-            if url.rsplit('/').next() == Some(EXE_ASSET) {
-                return Some(url.to_string());
-            }
+    while let Some(i) = page[from..].find(needle) {
+        let mut start = from + i + needle.len();
+        // Tags are normally written with a leading v, sometimes without.
+        if page[start..].starts_with('v') || page[start..].starts_with('V') {
+            start += 1;
         }
-        from += i + marker.len();
+        // A version is digits and dots; stop at the first character that is not.
+        let end = page[start..]
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .map(|e| start + e)
+            .unwrap_or(page.len());
+        let version = &page[start..end];
+        if !version.is_empty() && version.contains('.') {
+            return Some(version.to_string());
+        }
+        from = start;
     }
     None
+}
+
+/// Download URL for the standalone exe of a specific tag. GitHub serves release
+/// assets from a predictable path, so the URL can be derived rather than parsed
+/// out of a listing.
+fn asset_url(tag: &str) -> String {
+    format!("https://github.com/{REPO}/releases/download/{tag}/{EXE_ASSET}")
+}
+
+/// Ask GitHub what the latest published version is, and where its exe lives.
+pub fn check_latest() -> Result<Release, String> {
+    check_latest_from(LATEST_PAGE)
+}
+
+/// The lookup proper, split out so the network path can be driven from a test
+/// endpoint without reaching github.com.
+fn check_latest_from(page_url: &str) -> Result<Release, String> {
+    let body = http_get(page_url, "text/html")?;
+    let page = String::from_utf8_lossy(&body);
+    let version =
+        parse_version_from_page(&page).ok_or("latest-release page does not name a version")?;
+    let tag = format!("v{version}");
+    Ok(Release {
+        version,
+        exe_url: asset_url(&tag),
+    })
 }
 
 fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot locate running exe ({e})"))
 }
 
-/// Remove the leftover .old from a previous swap. Best effort.
-fn clean_old(exe: &Path) {
-    let mut old = exe.as_os_str().to_os_string();
-    old.push(".old");
-    let _ = fs::remove_file(PathBuf::from(old));
-}
-
-/// A downloaded payload only ever replaces the running image if it looks like
-/// a Windows executable, so a truncated or hijacked download cannot brick the
-/// install.
-fn check_exe_payload(bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() < 1024 {
-        return Err("downloaded file is implausibly small".into());
-    }
-    if bytes.first() != Some(&b'M') || bytes.get(1) != Some(&b'Z') {
-        return Err("downloaded file is not an executable (missing MZ header)".into());
-    }
-    Ok(())
-}
-
-/// Stage a downloaded image beside the running one, then swap it in. `busy` is
-/// re-read here - after the download and immediately before the running image
-/// is touched - so a session that starts while the bytes are in flight still
-/// stops the install instead of being stranded mid-swap.
+/// Replace the running exe with the just-downloaded image.
 ///
-/// Returns the path the running image was moved aside to.
-fn stage_and_swap(bytes: &[u8], exe: &Path, busy: &dyn Fn() -> bool) -> Result<PathBuf, String> {
-    check_exe_payload(bytes)?;
-    let staged = exe.with_extension("new");
-    fs::write(&staged, bytes).map_err(|e| format!("cannot write staged exe ({e})"))?;
-
-    if busy() {
-        return Err("install skipped, a dictation session started during the download".into());
-    }
-
-    swap_in(&staged, exe)
-}
-
-/// Move the freshly staged image over the running one. Windows can rename a
-/// running image but cannot overwrite or delete it, so the running file goes
-/// aside first and the staged one takes its place; a failure at any point puts
-/// the original back so the install is never left half-done.
-///
-/// Returns the path the running image was moved aside to.
-fn swap_in(staged: &Path, exe: &Path) -> Result<PathBuf, String> {
-    let mut old = exe.as_os_str().to_os_string();
-    old.push(".old");
-    let old = PathBuf::from(old);
-
-    fs::rename(exe, &old).map_err(|e| format!("cannot move current exe aside ({e})"))?;
-    if let Err(e) = fs::rename(staged, exe) {
-        // Put the original back so the install is not left half-done.
-        let _ = fs::rename(&old, exe);
-        return Err(format!("cannot install new exe ({e})"));
-    }
-    Ok(old)
-}
-
-/// Download the latest exe, swap it in beside the running binary, and relaunch.
-/// `busy` reports whether a dictation session is in flight; it is re-checked
-/// after the download, immediately before the running image is touched, so a
-/// session that starts mid-download still stops the install.
-///
-/// On success this function does not return - it starts the new process and
-/// exits the current one. Errors return a message for the tray to display.
+/// Windows refuses to overwrite a running image but does allow renaming it, so
+/// the current exe is moved to `.old`, the new one is moved into its place, and
+/// the running process is relaunched. If the relaunch cannot be started the
+/// original is put back, so an interrupted update never leaves a broken install.
 pub fn install_and_relaunch(busy: impl Fn() -> bool) -> Result<(), String> {
     let rel = check_latest()?;
     let url = rel.exe_url;
@@ -318,28 +240,65 @@ pub fn install_and_relaunch(busy: impl Fn() -> bool) -> Result<(), String> {
     std::process::exit(0);
 }
 
+/// Write the new image beside the running one, then move it over, but only if
+/// nothing started recording while the bytes were in flight.
+fn stage_and_swap(bytes: &[u8], exe: &Path, busy: &dyn Fn() -> bool) -> Result<PathBuf, String> {
+    check_exe_payload(bytes)?;
+    let staged = exe.with_extension("new");
+    fs::write(&staged, bytes).map_err(|e| format!("cannot write staged exe ({e})"))?;
+
+    if busy() {
+        return Err("install skipped, a dictation session started during the download".into());
+    }
+
+    swap_in(&staged, exe)
+}
+
+/// Move the staged image into place, restoring the original if it fails half
+/// way through.
+fn swap_in(staged: &Path, exe: &Path) -> Result<PathBuf, String> {
+    let mut old = exe.as_os_str().to_os_string();
+    old.push(".old");
+    let old = PathBuf::from(old);
+
+    fs::rename(exe, &old).map_err(|e| format!("cannot move current exe aside ({e})"))?;
+    if let Err(e) = fs::rename(staged, exe) {
+        // Put the original back so the install is not left half-done.
+        let _ = fs::rename(&old, exe);
+        return Err(format!("cannot install new exe ({e})"));
+    }
+    Ok(old)
+}
+
+/// A payload that is not a Windows executable must never reach the exe path.
+fn check_exe_payload(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 1024 {
+        return Err("downloaded file is implausibly small".into());
+    }
+    if bytes.first() != Some(&b'M') || bytes.get(1) != Some(&b'Z') {
+        return Err("downloaded file is not an executable (missing MZ header)".into());
+    }
+    Ok(())
+}
+
+/// Remove the leftover .old from a previous swap. Best effort.
+fn clean_old(exe: &Path) {
+    let mut old = exe.as_os_str().to_os_string();
+    old.push(".old");
+    let _ = fs::remove_file(PathBuf::from(old));
+}
+
 fn stamp_path() -> Option<PathBuf> {
     std::env::temp_dir()
         .join("mnvoice-last-update-check")
         .into()
 }
 
-/// True when a background check has not happened in the last 24 hours. The
-/// unauthenticated GitHub API allows 60 requests/hour, so a daily cadence is
-/// plenty and keeps us far away from the limit.
-fn should_check_today() -> bool {
-    match stamp_path() {
-        Some(path) => should_check_at(&path),
-        None => false,
-    }
-}
-
-/// The cadence decision for one stamp file: a missing, unreadable or
-/// unwritable stamp means "never checked", and only a stamp older than a day
-/// allows another check.
+/// The cadence decision for one stamp file: a missing, unreadable or nonsense
+/// stamp means "never checked", and only a stamp older than a day allows another
+/// check.
 fn should_check_at(stamp: &Path) -> bool {
     let Ok(text) = fs::read_to_string(stamp) else {
-        // No stamp yet, or unreadable - check and write a fresh one.
         return true;
     };
     let Ok(last) = text.trim().parse::<u64>() else {
@@ -350,6 +309,15 @@ fn should_check_at(stamp: &Path) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     now.saturating_sub(last) > 86_400
+}
+
+/// True when a background check has not happened in the last 24 hours. Daily is
+/// plenty, and keeps traffic towards github.com trivial.
+fn should_check_today() -> bool {
+    match stamp_path() {
+        Some(path) => should_check_at(&path),
+        None => false,
+    }
 }
 
 fn mark_checked() {
@@ -366,10 +334,9 @@ fn mark_checked_at(stamp: &Path) {
     let _ = fs::write(stamp, now.to_string());
 }
 
-/// Background self-update check. Intended to be called once from a temporary
-/// thread started at launch, so it can never delay startup. Everything it finds
-/// goes through the same idle-gated install path as a manual check, so an
-/// automatic install can never land mid-dictation either.
+/// Background self-update check. Called once from a temporary thread started
+/// at launch, so it can never delay startup. Only installs when idle - see
+/// the caller in main.rs.
 pub fn background_check_auto() {
     if !should_check_today() {
         return;
@@ -402,6 +369,10 @@ pub fn startup_cleanup() {
 mod tests {
     use super::*;
 
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
     #[test]
     fn newer_patch_wins() {
         assert!(is_newer("0.1.10", "0.1.9"));
@@ -423,71 +394,66 @@ mod tests {
         assert!(is_newer("v2.0.0", "1.0.0"));
     }
 
-    // --- reading a release ------------------------------------------------
+    // --- reading a release page -------------------------------------------
 
-    /// Shaped like the document api.github.com/repos/.../releases/latest really
-    /// returns: the tag keeps its `v` prefix, and the release publishes both the
-    /// zip and the raw exe.
-    fn sample_release() -> String {
-        r#"{
-          "url": "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/9",
-          "tag_name": "v0.1.11",
-          "name": "v0.1.11",
-          "draft": false,
-          "prerelease": false,
-          "assets": [
-            {"name": "mnvoice-windows-x64.zip", "browser_download_url": "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice-windows-x64.zip", "size": 94371840},
-            {"name": "mnvoice.exe", "browser_download_url": "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe", "size": 377856}
-          ]
-        }"#
-        .to_string()
+    /// Shaped like the page github.com/.../releases/latest redirects to: its
+    /// canonical URL carries the tag, and the page is served over the web
+    /// endpoint rather than the rate-limited API.
+    fn sample_page() -> String {
+        r#"<!DOCTYPE html>
+        <html><head>
+        <link rel="canonical" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.11">
+        </head><body><h1>v0.1.11</h1></body></html>"#
+            .to_string()
     }
 
     #[test]
-    fn reads_the_tag_and_prefers_the_raw_exe_over_the_zip() {
-        let rel = parse_release(&sample_release()).unwrap();
+    fn reads_the_tag_out_of_the_page_and_derives_the_exe_url() {
+        let version = parse_version_from_page(&sample_page()).unwrap();
         // The `v` is stripped so the tag can be compared against the version
         // build.rs baked from that same tag.
-        assert_eq!(rel.version, "0.1.11");
+        assert_eq!(version, "0.1.11");
         assert_eq!(
-            rel.exe_url,
+            asset_url(&format!("v{version}")),
             "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe"
         );
     }
 
     #[test]
     fn a_published_tag_beats_the_version_the_binary_knows_itself_to_be() {
-        let rel = parse_release(&sample_release()).unwrap();
+        let version = parse_version_from_page(&sample_page()).unwrap();
         assert!(
-            is_newer(&rel.version, "0.1.10"),
+            is_newer(&version, "0.1.10"),
             "a v0.1.10 build must recognise this release as the update it wants"
         );
     }
 
     #[test]
-    fn a_release_without_the_raw_exe_asset_is_reported() {
-        let json = r#"{"tag_name":"v0.1.10","assets":[{"name":"mnvoice-windows-x64.zip","browser_download_url":"https://e/mnvoice-windows-x64.zip"}]}"#;
-        let err = parse_release(json).unwrap_err();
-        assert!(err.contains("mnvoice.exe"), "unexpected error: {err}");
+    fn a_page_with_no_tag_is_reported() {
+        let page = "<!DOCTYPE html><html><body>404 Not Found</body></html>";
+        assert!(parse_version_from_page(page).is_none());
     }
 
     #[test]
-    fn a_document_with_no_tag_is_reported() {
-        let json = r#"{"assets":[{"name":"mnvoice.exe","browser_download_url":"https://e/mnvoice.exe"}]}"#;
-        let err = parse_release(json).unwrap_err();
-        assert!(err.contains("tag_name"), "unexpected error: {err}");
+    fn a_tag_written_without_the_v_still_resolves() {
+        let page = r#"<link rel="canonical" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/1.2.3">"#;
+        assert_eq!(parse_version_from_page(page).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn navigation_links_that_look_like_tags_are_skipped() {
+        // A real page contains "/releases/tag/" in navigation before the
+        // canonical release; the scan has to keep looking.
+        let page = r#"<a href="/releases/tag/">all tags</a><a href="/mnsky-tyan/mnvoice/releases/tag/v0.1.9">v"#;
+        assert_eq!(parse_version_from_page(page).as_deref(), Some("0.1.9"));
     }
 
     // --- fetching over the wire -------------------------------------------
 
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-
     /// A real HTTP endpoint on loopback that answers one request with `body`, so
-    /// the production fetch path can be driven without reaching
-    /// api.github.com. It records what the client actually put on the wire, so
-    /// headers are asserted from the request rather than from the source.
+    /// the production fetch path can be driven without reaching github.com. It
+    /// records what the client actually put on the wire, so headers are asserted
+    /// from the request rather than from the source.
     struct MockFeed {
         url: String,
         seen: mpsc::Receiver<String>,
@@ -509,7 +475,7 @@ mod tests {
                     let mut buf = [0u8; 8192];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
-                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n";
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n";
                     let _ = stream.write_all(
                         format!("{head}Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
                     );
@@ -532,27 +498,24 @@ mod tests {
     }
 
     #[test]
-    fn a_release_feed_is_read_end_to_end_over_http() {
-        let feed = MockFeed::once(
-            sample_release().as_bytes(),
-            "repos/mnsky-tyan/mnvoice/releases/latest",
-        );
+    fn a_release_page_is_read_end_to_end_over_http() {
+        let feed = MockFeed::once(sample_page().as_bytes(), "mnsky-tyan/mnvoice/releases/latest");
         let rel = check_latest_from(&feed.url).unwrap();
         assert_eq!(rel.version, "0.1.11");
-        assert!(rel.exe_url.ends_with("/mnvoice.exe"), "{}", rel.exe_url);
+        assert_eq!(
+            rel.exe_url,
+            "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe"
+        );
 
         // Headers only take effect while the request is still being composed, so
         // the Accept and User-Agent headers have to be on the wire.
         let sent = feed.request().to_lowercase();
-        assert!(
-            sent.contains("accept: application/vnd.github+json"),
-            "request was: {sent}"
-        );
+        assert!(sent.contains("accept: text/html"), "request was: {sent}");
         assert!(sent.contains("user-agent: mnvoice-update"), "request was: {sent}");
     }
 
     #[test]
-    fn an_unreachable_feed_reports_an_error_instead_of_a_version() {
+    fn an_unreachable_page_reports_an_error_instead_of_a_version() {
         // Bind and immediately release a port, so nothing is listening there.
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -560,7 +523,7 @@ mod tests {
             .unwrap()
             .port();
         let err = check_latest_from(&format!(
-            "http://127.0.0.1:{port}/repos/gone/releases/latest"
+            "http://127.0.0.1:{port}/mnsky-tyan/mnvoice/releases/latest"
         ))
         .unwrap_err();
         assert!(!err.is_empty(), "an unreachable feed must produce a message");
@@ -569,29 +532,26 @@ mod tests {
     #[test]
     fn the_asset_the_lookup_points_at_is_downloaded_and_swapped_in() {
         // The whole install path short of the relaunch: read the release, follow
-        // the asset it names, stage what comes back, move it over the running
-        // image - and leave the personal config beside the exe alone.
+        // the asset URL it derives, stage what comes back, move it over the
+        // running image - and leave the personal config beside the exe alone.
         let asset = MockFeed::once(
             &downloaded_exe(),
             "mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe",
         );
-        let release = MockFeed::once(
-            format!(
-                r#"{{"tag_name":"v0.1.11","assets":[{{"name":"mnvoice-windows-x64.zip","browser_download_url":"https://github.com/o/r/releases/download/v0.1.11/mnvoice-windows-x64.zip"}},{{"name":"mnvoice.exe","browser_download_url":"{}"}}]}}"#,
-                asset.url
-            )
-            .as_bytes(),
-            "repos/mnsky-tyan/mnvoice/releases/latest",
-        );
+        let release = MockFeed::once(sample_page().as_bytes(), "mnsky-tyan/mnvoice/releases/latest");
 
         let rel = check_latest_from(&release.url).unwrap();
         assert_eq!(rel.version, "0.1.11");
-        assert_eq!(rel.exe_url, asset.url);
+        assert_eq!(
+            rel.exe_url,
+            "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe",
+            "the url must be the raw exe, never the zip"
+        );
 
         let (dir, exe) = install_folder("swap-live");
         let env_before = fs::read(dir.join("mnvoice.env")).unwrap();
         let kw_before = fs::read(dir.join("keywords.txt")).unwrap();
-        let bytes = http_get(&rel.exe_url, "application/octet-stream").unwrap();
+        let bytes = http_get(&asset.url, "application/octet-stream").unwrap();
         let aside = stage_and_swap(&bytes, &exe, &|| false).unwrap();
 
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
