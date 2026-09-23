@@ -93,23 +93,27 @@ impl Orb {
                 return Err("CreateCompatibleDC failed".into());
             }
 
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: ORB_WIDTH,
-                    biHeight: -ORB_HEIGHT, // top-down DIB
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
+            // A BI_BITFIELDS header with an explicit alpha mask is required here.
+            // Plain BI_RGB at 32bpp gives a DGB with no alpha, and UpdateLayeredWindow
+            // then composites a fully transparent surface - the orb is invisible.
+            let bmi = BITMAPV5HEADER {
+                bV5Size: std::mem::size_of::<BITMAPV5HEADER>() as u32,
+                bV5Width: ORB_WIDTH,
+                bV5Height: -ORB_HEIGHT, // top-down DIB
+                bV5Planes: 1,
+                bV5BitCount: 32,
+                bV5Compression: BI_BITFIELDS,
+                bV5RedMask: 0x00FF_0000,
+                bV5GreenMask: 0x0000_FF00,
+                bV5BlueMask: 0x0000_00FF,
+                bV5AlphaMask: 0xFF00_0000,
                 ..Default::default()
             };
 
             let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let bitmap = match CreateDIBSection(
                 dc_mem,
-                &bmi,
+                &bmi as *const BITMAPV5HEADER as *const BITMAPINFO,
                 DIB_RGB_COLORS,
                 &mut bits_ptr,
                 HANDLE::default(),
@@ -425,6 +429,30 @@ fn render_gas_fluid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An all-transparent buffer arithmetically "passes" a non-zero check, so every
+    /// test must assert opaque pixels too. A regressed alpha channel is exactly how
+    /// an orb ships that is present but invisible.
+    #[test]
+    fn test_render_surfaces_are_opaque_and_coloured() {
+        let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
+        render_gas_fluid(10, &mut buf, false, (1.0, 0.18, 0.58), 0.75);
+
+        let opaque = buf.iter().filter(|&&p| ((p >> 24) & 0xFF) > 200).count();
+        assert!(opaque > 150, "orb must have visible opaque pixels, got {opaque}");
+
+        let centre = (ORB_HEIGHT / 2 * ORB_WIDTH + ORB_WIDTH / 2) as usize;
+        let p = buf[centre];
+        assert!(
+            ((p >> 24) & 0xFF) > 100,
+            "centre pixel must be visible, alpha=0x{:02X}",
+            (p >> 24) & 0xFF
+        );
+        // Packing order must stay BGRA for UpdateLayeredWindow: the low byte is
+        // blue, and the green byte must come from the configured 0.18 component.
+        let green = (p >> 8) & 0xFF;
+        assert!((20..60).contains(&green), "green byte looks wrong: {green}");
+    }
 
     #[test]
     fn test_render_recording_non_empty() {
