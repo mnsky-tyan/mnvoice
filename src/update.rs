@@ -656,7 +656,7 @@ mod tests {
         server: std::thread::JoinHandle<()>,
     }
 
-        impl MockFeed {
+    impl MockFeed {
         /// `path` is what the client asks for and what the URL ends in, so the
         /// release lookup gets a path ending in `/latest` and an asset gets one
         /// ending in `/mnvoice.exe` exactly as GitHub serves them. The response is
