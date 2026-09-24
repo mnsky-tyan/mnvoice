@@ -11,10 +11,11 @@ mod orb;
 mod paste;
 mod rest;
 mod stream;
+mod update;
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,8 +29,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIF_GUID, NIF_ICON,
-    NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -60,6 +61,7 @@ const IDM_STARTUP: usize = 3;
 const IDM_RESTART: usize = 4;
 const IDM_OPEN_CONFIG: usize = 5;
 const IDM_OPEN_KEYWORDS: usize = 6;
+const IDM_UPDATE: usize = 7;
 const TIMER_ORB: usize = 101;
 
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
@@ -77,6 +79,40 @@ enum State {
     Idle,
     Recording,
     Transcribing,
+}
+
+/// Human-readable state for logs and notifications.
+fn state_name(s: State) -> &'static str {
+    match s {
+        State::Idle => "idle",
+        State::Recording => "recording",
+        State::Transcribing => "transcribing",
+    }
+}
+
+impl State {
+    fn from_code(code: u8) -> State {
+        match code {
+            1 => State::Recording,
+            2 => State::Transcribing,
+            _ => State::Idle,
+        }
+    }
+}
+
+/// The session state in one authoritative place, readable from any thread.
+///
+/// The updater's worker thread reads this after its download finishes to decide
+/// whether the binary may be swapped, so it must never have to ask the UI
+/// thread's window for the answer: that lookup handed out a raw pointer into
+/// UI-thread-owned memory that another thread then read and aliased, which is
+/// only correct by luck and disappears entirely once the window is gone.
+static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle as u8);
+
+/// Record a state change in both the UI's own copy and the shared atomic.
+fn set_state(app: &mut App, state: State) {
+    app.state = state;
+    SESSION_STATE.store(state as u8, Ordering::SeqCst);
 }
 
 struct App {
@@ -134,6 +170,17 @@ fn kill_running_instances() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == update::FINISH_UPDATE_ARG) {
+        // A second, short-lived copy of this exe finishes an install the first one
+        // could not. It waits for that process to be gone, and only then, and only
+        // when the swap left the exe path empty, does it move the staged image in.
+        // Started before the single-instance mutex is taken, which the app itself
+        // is holding for as long as it is the one installing. It runs from a copy
+        // of this exe under an image name of its own, so the install it has to
+        // repair comes in after the flag on the command line.
+        update::finish_install(args.get(pos + 1).map(std::path::Path::new));
+        return;
+    }
     if args.iter().any(|a| a == "--restart") {
         // Graceful self-heal: terminate any running instance, wait for it to
         // release the global hotkey, then continue starting fresh.
@@ -190,6 +237,9 @@ fn main() {
         }
 
         let audio_engine = audio::AudioEngine::start();
+        // Best-effort housekeeping: drop the leftover .old from a previous
+        // update and arm the periodic background check when AUTO_UPDATE=1.
+        update::startup_cleanup(config.as_ref().map(|c| c.auto_update).unwrap_or(false));
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -375,7 +425,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if let Some(orb) = &mut app.orb {
                         orb.hide();
                     }
-                    app.state = State::Idle;
+                    set_state(app, State::Idle);
                     let _ = set_tray_tip(hwnd, "mnvoice - idle");
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
@@ -410,7 +460,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     let app = app_ref(hwnd);
-                    app.state = State::Idle;
+                    set_state(app, State::Idle);
                     PostQuitMessage(0);
                 } else if id == IDM_STOP {
                     let app = app_ref(hwnd);
@@ -426,6 +476,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 } else if id == IDM_RESTART {
                     relaunch_for_restart();
+                } else if id == IDM_UPDATE {
+                    check_for_updates_async(false);
                 } else if id == IDM_OPEN_CONFIG {
                     open_companion_file(
                         "mnvoice.env",
@@ -490,7 +542,7 @@ fn toggle(app: &mut App) {
             // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
             let worker_cfg = cfg.clone();
             thread::spawn(move || worker(stop, cancelled, worker_cfg, outcome, hwnd_bits, audio_engine));
-            app.state = State::Recording;
+            set_state(app, State::Recording);
 
             // Summon the orb last, once cancel is already live.
             if let Some(orb) = &mut app.orb {
@@ -502,7 +554,7 @@ fn toggle(app: &mut App) {
         }
         State::Recording => {
             app.stop.store(true, Ordering::SeqCst);
-            app.state = State::Transcribing;
+            set_state(app, State::Transcribing);
             let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
             if let Some(orb) = &mut app.orb {
                 orb.set_state(orb::OrbState::Transcribing);
@@ -524,7 +576,7 @@ fn cancel(app: &mut App) {
     // Tell the worker and the streaming reader to stop typing further words.
     app.cancelled.store(true, Ordering::SeqCst);
     app.stop.store(true, Ordering::SeqCst);
-    app.state = State::Idle;
+    set_state(app, State::Idle);
     let _ = unsafe { KillTimer(app.hwnd, TIMER_ORB) };
     let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
     if let Some(orb) = &mut app.orb {
@@ -624,6 +676,7 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING | startup_flags, IDM_STARTUP, w!("Start with Windows"));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, IDM_UPDATE, w!("Check for updates"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, w!("Open config"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_KEYWORDS, w!("Open keywords"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART, w!("Restart"));
@@ -706,6 +759,105 @@ fn open_companion_file(name: &str, stub: &str) {
         let _ = std::fs::write(&path, stub);
     }
     let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+}
+
+/// Ask GitHub whether a newer release exists. `quiet` suppresses the
+/// "up to date" balloon so the periodic background check stays silent.
+///
+/// Runs on a worker thread: the request can take seconds and the tray menu
+/// must not freeze. Installation only ever happens when idle, because swapping
+/// the exe mid-dictation would lose the transcript in flight.
+fn check_for_updates_async(quiet: bool) {
+    thread::spawn(move || {
+        let rel = match update::check_latest() {
+            Ok(r) => r,
+            Err(e) => {
+                log(&format!("update check failed: {e}"));
+                if !quiet {
+                    balloon("Update check failed", &e);
+                }
+                return;
+            }
+        };
+        let current = update::current_version().to_string();
+        if !update::is_newer(&rel.version, &current) {
+            log("mnvoice is up to date");
+            if !quiet {
+                balloon("mnvoice is up to date", &format!("v{current} is the latest version"));
+            }
+            return;
+        }
+
+        // Never install while the user is speaking or a transcript is in flight.
+        let state = session_state();
+        if state != State::Idle {
+            log(&format!(
+                "update v{} available, deferred (currently {})",
+                rel.version,
+                state_name(state)
+            ));
+            if !quiet {
+                balloon(
+                    "Update available",
+                    &format!(
+                        "v{} is available. Not installed while mnvoice is busy - check again when idle.",
+                        rel.version
+                    ),
+                );
+            }
+            return;
+        }
+
+        log(&format!("installing v{}", rel.version));
+        if let Err(e) = update::install_and_relaunch(&rel, session_active) {
+            log(&format!("update failed: {e}"));
+            if !quiet {
+                // The user asked for this check, so an install that cannot
+                // complete is news they get to see, not a log line only.
+                balloon("Update failed", &e);
+            }
+        }
+    });
+}
+
+/// True while a dictation session is in flight. The install path checks this
+/// both before downloading and again right before the binary is swapped, so a
+/// transcript can never be stranded mid-swap.
+fn session_active() -> bool {
+    session_state() != State::Idle
+}
+
+/// Current session state. Read from the shared atomic rather than from the
+/// window, so it stays correct while the window exists, while it is being
+/// created, and after it is gone.
+fn session_state() -> State {
+    State::from_code(SESSION_STATE.load(Ordering::SeqCst))
+}
+
+/// Transient notification from the tray icon. Balloon timeouts are only
+/// advisory, so the tip is dismissed on the next interaction either way.
+fn balloon(title: &str, body: &str) {
+    unsafe {
+        let Ok(hwnd) = FindWindowW(w!("mnvoiceTrayClass"), w!("mnvoice")) else {
+            return;
+        };
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_INFO | NIF_GUID,
+            guidItem: TRAY_GUID,
+            ..Default::default()
+        };
+        let t = wide(title);
+        let n = t.len().min(nid.szInfoTitle.len());
+        nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
+        let b = wide(body);
+        let n = b.len().min(nid.szInfo.len());
+        nid.szInfo[..n].copy_from_slice(&b[..n]);
+        nid.dwInfoFlags = NIIF_INFO;
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
 }
 
 /// Relaunch this exe with --restart so a fresh instance takes over, then exit.

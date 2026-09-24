@@ -29,6 +29,8 @@ pub struct Config {
     /// Drop disfluencies (uh, um, erm). Streaming uses the provider's native
     /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
     pub strip_fillers: bool,
+    /// Install a newer published release automatically when one appears.
+    pub auto_update: bool,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -47,6 +49,7 @@ pub fn load() -> Result<Config, String> {
     let mut vad_silence_ms = 3000u32;
     let mut vad_rms_threshold = 400.0f64;
     let mut filler_words_str = String::new();
+    let mut auto_update_str = String::new();
 
     // Check for keywords.txt beside the executable
     if let Ok(exe) = std::env::current_exe() {
@@ -81,6 +84,7 @@ pub fn load() -> Result<Config, String> {
                     &mut vad_silence_ms,
                     &mut vad_rms_threshold,
                     &mut filler_words_str,
+                    &mut auto_update_str,
                 )
             });
         }
@@ -148,6 +152,9 @@ pub fn load() -> Result<Config, String> {
     if let Ok(v) = std::env::var("FILLER_WORDS") {
         filler_words_str = v;
     }
+    if let Ok(v) = std::env::var("AUTO_UPDATE") {
+        auto_update_str = v;
+    }
 
     // Determine protocol: streaming vs rest
     let protocol = match protocol_str.to_lowercase().as_str() {
@@ -206,6 +213,10 @@ pub fn load() -> Result<Config, String> {
         "1" | "true" | "on" | "yes" | "keep"
     );
 
+    // AUTO_UPDATE is opt-in: silently replacing a binary is a decision the user
+    // must make, so absence and typos both mean "off".
+    let auto_update = parse_auto_update(&auto_update_str);
+
     Ok(Config {
         protocol,
         api_key,
@@ -224,7 +235,14 @@ pub fn load() -> Result<Config, String> {
         vad_silence_ms,
         vad_rms_threshold,
         strip_fillers,
+        auto_update,
     })
+}
+
+/// Whether an `AUTO_UPDATE` value asks for automatic installs. Opt-in, so an
+/// empty string, a typo and every other spelling all mean "off".
+pub fn parse_auto_update(s: &str) -> bool {
+    matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
 
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
@@ -270,6 +288,7 @@ fn apply(
     vad_silence_ms: &mut u32,
     vad_rms_threshold: &mut f64,
     filler_words_str: &mut String,
+    auto_update_str: &mut String,
 ) {
     match k {
         "PROTOCOL" | "MODE" | "PROVIDER" => *protocol_str = v.to_string(),
@@ -311,6 +330,7 @@ fn apply(
             if let Ok(n) = v.parse() { *vad_rms_threshold = n; }
         }
         "FILLER_WORDS" => *filler_words_str = v.to_string(),
+        "AUTO_UPDATE" => *auto_update_str = v.to_string(),
         _ => {}
     }
 }
@@ -444,6 +464,16 @@ mod tests {
         assert_eq!(parse_fluid_level("1.0"), 1.0);
         assert_eq!(parse_fluid_level("150%"), 1.0);
         assert_eq!(parse_fluid_level("0.01"), 0.05);
+    }
+
+    #[test]
+    fn test_auto_update_is_opt_in_ignoring_typo_and_empty() {
+        for on in ["1", "true", "TRUE", " On ", "yes", "yes\n", "1 "] {
+            assert!(parse_auto_update(on), "{on:?} should arm auto-update");
+        }
+        for off in ["", "  ", "0", "false", "no", "off", "ture", "enabled"] {
+            assert!(!parse_auto_update(off), "{off:?} must not arm auto-update");
+        }
     }
 
     #[test]

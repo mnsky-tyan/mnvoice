@@ -24,13 +24,23 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      # The raw exe is the asset the in-app updater downloads, and it is also
+      # what a user gets when they would rather not unpack a zip.
       - name: Package artifacts
         run: |
           mkdir dist
           cp target/release/mnvoice.exe dist/
+          # The raw exe is also left at the workspace root so the publish step can
+          # hand it to gh; only the zip is created from dist.
+          cp target/release/mnvoice.exe mnvoice.exe
           cp mnvoice.env.example dist/
           cp keywords.txt.example dist/
           Compress-Archive -Path dist/* -DestinationPath mnvoice-windows-x64.zip
+          # A published hash is the only way to check a download independently of
+          # where it was fetched from, so it ships with every release.
+          Get-FileHash -Algorithm SHA256 mnvoice.exe, mnvoice-windows-x64.zip |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path -Leaf $_.Path)" } |
+            Set-Content -Path SHA256SUMS -Encoding utf8
 
       # Uses the preinstalled gh CLI rather than softprops/action-gh-release,
       # which silently succeeds while uploading nothing under the Node 24 runtime.
@@ -42,12 +52,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = "${{ github.ref_name }}"
-          if (!(Test-Path mnvoice-windows-x64.zip)) { throw "mnvoice-windows-x64.zip was not produced" }
+          foreach ($f in @('mnvoice.exe','mnvoice-windows-x64.zip','SHA256SUMS')) {
+            if (!(Test-Path $f)) { throw "$f was not produced" }
+          }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag mnvoice-windows-x64.zip --clobber
+            gh release upload $tag mnvoice.exe mnvoice-windows-x64.zip SHA256SUMS --clobber
           } else {
-            gh release create $tag --title $tag --verify-tag mnvoice-windows-x64.zip
+            gh release create $tag --title $tag --verify-tag mnvoice.exe mnvoice-windows-x64.zip SHA256SUMS
           }
           if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
           Write-Host "published $tag"
@@ -60,8 +72,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = "${{ github.ref_name }}"
-          $names = gh release view $tag --json assets --jq '.assets[].name'
-          if ((($names -split "`n") -notcontains 'mnvoice-windows-x64.zip')) {
-            throw "release $tag is missing mnvoice-windows-x64.zip. Assets found: '$names'"
+          # The REST endpoint is asked directly: gh's own release listing is
+          # cached and can still lag behind an upload that just succeeded, which
+          # would fail this step after a publish that actually worked.
+          $json = curl.exe -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/$tag" | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "could not read $tag from api.github.com (curl exit $LASTEXITCODE)" }
+          $names = ($json | ConvertFrom-Json).assets.name
+          # mnvoice.exe is mandatory: it is what the updater fetches.
+          foreach ($need in @('mnvoice.exe','mnvoice-windows-x64.zip','SHA256SUMS')) {
+            if ((($names -split "`n") -notcontains $need)) {
+              throw "release $tag is missing $need. Assets found: '$names'"
+            }
           }
-          Write-Host "confirmed asset on $tag"
+          Write-Host "confirmed assets on $tag"

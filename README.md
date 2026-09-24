@@ -6,7 +6,7 @@ Press a hotkey, speak naturally - words type directly into whatever window you a
 Built in native Rust using pure Win32, WASAPI, and WinHTTP. No Electron, no Python, no async runtimes.
 
 ```
-mnvoice.exe (~302 KB)
+mnvoice.exe (~417 KB)
   ├── Global hotkey (configurable, default Alt+Space to start / stop)
   ├── Standby pre-initialized audio capture (WASAPI, 16 kHz mono, ~15 ms to first audio)
   ├── Dual-layer VAD (local RMS energy + server endpointing, auto-stops on silence)
@@ -14,7 +14,7 @@ mnvoice.exe (~302 KB)
   ├── Monotonic live word-by-word typing (SendInput KEYEVENTF_UNICODE, zero clipboard touch)
   ├── Custom vocabulary / keyterm prompting (keywords.txt or KEYWORDS= env)
   ├── Filler-word stripping (provider-native on streaming, local filter on REST)
-  └── System tray control (start with Windows, config, keywords, restart)
+  └── System tray control (start with Windows, check for updates, config, keywords, restart)
 ```
 
 ## Features
@@ -24,9 +24,9 @@ mnvoice.exe (~302 KB)
 - **Real-time word streaming** - 40 ms audio slices over native WinHTTP WebSockets; words appear as you speak.
 - **Hands-free auto-stop** - dual VAD (local RMS + server endpointing) detects ~2.2 s of silence and finalizes automatically.
 - **Fully configurable** - hotkey, cancel key, orb color, fluid level, filler words, STT provider, model, language, and vocabulary. All in one plain text file, none of it required.
-- **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, config, keywords, and restart.
+- **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, check for updates, config, keywords, and restart.
 - **Privacy focused** - zero audio written to disk, point-to-point TLS, zero telemetry. See [SECURITY.md](SECURITY.md).
-- **Tiny footprint** - ~302 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
+- **Tiny footprint** - ~417 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
 
 ---
 
@@ -73,7 +73,7 @@ Press **Alt+Space** in any app to start dictating. A pink orb appears at the bot
 ### What you get
 
 ```
-system tray icon  - right-click for autostart, config, keywords, restart, exit
+system tray icon  - right-click for autostart, check for updates, config, keywords, restart, exit
 orb               - appears only while recording, then disappears
 no windows        - nothing in the taskbar, nothing to close
 no terminal       - no command needed after install
@@ -109,6 +109,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v mnvoice /f
 ```
 system tray icon
     -> Start with Windows   (checkbox)
+    -> Check for updates    (downloads a newer release, installs it when idle)
     -> Open config          (opens mnvoice.env in Notepad)
     -> Open keywords        (opens keywords.txt in Notepad)
     -> Restart              (frees the hotkey and starts fresh)
@@ -120,12 +121,13 @@ system tray icon
 
 ## Command line
 
-There is only one flag, and it is for recovery, not normal use:
+One flag is yours to use, and it is for recovery, not normal use:
 
 | Command | Purpose |
 |---|---|
 | `mnvoice.exe` | Run normally |
 | `mnvoice.exe --restart` | Kill stale instances, free the hotkey, start fresh |
+| `mnvoice.exe --finish-update <dir>` | Internal recovery flag the updater itself uses: a short-lived helper copy finishes an interrupted swap. Never run it by hand. |
 
 `--restart` is what to reach for if **Alt+Space silently stops working** - almost always another app (Gemini, PowerToys, AutoHotkey) has grabbed the same hotkey and left it held. Starting with `--restart` lets mnvoice claim it again.
 
@@ -253,6 +255,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `CANCEL_KEY` | `Escape` | Discard the recording mid-speech (`none` to disable) |
 | `FILLER_WORDS` | `0` | `0` strips "uh"/"um"/"erm", `1` keeps them verbatim |
 | `KEYWORDS` | - | Comma-separated vocabulary hints. `keywords.txt` beside the exe is auto-loaded too. |
+| `AUTO_UPDATE` | off | `1` installs a newer published release automatically. Off by default; see [Updates](#updates). |
 | `VAD_SILENCE_MS` | `3000` | Silence after speech that stops recording. Raise if it cuts you off. |
 | `VAD_RMS_THRESHOLD` | `400` | Mic energy counted as speech, `0`-`32767`. Raise if noise keeps it listening. |
 | `MAX_SECONDS` | `120` | Hard recording limit before forced stop |
@@ -276,6 +279,61 @@ Deepgram is the **recommended** provider rather than a requirement - the REST pa
 Provider-named aliases (`DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `DEEPGRAM_MODEL`, and so on) are also accepted for convenience.
 
 ---
+
+## Updates
+
+mnvoice can update itself. There is no installer and no package manager, so an
+update means: download the new `mnvoice.exe`, move the old one aside, put the new
+one in its place, relaunch.
+
+**Automatic.** Set `AUTO_UPDATE=1` in `mnvoice.env`. mnvoice then checks
+the release feed at most once per day, and only installs when it is idle - it will
+never swap the binary out from under a transcript in flight.
+
+It is off by default on purpose. Replacing a running binary is a decision you
+should make, not one that happens silently because a default pointed that way.
+Absence, an empty value, or a typo all mean off, so a misspelling cannot quietly
+switch it on.
+
+The check reads GitHub's `releases.atom` feed rather than the REST API. That
+matters: the unauthenticated API allows 60 requests per hour **per source IP**,
+so on a shared or NAT'd address the budget can already be spent by unrelated
+traffic and every check would fail with `HTTP 403`. The feed is served from the
+web endpoint, so it has no per-IP quota, needs no token, and is a small
+machine-readable document instead of a 200 KB page.
+
+**Manual.** Tray menu > `Check for updates`. Same result, whenever you ask.
+
+**Your settings survive.** `mnvoice.env` and `keywords.txt` sit beside the exe as
+separate files and are never touched by an update, so your key, vocabulary and
+preferences carry across every version.
+
+### Verifying a download
+
+Every release publishes three files:
+
+| File | For |
+|---|---|
+| `mnvoice.exe` | Direct download, and what the updater fetches |
+| `mnvoice-windows-x64.zip` | `mnvoice.exe` + `mnvoice.env.example` + `keywords.txt.example` |
+| `SHA256SUMS` | The SHA-256 hash of each of the two files above |
+
+Windows will show a SmartScreen prompt on the first run of any newly downloaded
+copy. That is a reputation check on an unsigned binary, not a virus detection -
+nothing has ever been flagged in mnvoice.
+
+Publishing the hashes means you do not have to take the download on trust: hash
+the file you got and check it against its line in `SHA256SUMS` from the same
+release.
+
+```powershell
+Get-FileHash ~\Downloads\mnvoice.exe -Algorithm SHA256
+Get-Content ~\Downloads\SHA256SUMS
+```
+
+The hash of `mnvoice.exe` must match the `mnvoice.exe` line in `SHA256SUMS`
+(PowerShell prints upper case, the file lower case). The updater downloads that
+same release asset, so a copy it installed passes the same check.
 
 ## Building from Source
 
