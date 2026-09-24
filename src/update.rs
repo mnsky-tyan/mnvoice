@@ -234,12 +234,24 @@ fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot locate running exe ({e})"))
 }
 
+/// Argument that starts a second, short-lived copy of this exe to finish an
+/// install the starting process could not complete. Handled at the top of main,
+/// before the single-instance mutex, which the app itself already holds.
+pub const FINISH_UPDATE_ARG: &str = "--finish-update";
+
 /// Replace the running exe with the just-downloaded image.
 ///
 /// Windows refuses to overwrite a running image but does allow renaming it, so
 /// the current exe is moved to `.old`, the new one is moved into its place, and
 /// the running process is relaunched. If the relaunch cannot be started the
 /// original is put back, so an interrupted update never leaves a broken install.
+///
+/// The two renames cannot be made into one operation, so the exe path is
+/// briefly absent between them and only a live process could put an image back
+/// there. A second, short-lived copy of this exe is therefore started before
+/// the swap, holding the read end of a pipe this process keeps open: if this
+/// process is killed between the two renames, that copy finishes the swap
+/// instead of leaving the install directory with no exe in it.
 pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<(), String> {
     let url = &rel.exe_url;
     let version = &rel.version;
@@ -247,17 +259,90 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     let exe = current_exe()?;
 
     let bytes = http_get(url, "application/octet-stream")?;
-    let old = stage_and_swap(&bytes, &exe, &busy)?;
+
+    // The helper waits on the other end of this pipe, so keeping the handle open
+    // is how it learns this process is still the one installing: exiting, or being
+    // killed, closes it all the same. It is in place before anything is moved, so
+    // it is already watching when the swap starts, and it is stopped the moment
+    // this process has resolved the install either way.
+    let mut helper = Command::new(&exe)
+        .arg(FINISH_UPDATE_ARG)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot start the update helper ({e})"))?;
+
+    let old = match stage_and_swap(&bytes, &exe, &busy) {
+        Ok(old) => old,
+        Err(e) => {
+            let _ = helper.kill();
+            return Err(e);
+        }
+    };
 
     // --restart hands the hotkey and the single-instance mutex over cleanly, and
     // exiting here releases them from this side too - the new image takes this
     // exe's path, so the old process must not keep running the renamed one.
     if let Err(e) = Command::new(&exe).arg("--restart").spawn() {
         let _ = fs::rename(&old, &exe);
+        let _ = helper.kill();
         return Err(format!("cannot start the new exe ({e})"));
     }
     crate::log(&format!("updated to v{version}, relaunching"));
+    let _ = helper.kill();
     std::process::exit(0);
+}
+
+/// Finish an install the process that started this one could not complete.
+///
+/// This process is not the image being replaced, so it outlives the death of the
+/// one that is. That matters only while an install is half-done: the swap has
+/// moved the running image aside and has not moved the new one in, which leaves
+/// the install directory with no exe at all and nothing running that could
+/// repair it. This code repairs it, and does nothing at all for every swap its
+/// parent finished or rolled back, so a healthy install is never taken over.
+pub fn finish_install() {
+    // The parent holds the only other end of this pipe, so a closed pipe means
+    // it is gone: killed, crashed, or finished. Waiting here also means this
+    // process never touches the files while its parent could still be swapping.
+    let mut pipe = std::io::stdin();
+    let mut drain = std::io::sink();
+    let _ = std::io::copy(&mut pipe, &mut drain);
+
+    let exe = match current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            crate::log(&format!("update helper: {e}"));
+            return;
+        }
+    };
+    if !swap_interrupted(&exe) {
+        return;
+    }
+    if let Err(e) = finish_swap(&exe) {
+        crate::log(&format!("update helper: {e}"));
+        return;
+    }
+
+    // --restart hands the hotkey and the single-instance mutex over cleanly.
+    if let Err(e) = Command::new(&exe).arg("--restart").spawn() {
+        crate::log(&format!("update helper: cannot start the new exe ({e})"));
+        return;
+    }
+    crate::log("update helper: finished the interrupted install");
+}
+
+/// The state an interrupted swap leaves behind: nothing at the exe path, with
+/// the new image still staged beside it.
+fn swap_interrupted(exe: &Path) -> bool {
+    !exe.exists() && staged_path(exe).exists()
+}
+
+/// Move the staged image into the exe path, which the interrupted process could
+/// not.
+fn finish_swap(exe: &Path) -> Result<(), String> {
+    fs::rename(staged_path(exe), exe).map_err(|e| format!("cannot finish the install ({e})"))
 }
 
 /// Write the new image beside the running one, then move it over, but only if
@@ -799,6 +884,46 @@ mod tests {
         // The original is back in place, not stranded as mnvoice.exe.old.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         assert!(!dir.join("mnvoice.exe.old").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_install_interrupted_between_the_renames_is_finished_by_another_process() {
+        // The swap moved the running image aside and was then interrupted, so
+        // there is no exe at all: nothing running could start, and nothing that
+        // starts could have repaired it. Another process moving the staged image
+        // in is the only repair, and it has to work from this state alone.
+        let (dir, exe) = install_folder("swap-interrupted");
+        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        fs::write(staged_path(&exe), downloaded_exe()).unwrap();
+        assert!(swap_interrupted(&exe), "the interrupted state must be recognised");
+
+        finish_swap(&exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
+        // The image it was moving aside is still there to go back to, and the
+        // staged file is consumed.
+        assert_eq!(fs::read(dir.join("mnvoice.exe.old")).unwrap(), installed_exe());
+        assert!(!staged_path(&exe).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_install_that_landed_or_was_rolled_back_is_left_alone() {
+        // Both a completed swap and a rolled-back one leave the exe path
+        // populated, so there is nothing to finish: taking over an install its
+        // parent already resolved is never the finisher's business.
+        let (dir, exe) = install_folder("swap-landed");
+        stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap();
+        assert!(!swap_interrupted(&exe), "a completed install is not half-done");
+        assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
+        let _ = fs::remove_dir_all(&dir);
+
+        let (dir, exe) = install_folder("swap-rolled-back");
+        // The staged image cannot be moved in, so the original is put back.
+        let staged = dir.join("not-a-dir").join("mnvoice.new");
+        assert!(swap_in(&staged, &exe).is_err());
+        assert!(!swap_interrupted(&exe), "a rolled-back install is not half-done");
+        assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         let _ = fs::remove_dir_all(&dir);
     }
 
