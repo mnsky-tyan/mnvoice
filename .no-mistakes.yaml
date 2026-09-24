@@ -1,0 +1,42 @@
+# Per-repo no-mistakes overrides for mnvoice.
+
+# mnvoice is a Windows-only Rust project: the test suite links the `windows`
+# crate and winres needs rc.exe, so on this machine the only usable cargo is the
+# Windows one reached through the WSL drive mount. (WSL's own `cargo` is not
+# installed and Windows PATH integration is deliberately off.)
+#
+# Three WSL/Windows facts this command has to work around, each of which cost
+# real debugging time:
+#
+#   1. No baseline command. Without one the Test step has nothing deterministic
+#      to run and improvises a live GUI harness. That stalled twice in WSL:
+#      `find /` to locate the exe crawls the whole 9p-mounted C: drive and sat at
+#      0.0% CPU for the better part of an hour, and launching the tray app via
+#      interop PowerShell deadlocks because a process that never exits inherits
+#      the console handles so the wrapper can never return.
+#
+#   2. Env vars do not cross the boundary. A variable set in a bash one-liner
+#      never reaches a Windows process: `CARGO_TARGET_DIR=... cargo.exe` reads
+#      back as empty on the Windows side. `WSLENV=<name>` is the documented opt-in
+#      that forwards a named variable, and it is required here.
+#
+#   3. WSL's 9p mount supports no Windows file locking. cargo's incremental
+#      compilation dies on it with "could not create session directory lock file:
+#      Incorrect function (os error -2147024895)". Gate worktrees live on the WSL
+#      filesystem, so the build directory has to be redirected to real Windows
+#      disk. That also makes the build fast: a cold `cargo test` is ~37s.
+commands:
+  test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test
+
+# This repository's only workflow is .github/workflows/release.yml, which fires
+# on tag pushes ("v*") and workflow_dispatch and never on a pull request. A PR
+# branch therefore registers no checks at all, so without this declaration the
+# CI step waits for checks that can never appear (ci_timeout is 168h, so it
+# would simply sit there).
+#
+# `no-mistakes ci-workflow` can generate a PR workflow from the command above,
+# but the generated one assumes a Go module and ubuntu-latest - wrong for a
+# Windows-only Rust app. Writing a proper windows-latest workflow by hand is the
+# stronger fix if CI on the app's own platform is ever wanted; until then this
+# declaration keeps the gate honest rather than silently waiting.
+no_ci: true
