@@ -308,29 +308,30 @@ preferences carry across every version.
 
 ### Verifying a download
 
-Every release publishes two files:
+Every release publishes three files:
 
 | File | For |
 |---|---|
 | `mnvoice.exe` | Direct download, and what the updater fetches |
 | `mnvoice-windows-x64.zip` | `mnvoice.exe` + `mnvoice.env.example` + `keywords.txt.example` |
+| `SHA256SUMS` | The SHA-256 hash of each of the two files above |
 
 Windows will show a SmartScreen prompt on the first run of any newly downloaded
 copy. That is a reputation check on an unsigned binary, not a virus detection -
 nothing has ever been flagged in mnvoice.
 
-Releases carry no separate checksum file, so verifying means a comparison you run
-yourself: download `mnvoice.exe` from the release page, then hash that file and
-the `mnvoice.exe` you are running. Equal hashes mean you are running exactly what
-CI built from the tagged public source.
+Publishing the hashes means you do not have to take the download on trust: hash
+the file you got and check it against its line in `SHA256SUMS` from the same
+release.
 
 ```powershell
 Get-FileHash ~\Downloads\mnvoice.exe -Algorithm SHA256
-Get-FileHash "C:\path\to\mnvoice.exe" -Algorithm SHA256
+Get-Content ~\Downloads\SHA256SUMS
 ```
 
-The updater fetches that same release asset, so a copy it installed itself passes
-the same comparison.
+The hash of `mnvoice.exe` must match the `mnvoice.exe` line in `SHA256SUMS`
+(PowerShell prints upper case, the file lower case). The updater downloads that
+same release asset, so a copy it installed passes the same check.
 
 ## Building from Source
 

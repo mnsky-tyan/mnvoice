@@ -9,8 +9,10 @@ use crate::config::Config;
 
 const BOUNDARY: &str = "mnvoiceboundary9f2a";
 const WINHTTP_ADDREQUEST_HEADER_FLAG: u32 = 0x2000_0000; // add or replace
-const WINHTTP_QUERY_STATUS: u32 = 19;
-const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+// The windows crate does not export these two, and both WinHTTP clients here
+// need the same pair.
+pub(crate) const WINHTTP_QUERY_STATUS: u32 = 19;
+pub(crate) const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

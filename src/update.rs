@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::{w, PCWSTR};
 
-use crate::rest;
+use crate::rest::{self, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS};
 
 /// Repository that publishes mnvoice releases.
 const REPO: &str = "mnsky-tyan/mnvoice";
@@ -134,6 +134,19 @@ fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
             )?;
             WinHttpSendRequest(request, None, None, 0, 0, 0)?;
             WinHttpReceiveResponse(request, std::ptr::null_mut())?;
+            // The status line is only readable while the response is still open,
+            // so it is collected here next to the body it describes.
+            let mut status: u32 = 0;
+            let mut len = std::mem::size_of::<u32>() as u32;
+            let mut index = 0u32;
+            let _ = WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS | WINHTTP_QUERY_FLAG_NUMBER,
+                PCWSTR::null(),
+                Some(&mut status as *mut u32 as *mut std::ffi::c_void),
+                &mut len,
+                &mut index,
+            );
             let mut chunk = [0u8; 16 * 1024];
             loop {
                 let mut read = 0u32;
@@ -148,34 +161,41 @@ fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
                 }
                 body.extend_from_slice(&chunk[..read as usize]);
             }
-            Ok::<(), windows::core::Error>(())
+            Ok::<(u32, Vec<u8>), windows::core::Error>((status, body))
         })();
         let _ = WinHttpCloseHandle(request);
         let _ = WinHttpCloseHandle(connect);
         let _ = WinHttpCloseHandle(session);
-        result.map_err(|e| format!("request failed ({e})"))?;
+        let (status, body) = result.map_err(|e| format!("request failed ({e})"))?;
+
+        // A 404 or 403 body must not be mistaken for a release that names no
+        // version, or for an executable missing its MZ header.
+        if status != 200 {
+            let preview: String = String::from_utf8_lossy(&body).chars().take(200).collect();
+            return Err(format!("update request returned HTTP {status}: {preview}"));
+        }
 
         Ok(body)
     }
 }
 
-/// Version named by a latest-release page, e.g. the "0.1.10" inside
-/// ".../releases/tag/v0.1.10". Tolerates a tag written without the `v`.
-pub fn parse_version_from_page(page: &str) -> Option<String> {
+/// Version named by the newest entry of the release feed, e.g. the "0.1.10"
+/// inside ".../releases/tag/v0.1.10". Tolerates a tag written without the `v`.
+pub fn parse_version_from_feed(feed: &str) -> Option<String> {
     let needle = "releases/tag/";
     let mut from = 0;
-    while let Some(i) = page[from..].find(needle) {
+    while let Some(i) = feed[from..].find(needle) {
         let mut start = from + i + needle.len();
         // Tags are normally written with a leading v, sometimes without.
-        if page[start..].starts_with('v') || page[start..].starts_with('V') {
+        if feed[start..].starts_with('v') || feed[start..].starts_with('V') {
             start += 1;
         }
         // A version is digits and dots; stop at the first character that is not.
-        let end = page[start..]
+        let end = feed[start..]
             .find(|c: char| !c.is_ascii_digit() && c != '.')
             .map(|e| start + e)
-            .unwrap_or(page.len());
-        let version = &page[start..end];
+            .unwrap_or(feed.len());
+        let version = &feed[start..end];
         if !version.is_empty() && version.contains('.') {
             return Some(version.to_string());
         }
@@ -202,7 +222,7 @@ fn check_latest_from(feed_url: &str) -> Result<Release, String> {
     let body = http_get(feed_url, "application/atom+xml")?;
     let feed = String::from_utf8_lossy(&body);
     let version =
-        parse_version_from_page(&feed).ok_or("release feed does not name a version")?;
+        parse_version_from_feed(&feed).ok_or("release feed does not name a version")?;
     let tag = format!("v{version}");
     Ok(Release {
         version,
@@ -220,14 +240,13 @@ fn current_exe() -> Result<PathBuf, String> {
 /// the current exe is moved to `.old`, the new one is moved into its place, and
 /// the running process is relaunched. If the relaunch cannot be started the
 /// original is put back, so an interrupted update never leaves a broken install.
-pub fn install_and_relaunch(busy: impl Fn() -> bool) -> Result<(), String> {
-    let rel = check_latest()?;
-    let url = rel.exe_url;
-    let version = rel.version;
+pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<(), String> {
+    let url = &rel.exe_url;
+    let version = &rel.version;
 
     let exe = current_exe()?;
 
-    let bytes = http_get(&url, "application/octet-stream")?;
+    let bytes = http_get(url, "application/octet-stream")?;
     let old = stage_and_swap(&bytes, &exe, &busy)?;
 
     // --restart hands the hotkey and the single-instance mutex over cleanly, and
@@ -245,14 +264,28 @@ pub fn install_and_relaunch(busy: impl Fn() -> bool) -> Result<(), String> {
 /// nothing started recording while the bytes were in flight.
 fn stage_and_swap(bytes: &[u8], exe: &Path, busy: &dyn Fn() -> bool) -> Result<PathBuf, String> {
     check_exe_payload(bytes)?;
-    let staged = exe.with_extension("new");
+    let staged = staged_path(exe);
     fs::write(&staged, bytes).map_err(|e| format!("cannot write staged exe ({e})"))?;
 
     if busy() {
+        let _ = fs::remove_file(&staged);
         return Err("install skipped, a dictation session started during the download".into());
     }
 
-    swap_in(&staged, exe)
+    match swap_in(&staged, exe) {
+        Ok(old) => Ok(old),
+        Err(e) => {
+            // The install did not land, so a full copy of the new binary must not
+            // be left sitting beside the exe for the next attempt to trip over.
+            let _ = fs::remove_file(&staged);
+            Err(e)
+        }
+    }
+}
+
+/// Path the download is written to before it is moved over the running exe.
+fn staged_path(exe: &Path) -> PathBuf {
+    exe.with_extension("new")
 }
 
 /// Move the staged image into place, restoring the original if it fails half
@@ -282,11 +315,14 @@ fn check_exe_payload(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove the leftover .old from a previous swap. Best effort.
-fn clean_old(exe: &Path) {
+/// Remove what an interrupted or deferred update left behind: the image the
+/// running exe was moved aside to, and a download that never got swapped in.
+/// Best effort.
+fn clean_stale(exe: &Path) {
     let mut old = exe.as_os_str().to_os_string();
     old.push(".old");
     let _ = fs::remove_file(PathBuf::from(old));
+    let _ = fs::remove_file(staged_path(exe));
 }
 
 fn stamp_path() -> Option<PathBuf> {
@@ -348,15 +384,14 @@ pub fn background_check_auto() {
 }
 
 /// Called once at startup: tidy up after the previous update, then hand the
-/// periodic check to a background thread so nothing blocks the tray.
-pub fn startup_cleanup() {
+/// periodic check to a background thread so nothing blocks the tray. The
+/// caller already holds the loaded config, so its AUTO_UPDATE flag is taken
+/// from there rather than parsed off disk a second time.
+pub fn startup_cleanup(auto_update: bool) {
     if let Ok(exe) = current_exe() {
-        clean_old(&exe);
+        clean_stale(&exe);
     }
-    let auto = crate::config::load()
-        .map(|c| c.auto_update)
-        .unwrap_or(false);
-    if !auto {
+    if !auto_update {
         return;
     }
     std::thread::spawn(|| {
@@ -395,7 +430,7 @@ mod tests {
         assert!(is_newer("v2.0.0", "1.0.0"));
     }
 
-    // --- reading a release page -------------------------------------------
+    // --- reading the release feed -----------------------------------------
 
     /// Shaped like GitHub's real releases.atom: newest entry first, each one
     /// carrying its tag as a `/releases/tag/vX` link, and the summary of older
@@ -418,8 +453,8 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_tag_out_of_the_page_and_derives_the_exe_url() {
-        let version = parse_version_from_page(&sample_feed()).unwrap();
+    fn reads_the_tag_out_of_the_feed_and_derives_the_exe_url() {
+        let version = parse_version_from_feed(&sample_feed()).unwrap();
         // The `v` is stripped so the tag can be compared against the version
         // build.rs baked from that same tag.
         assert_eq!(version, "0.1.11");
@@ -431,7 +466,7 @@ mod tests {
 
     #[test]
     fn a_published_tag_beats_the_version_the_binary_knows_itself_to_be() {
-        let version = parse_version_from_page(&sample_feed()).unwrap();
+        let version = parse_version_from_feed(&sample_feed()).unwrap();
         assert!(
             is_newer(&version, "0.1.10"),
             "a v0.1.10 build must recognise this release as the update it wants"
@@ -443,14 +478,14 @@ mod tests {
         // A 404 or an error page names no tag, so the caller must hear about it
         // rather than fall back to some assumed version.
         let page = "<!DOCTYPE html><html><body>404 Not Found</body></html>";
-        assert!(parse_version_from_page(page).is_none());
-        assert!(parse_version_from_page("<feed><title>empty</title></feed>").is_none());
+        assert!(parse_version_from_feed(page).is_none());
+        assert!(parse_version_from_feed("<feed><title>empty</title></feed>").is_none());
     }
 
     #[test]
     fn a_tag_written_without_the_v_still_resolves() {
         let feed = r#"<entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/1.2.3"/></entry>"#;
-        assert_eq!(parse_version_from_page(feed).as_deref(), Some("1.2.3"));
+        assert_eq!(parse_version_from_feed(feed).as_deref(), Some("1.2.3"));
     }
 
     #[test]
@@ -459,15 +494,16 @@ mod tests {
         // so the tag is followed immediately by an escaped entity. A scanner
         // that ran past the digits and dots would swallow it into the version.
         let feed = r#"<id>tag:github.com,2008:https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.10&#39;, older release</id>"#;
-        assert_eq!(parse_version_from_page(feed).as_deref(), Some("0.1.10"));
+        assert_eq!(parse_version_from_feed(feed).as_deref(), Some("0.1.10"));
     }
 
     #[test]
-    fn navigation_links_that_look_like_tags_are_skipped() {
-        // A real page contains "/releases/tag/" in navigation before the
-        // canonical release; the scan has to keep looking.
-        let page = r#"<a href="/releases/tag/">all tags</a><a href="/mnsky-tyan/mnvoice/releases/tag/v0.1.9">v"#;
-        assert_eq!(parse_version_from_page(page).as_deref(), Some("0.1.9"));
+    fn tag_links_with_no_version_are_skipped() {
+        // The feed can carry a tag link that names no version - a bare
+        // "/releases/tag/" href - ahead of the release it belongs to, so the
+        // scan has to keep looking.
+        let feed = r#"<a href="/releases/tag/">all tags</a><a href="/mnsky-tyan/mnvoice/releases/tag/v0.1.9">v"#;
+        assert_eq!(parse_version_from_feed(feed).as_deref(), Some("0.1.9"));
     }
 
     // --- fetching over the wire -------------------------------------------
@@ -485,11 +521,14 @@ mod tests {
     impl MockFeed {
         /// `path` is what the client asks for and what the URL ends in, so the
         /// release lookup gets a path ending in `/latest` and an asset gets one
-        /// ending in `/mnvoice.exe` exactly as GitHub serves them.
-        fn once(body: &[u8], path: &str) -> MockFeed {
+        /// ending in `/mnvoice.exe` exactly as GitHub serves them. `status` is
+        /// the status line to answer with, so a rejection can be driven the
+        /// same way a success is.
+        fn once(body: &[u8], path: &str, status: &str) -> MockFeed {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let body = body.to_vec();
+            let status = status.to_string();
             let (tx, seen) = mpsc::channel();
             let server = std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
@@ -497,7 +536,9 @@ mod tests {
                     let mut buf = [0u8; 8192];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
-                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/atom+xml\r\nConnection: close\r\n";
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/atom+xml\r\nConnection: close\r\n"
+                    );
                     let _ = stream.write_all(
                         format!("{head}Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
                     );
@@ -520,8 +561,8 @@ mod tests {
     }
 
     #[test]
-    fn a_release_page_is_read_end_to_end_over_http() {
-        let feed = MockFeed::once(sample_feed().as_bytes(), "mnsky-tyan/mnvoice/releases.atom");
+    fn a_release_feed_is_read_end_to_end_over_http() {
+        let feed = MockFeed::once(sample_feed().as_bytes(), "mnsky-tyan/mnvoice/releases.atom", "200 OK");
         let rel = check_latest_from(&feed.url).unwrap();
         assert_eq!(rel.version, "0.1.11");
         assert_eq!(
@@ -540,7 +581,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_page_reports_an_error_instead_of_a_version() {
+    fn a_feed_the_server_rejects_says_so_with_its_status() {
+        // A 403 or 404 body is not a release, so naming the status beats a
+        // misleading "the feed names no version".
+        let feed = MockFeed::once(
+            b"<feed><title>rate limited</title></feed>",
+            "mnsky-tyan/mnvoice/releases.atom",
+            "403 Forbidden",
+        );
+        let err = check_latest_from(&feed.url).unwrap_err();
+        assert!(err.contains("403"), "unexpected error: {err}");
+        assert!(
+            !err.contains("does not name a version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_feed_reports_an_error_instead_of_a_version() {
         // Bind and immediately release a port, so nothing is listening there.
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -548,7 +606,7 @@ mod tests {
             .unwrap()
             .port();
         let err = check_latest_from(&format!(
-            "http://127.0.0.1:{port}/mnsky-tyan/mnvoice/releases/latest"
+            "http://127.0.0.1:{port}/mnsky-tyan/mnvoice/releases.atom"
         ))
         .unwrap_err();
         assert!(!err.is_empty(), "an unreachable feed must produce a message");
@@ -562,8 +620,13 @@ mod tests {
         let asset = MockFeed::once(
             &downloaded_exe(),
             "mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe",
+            "200 OK",
         );
-        let release = MockFeed::once(sample_feed().as_bytes(), "mnsky-tyan/mnvoice/releases.atom");
+        let release = MockFeed::once(
+            sample_feed().as_bytes(),
+            "mnsky-tyan/mnvoice/releases.atom",
+            "200 OK",
+        );
 
         let rel = check_latest_from(&release.url).unwrap();
         assert_eq!(rel.version, "0.1.11");
@@ -663,10 +726,12 @@ mod tests {
             err.contains("dictation session started during the download"),
             "unexpected error: {err}"
         );
-        // Nothing was swapped: still the old image, and the running file was
-        // never moved out of the way.
+        // Nothing was swapped: still the old image, the running file was never
+        // moved out of the way, and the download it already paid for is not
+        // left behind in the install folder.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         assert!(!dir.join("mnvoice.exe.old").exists());
+        assert!(!dir.join("mnvoice.new").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -694,6 +759,22 @@ mod tests {
         let err = stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap_err();
         assert!(err.contains("move current exe aside"), "unexpected error: {err}");
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
+        // The install did not land, so the download is not left on disk either.
+        assert!(!dir.join("mnvoice.new").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leftovers_from_an_earlier_update_are_reaped_at_startup() {
+        let (dir, exe) = install_folder("stale-leftovers");
+        fs::write(dir.join("mnvoice.exe.old"), installed_exe()).unwrap();
+        fs::write(staged_path(&exe), downloaded_exe()).unwrap();
+        clean_stale(&exe);
+        assert!(!dir.join("mnvoice.exe.old").exists());
+        assert!(!dir.join("mnvoice.new").exists());
+        // The running image and the personal config beside it are left alone.
+        assert_eq!(fs::read(&exe).unwrap(), installed_exe());
+        assert!(dir.join("mnvoice.env").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

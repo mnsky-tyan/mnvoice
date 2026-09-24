@@ -10,6 +10,10 @@ fn main() {
     // CI pushes tags as refs/tags/vX.Y.Z, so read that when present and fall
     // back to the Cargo version for local builds where no tag exists.
     println!("cargo:rustc-env=MNVOICE_VERSION={}", version());
+    // Without this, a rebuild in the same target directory keeps the version
+    // baked by an earlier build with a different tag, and the updater compares
+    // against a baseline that was never compiled in.
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
 }
 
 fn version() -> String {

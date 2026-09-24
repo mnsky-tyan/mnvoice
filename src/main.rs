@@ -15,7 +15,7 @@ mod update;
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,6 +88,31 @@ fn state_name(s: State) -> &'static str {
         State::Recording => "recording",
         State::Transcribing => "transcribing",
     }
+}
+
+impl State {
+    fn from_code(code: u8) -> State {
+        match code {
+            1 => State::Recording,
+            2 => State::Transcribing,
+            _ => State::Idle,
+        }
+    }
+}
+
+/// The session state in one authoritative place, readable from any thread.
+///
+/// The updater's worker thread reads this after its download finishes to decide
+/// whether the binary may be swapped, so it must never have to ask the UI
+/// thread's window for the answer: that lookup handed out a raw pointer into
+/// UI-thread-owned memory that another thread then read and aliased, which is
+/// only correct by luck and disappears entirely once the window is gone.
+static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle as u8);
+
+/// Record a state change in both the UI's own copy and the shared atomic.
+fn set_state(app: &mut App, state: State) {
+    app.state = state;
+    SESSION_STATE.store(state as u8, Ordering::SeqCst);
 }
 
 struct App {
@@ -203,7 +228,7 @@ fn main() {
         let audio_engine = audio::AudioEngine::start();
         // Best-effort housekeeping: drop the leftover .old from a previous
         // update and arm the periodic background check when AUTO_UPDATE=1.
-        update::startup_cleanup();
+        update::startup_cleanup(config.as_ref().map(|c| c.auto_update).unwrap_or(false));
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -389,7 +414,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if let Some(orb) = &mut app.orb {
                         orb.hide();
                     }
-                    app.state = State::Idle;
+                    set_state(app, State::Idle);
                     let _ = set_tray_tip(hwnd, "mnvoice - idle");
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
@@ -424,7 +449,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     let app = app_ref(hwnd);
-                    app.state = State::Idle;
+                    set_state(app, State::Idle);
                     PostQuitMessage(0);
                 } else if id == IDM_STOP {
                     let app = app_ref(hwnd);
@@ -506,7 +531,7 @@ fn toggle(app: &mut App) {
             // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
             let worker_cfg = cfg.clone();
             thread::spawn(move || worker(stop, cancelled, worker_cfg, outcome, hwnd_bits, audio_engine));
-            app.state = State::Recording;
+            set_state(app, State::Recording);
 
             // Summon the orb last, once cancel is already live.
             if let Some(orb) = &mut app.orb {
@@ -518,7 +543,7 @@ fn toggle(app: &mut App) {
         }
         State::Recording => {
             app.stop.store(true, Ordering::SeqCst);
-            app.state = State::Transcribing;
+            set_state(app, State::Transcribing);
             let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
             if let Some(orb) = &mut app.orb {
                 orb.set_state(orb::OrbState::Transcribing);
@@ -540,7 +565,7 @@ fn cancel(app: &mut App) {
     // Tell the worker and the streaming reader to stop typing further words.
     app.cancelled.store(true, Ordering::SeqCst);
     app.stop.store(true, Ordering::SeqCst);
-    app.state = State::Idle;
+    set_state(app, State::Idle);
     let _ = unsafe { KillTimer(app.hwnd, TIMER_ORB) };
     let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
     if let Some(orb) = &mut app.orb {
@@ -773,8 +798,13 @@ fn check_for_updates_async(quiet: bool) {
         }
 
         log(&format!("installing v{}", rel.version));
-        if let Err(e) = update::install_and_relaunch(session_active) {
+        if let Err(e) = update::install_and_relaunch(&rel, session_active) {
             log(&format!("update failed: {e}"));
+            if !quiet {
+                // The user asked for this check, so an install that cannot
+                // complete is news they get to see, not a log line only.
+                balloon("Update failed", &e);
+            }
         }
     });
 }
@@ -786,21 +816,11 @@ fn session_active() -> bool {
     session_state() != State::Idle
 }
 
-/// Current session state, or Idle when no window is up to ask.
+/// Current session state. Read from the shared atomic rather than from the
+/// window, so it stays correct while the window exists, while it is being
+/// created, and after it is gone.
 fn session_state() -> State {
-    current_app().map(|app| app.state).unwrap_or(State::Idle)
-}
-
-fn current_app() -> Option<&'static mut App> {
-    unsafe {
-        let hwnd = FindWindowW(w!("mnvoiceTrayClass"), w!("mnvoice")).ok()?;
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if ptr.is_null() {
-            None
-        } else {
-            Some(&mut *ptr)
-        }
-    }
+    State::from_code(SESSION_STATE.load(Ordering::SeqCst))
 }
 
 /// Transient notification from the tray icon. Balloon timeouts are only
