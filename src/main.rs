@@ -29,8 +29,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIF_GUID, NIF_ICON,
-    NIF_INFO, NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
