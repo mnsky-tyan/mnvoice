@@ -170,13 +170,15 @@ fn kill_running_instances() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == update::FINISH_UPDATE_ARG) {
+    if let Some(pos) = args.iter().position(|a| a == update::FINISH_UPDATE_ARG) {
         // A second, short-lived copy of this exe finishes an install the first one
         // could not. It waits for that process to be gone, and only then, and only
         // when the swap left the exe path empty, does it move the staged image in.
         // Started before the single-instance mutex is taken, which the app itself
-        // is holding for as long as it is the one installing.
-        update::finish_install();
+        // is holding for as long as it is the one installing. It runs from a copy
+        // of this exe under an image name of its own, so the install it has to
+        // repair comes in after the flag on the command line.
+        update::finish_install(args.get(pos + 1).map(|p| std::path::Path::new(p)));
         return;
     }
     if args.iter().any(|a| a == "--restart") {

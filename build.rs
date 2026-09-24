@@ -14,6 +14,10 @@ fn main() {
     // baked by an earlier build with a different tag, and the updater compares
     // against a baseline that was never compiled in.
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    // Emitting any rerun-if instruction stops Cargo's default scan of the
+    // package, so the icon the resource section is built from would otherwise
+    // stop being watched and a rebuild after editing it would keep the old orb.
+    println!("cargo:rerun-if-changed=assets/mnvoice.ico");
 }
 
 fn version() -> String {

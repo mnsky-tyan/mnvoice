@@ -235,9 +235,19 @@ fn current_exe() -> Result<PathBuf, String> {
 }
 
 /// Argument that starts a second, short-lived copy of this exe to finish an
-/// install the starting process could not complete. Handled at the top of main,
-/// before the single-instance mutex, which the app itself already holds.
+/// install the starting process could not complete. The install to repair
+/// follows it on the command line. Handled at the top of main, before the
+/// single-instance mutex, which the app itself already holds.
 pub const FINISH_UPDATE_ARG: &str = "--finish-update";
+
+/// Prefix of the recovery helper's copy of this exe in the temp directory.
+///
+/// The helper needs an image name of its own because it is a second copy of
+/// this exe: every relaunch terminates the other instances of this exe by
+/// image name, so a helper that shared the app's image name would be killed by
+/// the very restart it exists to outlive, and the install it was started to
+/// recover would be left with no exe in it at all.
+const HELPER_IMAGE_PREFIX: &str = "mnvoice-updater-";
 
 /// Replace the running exe with the just-downloaded image.
 ///
@@ -265,18 +275,13 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // killed, closes it all the same. It is in place before anything is moved, so
     // it is already watching when the swap starts, and it is stopped the moment
     // this process has resolved the install either way.
-    let mut helper = Command::new(&exe)
-        .arg(FINISH_UPDATE_ARG)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot start the update helper ({e})"))?;
+    let mut helper = spawn_helper(&exe)?;
 
     let old = match stage_and_swap(&bytes, &exe, &busy) {
         Ok(old) => old,
         Err(e) => {
             let _ = helper.kill();
+            reap_helpers();
             return Err(e);
         }
     };
@@ -287,11 +292,58 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     if let Err(e) = Command::new(&exe).arg("--restart").spawn() {
         let _ = fs::rename(&old, &exe);
         let _ = helper.kill();
+        reap_helpers();
         return Err(format!("cannot start the new exe ({e})"));
     }
     crate::log(&format!("updated to v{version}, relaunching"));
     let _ = helper.kill();
+    reap_helpers();
     std::process::exit(0);
+}
+
+/// Start the recovery helper from a copy of this exe that carries its own image
+/// name.
+///
+/// A different image name can only come from a different file, so a copy of
+/// this exe is laid down in the temp directory and the install it has to
+/// repair is named on its command line, since the copy's own path says nothing
+/// about where the real exe lives. Both are taken from the installer, which is
+/// the only process that knows either.
+fn spawn_helper(exe: &Path) -> Result<std::process::Child, String> {
+    let copy = std::env::temp_dir().join(format!(
+        "{HELPER_IMAGE_PREFIX}{}.exe",
+        std::process::id()
+    ));
+    fs::copy(exe, &copy).map_err(|e| format!("cannot stage the update helper ({e})"))?;
+    match Command::new(&copy)
+        .arg(FINISH_UPDATE_ARG)
+        .arg(exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => Ok(child),
+        Err(e) => {
+            let _ = fs::remove_file(&copy);
+            Err(format!("cannot start the update helper ({e})"))
+        }
+    }
+}
+
+/// Take the helper copies left in the temp directory away. Best effort, like
+/// clean_stale: Windows will not let a copy still in use go, and one still in
+/// use has already had its chance to do its work.
+fn reap_helpers() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(HELPER_IMAGE_PREFIX) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Finish an install the process that started this one could not complete.
@@ -302,7 +354,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
 /// the install directory with no exe at all and nothing running that could
 /// repair it. This code repairs it, and does nothing at all for every swap its
 /// parent finished or rolled back, so a healthy install is never taken over.
-pub fn finish_install() {
+pub fn finish_install(install: Option<&Path>) {
     // The parent holds the only other end of this pipe, so a closed pipe means
     // it is gone: killed, crashed, or finished. Waiting here also means this
     // process never touches the files while its parent could still be swapping.
@@ -310,23 +362,28 @@ pub fn finish_install() {
     let mut drain = std::io::sink();
     let _ = std::io::copy(&mut pipe, &mut drain);
 
-    let exe = match current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            crate::log(&format!("update helper: {e}"));
-            return;
-        }
+    let Some(exe) = install else {
+        crate::log("update helper: no install to repair");
+        return;
     };
-    if !swap_interrupted(&exe) {
+    if !swap_interrupted(exe) {
         return;
     }
-    if let Err(e) = finish_swap(&exe) {
+    if let Err(e) = finish_swap(exe) {
         crate::log(&format!("update helper: {e}"));
         return;
     }
+    // This process runs from a copy of the exe, and a running image cannot be
+    // deleted, so the copy is renamed aside where the next start's cleanup can
+    // take it.
+    if let Ok(self_image) = current_exe() {
+        let mut aside = self_image.clone().into_os_string();
+        aside.push(".old");
+        let _ = fs::rename(&self_image, PathBuf::from(aside));
+    }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
-    if let Err(e) = Command::new(&exe).arg("--restart").spawn() {
+    if let Err(e) = Command::new(exe).arg("--restart").spawn() {
         crate::log(&format!("update helper: cannot start the new exe ({e})"));
         return;
     }
@@ -476,6 +533,7 @@ pub fn startup_cleanup(auto_update: bool) {
     if let Ok(exe) = current_exe() {
         clean_stale(&exe);
     }
+    reap_helpers();
     if !auto_update {
         return;
     }
