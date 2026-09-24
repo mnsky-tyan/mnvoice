@@ -310,10 +310,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
 /// about where the real exe lives. Both are taken from the installer, which is
 /// the only process that knows either.
 fn spawn_helper(exe: &Path) -> Result<std::process::Child, String> {
-    let copy = std::env::temp_dir().join(format!(
-        "{HELPER_IMAGE_PREFIX}{}.exe",
-        std::process::id()
-    ));
+    let copy = helper_copy_path();
     fs::copy(exe, &copy).map_err(|e| format!("cannot stage the update helper ({e})"))?;
     match Command::new(&copy)
         .arg(FINISH_UPDATE_ARG)
@@ -329,6 +326,12 @@ fn spawn_helper(exe: &Path) -> Result<std::process::Child, String> {
             Err(format!("cannot start the update helper ({e})"))
         }
     }
+}
+
+/// Path of the helper's copy of this exe. Every installer takes the path of
+/// its own pid, so a second install never has to share one.
+fn helper_copy_path() -> PathBuf {
+    std::env::temp_dir().join(format!("{HELPER_IMAGE_PREFIX}{}.exe", std::process::id()))
 }
 
 /// Take the helper copies left in the temp directory away. Best effort, like
@@ -372,14 +375,6 @@ pub fn finish_install(install: Option<&Path>) {
     if let Err(e) = finish_swap(exe) {
         crate::log(&format!("update helper: {e}"));
         return;
-    }
-    // This process runs from a copy of the exe, and a running image cannot be
-    // deleted, so the copy is renamed aside where the next start's cleanup can
-    // take it.
-    if let Ok(self_image) = current_exe() {
-        let mut aside = self_image.clone().into_os_string();
-        aside.push(".old");
-        let _ = fs::rename(&self_image, PathBuf::from(aside));
     }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
@@ -549,7 +544,7 @@ mod tests {
     use super::*;
 
     use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
 
     #[test]
@@ -661,17 +656,18 @@ mod tests {
         server: std::thread::JoinHandle<()>,
     }
 
-    impl MockFeed {
+        impl MockFeed {
         /// `path` is what the client asks for and what the URL ends in, so the
         /// release lookup gets a path ending in `/latest` and an asset gets one
-        /// ending in `/mnvoice.exe` exactly as GitHub serves them. `status` is
-        /// the status line to answer with, so a rejection can be driven the
-        /// same way a success is.
-        fn once(body: &[u8], path: &str, status: &str) -> MockFeed {
+        /// ending in `/mnvoice.exe` exactly as GitHub serves them. The response is
+        /// whatever `respond` writes on the accepted connection, so a redirect can
+        /// be driven exactly the way a plain body is.
+        fn serve(
+            path: &str,
+            respond: impl FnOnce(&mut TcpStream) + Send + 'static,
+        ) -> MockFeed {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
-            let body = body.to_vec();
-            let status = status.to_string();
             let (tx, seen) = mpsc::channel();
             let server = std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
@@ -679,14 +675,7 @@ mod tests {
                     let mut buf = [0u8; 8192];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
-                    let head = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/atom+xml\r\nConnection: close\r\n"
-                    );
-                    let _ = stream.write_all(
-                        format!("{head}Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
-                    );
-                    let _ = stream.write_all(&body);
-                    let _ = stream.flush();
+                    respond(&mut stream);
                 }
             });
             MockFeed {
@@ -694,6 +683,39 @@ mod tests {
                 seen,
                 server,
             }
+        }
+
+        /// Answers one request with `body`. `status` is the status line to answer
+        /// with, so a rejection can be driven the same way a success is.
+        fn once(body: &[u8], path: &str, status: &str) -> MockFeed {
+            let body = body.to_vec();
+            let status = status.to_string();
+            MockFeed::serve(path, move |stream| {
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/atom+xml\r\nConnection: close\r\n"
+                );
+                let _ = stream.write_all(
+                    format!("{head}Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            })
+        }
+
+        /// Answers one request with a redirect to `location` and no body, the way
+        /// GitHub answers a request for a release asset: the asset is served from
+        /// somewhere else, so the client has to go and get it there.
+        fn redirecting_to(location: &str, path: &str) -> MockFeed {
+            let location = location.to_string();
+            MockFeed::serve(path, move |stream| {
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            })
         }
 
         /// The request the client really sent, once the response is consumed.
@@ -753,6 +775,39 @@ mod tests {
         ))
         .unwrap_err();
         assert!(!err.is_empty(), "an unreachable feed must produce a message");
+    }
+
+    #[test]
+    fn an_asset_download_follows_the_redirect_to_the_host_the_asset_lives_on() {
+        // GitHub answers a request for a release asset with a 302 naming the
+        // host the asset is actually served from, so a download only succeeds if
+        // that redirect is followed. The asset endpoint is bound first, because
+        // the redirect has to name its address.
+        let cdn = MockFeed::once(
+            &downloaded_exe(),
+            "release-assets/mnvoice.exe",
+            "200 OK",
+        );
+        let asset = MockFeed::redirecting_to(
+            &cdn.url,
+            "mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe",
+        );
+
+        let bytes = http_get(&asset.url, "application/octet-stream").unwrap();
+        assert_eq!(
+            bytes,
+            downloaded_exe(),
+            "the bytes must come from the redirect target, not the redirecting host"
+        );
+
+        // The asset was really fetched from the target the 302 named, so this
+        // fails if the client ever stops following it.
+        let asked_of_the_cdn = cdn.request();
+        assert!(
+            asked_of_the_cdn.contains("/release-assets/mnvoice.exe"),
+            "redirect target request was: {asked_of_the_cdn}"
+        );
+        let _ = asset.request();
     }
 
     #[test]
@@ -918,6 +973,42 @@ mod tests {
         // The running image and the personal config beside it are left alone.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         assert!(dir.join("mnvoice.env").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repaired_swap_leaves_nothing_for_the_next_start_to_tidy_up() {
+        // The helper that repairs an interrupted swap is a copy of this exe under
+        // an image name of its own, so repairing it leaves two things behind that
+        // both belong to the update and neither to the app: the backup the swap
+        // moved the old image to, and the helper copy itself. The next start is
+        // what takes them, and it has to take all of them.
+        let (dir, exe) = install_folder("swap-repaired-tidy");
+        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        fs::write(staged_path(&exe), downloaded_exe()).unwrap();
+        let helper_copy = helper_copy_path();
+        fs::write(&helper_copy, installed_exe()).unwrap();
+
+        finish_swap(&exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
+
+        // What the next start does before the window exists.
+        clean_stale(&exe);
+        reap_helpers();
+        assert!(!dir.join("mnvoice.exe.old").exists());
+        assert!(!staged_path(&exe).exists());
+        assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
+
+        // Nothing that names the helper survives either, whatever pid it came
+        // from: a copy left in the temp directory is debris the app did not
+        // install and the user never asked for.
+        let leftovers = fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(HELPER_IMAGE_PREFIX))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "helper copies left behind: {leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
