@@ -178,7 +178,7 @@ fn main() {
         // is holding for as long as it is the one installing. It runs from a copy
         // of this exe under an image name of its own, so the install it has to
         // repair comes in after the flag on the command line.
-        update::finish_install(args.get(pos + 1).map(|p| std::path::Path::new(p)));
+        update::finish_install(args.get(pos + 1).map(std::path::Path::new));
         return;
     }
     if args.iter().any(|a| a == "--restart") {

@@ -6,7 +6,7 @@ Press a hotkey, speak naturally - words type directly into whatever window you a
 Built in native Rust using pure Win32, WASAPI, and WinHTTP. No Electron, no Python, no async runtimes.
 
 ```
-mnvoice.exe (~302 KB)
+mnvoice.exe (~417 KB)
   ├── Global hotkey (configurable, default Alt+Space to start / stop)
   ├── Standby pre-initialized audio capture (WASAPI, 16 kHz mono, ~15 ms to first audio)
   ├── Dual-layer VAD (local RMS energy + server endpointing, auto-stops on silence)
@@ -14,7 +14,7 @@ mnvoice.exe (~302 KB)
   ├── Monotonic live word-by-word typing (SendInput KEYEVENTF_UNICODE, zero clipboard touch)
   ├── Custom vocabulary / keyterm prompting (keywords.txt or KEYWORDS= env)
   ├── Filler-word stripping (provider-native on streaming, local filter on REST)
-  └── System tray control (start with Windows, config, keywords, restart)
+  └── System tray control (start with Windows, check for updates, config, keywords, restart)
 ```
 
 ## Features
@@ -24,9 +24,9 @@ mnvoice.exe (~302 KB)
 - **Real-time word streaming** - 40 ms audio slices over native WinHTTP WebSockets; words appear as you speak.
 - **Hands-free auto-stop** - dual VAD (local RMS + server endpointing) detects ~2.2 s of silence and finalizes automatically.
 - **Fully configurable** - hotkey, cancel key, orb color, fluid level, filler words, STT provider, model, language, and vocabulary. All in one plain text file, none of it required.
-- **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, config, keywords, and restart.
+- **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, check for updates, config, keywords, and restart.
 - **Privacy focused** - zero audio written to disk, point-to-point TLS, zero telemetry. See [SECURITY.md](SECURITY.md).
-- **Tiny footprint** - ~302 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
+- **Tiny footprint** - ~417 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
 
 ---
 
@@ -73,7 +73,7 @@ Press **Alt+Space** in any app to start dictating. A pink orb appears at the bot
 ### What you get
 
 ```
-system tray icon  - right-click for autostart, config, keywords, restart, exit
+system tray icon  - right-click for autostart, check for updates, config, keywords, restart, exit
 orb               - appears only while recording, then disappears
 no windows        - nothing in the taskbar, nothing to close
 no terminal       - no command needed after install
@@ -109,6 +109,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v mnvoice /f
 ```
 system tray icon
     -> Start with Windows   (checkbox)
+    -> Check for updates    (downloads a newer release, installs it when idle)
     -> Open config          (opens mnvoice.env in Notepad)
     -> Open keywords        (opens keywords.txt in Notepad)
     -> Restart              (frees the hotkey and starts fresh)
@@ -120,12 +121,13 @@ system tray icon
 
 ## Command line
 
-There is only one flag, and it is for recovery, not normal use:
+One flag is yours to use, and it is for recovery, not normal use:
 
 | Command | Purpose |
 |---|---|
 | `mnvoice.exe` | Run normally |
 | `mnvoice.exe --restart` | Kill stale instances, free the hotkey, start fresh |
+| `mnvoice.exe --finish-update <dir>` | Internal recovery flag the updater itself uses: a short-lived helper copy finishes an interrupted swap. Never run it by hand. |
 
 `--restart` is what to reach for if **Alt+Space silently stops working** - almost always another app (Gemini, PowerToys, AutoHotkey) has grabbed the same hotkey and left it held. Starting with `--restart` lets mnvoice claim it again.
 

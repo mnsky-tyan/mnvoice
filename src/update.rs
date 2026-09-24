@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::Win32::Networking::WinHttp::*;
 use windows::core::{w, PCWSTR};
+use windows::Win32::Networking::WinHttp::*;
 
 use crate::rest::{self, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS};
 
