@@ -24,7 +24,9 @@
 // implementation per platform and no shared logic, which is abstraction for its
 // own sake.
 
+pub mod audio;
 pub mod http;
+pub mod input;
 
 #[cfg(windows)]
 pub mod windows_impl;

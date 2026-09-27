@@ -398,6 +398,20 @@ impl WebSocket for WinHttpSocket {
     }
 }
 
+/// Types text by synthesizing keystrokes through paste.rs's event stream.
+///
+/// The injection contract lives on the trait; this is the Windows way of
+/// honouring it. paste.rs owns the mechanics - one unicode event per
+/// character with a 2 ms gap so no target window's message queue drops
+/// characters - and stays the single source of that behaviour.
+pub struct SendInputInjector;
+
+impl crate::platform::input::Injector for SendInputInjector {
+    fn type_text(&self, text: &str) -> Result<(), String> {
+        crate::paste::type_text(text)
+    }
+}
+
 impl Drop for WinHttpSocket {
     fn drop(&mut self) {
         unsafe {

@@ -14,7 +14,7 @@ use windows::Win32::System::Com::*;
 
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
-pub const SAMPLE_RATE: u32 = 16_000;
+pub use crate::platform::audio::{wav_bytes, SAMPLE_RATE};
 pub const WM_APP_RECORDING_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
 struct CaptureRequest {
@@ -29,6 +29,19 @@ struct CaptureRequest {
 #[derive(Clone)]
 pub struct AudioEngine {
     request_tx: Sender<CaptureRequest>,
+}
+
+impl crate::platform::audio::Audio for AudioEngine {
+    fn capture_to_channel(
+        &self,
+        stop: Arc<AtomicBool>,
+        max_seconds: u32,
+        vad_silence_ms: u32,
+        vad_rms_threshold: f64,
+        tx: Sender<Vec<i16>>,
+    ) -> Result<Receiver<Result<(), String>>, String> {
+        Self::capture_to_channel(self, stop, max_seconds, vad_silence_ms, vad_rms_threshold, tx)
+    }
 }
 
 impl AudioEngine {
@@ -273,26 +286,4 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
         pos += step;
     }
     Ok(out)
-}
-
-/// Wrap samples in a minimal RIFF/WAVE container (44-byte header).
-pub fn wav_bytes(samples: &[i16]) -> Vec<u8> {
-    let data_len = samples.len() * 2;
-    let mut v = Vec::with_capacity(44 + data_len);
-    v.extend_from_slice(b"RIFF");
-    v.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
-    v.extend_from_slice(b"WAVEfmt ");
-    v.extend_from_slice(&16u32.to_le_bytes());
-    v.extend_from_slice(&1u16.to_le_bytes());
-    v.extend_from_slice(&1u16.to_le_bytes());
-    v.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    v.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
-    v.extend_from_slice(&2u16.to_le_bytes());
-    v.extend_from_slice(&16u16.to_le_bytes());
-    v.extend_from_slice(b"data");
-    v.extend_from_slice(&(data_len as u32).to_le_bytes());
-    for &s in samples {
-        v.extend_from_slice(&s.to_le_bytes());
-    }
-    v
 }
