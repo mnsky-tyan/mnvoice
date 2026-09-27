@@ -58,6 +58,9 @@ pub fn version() -> String {
 /// stable and platform-specific so an existing install never has to be told
 /// twice; Windows in particular keeps the exact name it has always used, so the
 /// updater already running on people's machines keeps resolving correctly.
+/// Today only the Windows updater calls this - the Unix updater is not built
+/// yet - but the names are pinned by the release workflow regardless.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const fn asset_name() -> &'static str {
     #[cfg(windows)]
     {

@@ -109,8 +109,10 @@ pub fn is_disfluency(word: &str) -> bool {
 }
 
 /// Remove disfluency tokens from a transcript and normalise whitespace.
-/// Used on the REST path, where no provider has a native filler_words parameter,
-/// and on the streaming path as a safety net for providers that ignore it.
+/// Used on the REST path, where no provider has a native filler_words
+/// parameter, so the local stoplist is the only filter. The streaming path
+/// filters word-by-word as commits arrive (see stream.rs), which is why this
+/// does not appear there.
 pub fn strip_disfluencies(text: &str) -> String {
     text.split_whitespace()
         .filter(|w| !is_disfluency(w))

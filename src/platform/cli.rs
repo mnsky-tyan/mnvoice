@@ -113,7 +113,10 @@ fn dictate(cfg: &config::Config, engine: &dyn audio::Audio) -> Result<(), String
         }
         config::Protocol::Rest => {
             let wav = audio::wav_bytes(&samples);
-            let text = crate::rest::transcribe(cfg, &wav)?;
+            let raw = crate::rest::transcribe(cfg, &wav)?;
+            // REST has no provider-side filler parameter, so the local
+            // stoplist is the only filter (see strip_disfluencies).
+            let text = crate::rest::strip_disfluencies(&raw);
             input::type_text(&text);
             text
         }

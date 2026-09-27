@@ -18,7 +18,12 @@ pub struct Config {
     pub max_seconds: u32,
     pub trailing_space: bool,
     pub keywords: Vec<String>,
+    // Orb appearance. Read by the Windows orb renderer; on Linux and macOS
+    // the orb is not ported yet, so the fields ride along unparsed-but-stored
+    // to keep config files and their round-trip identical everywhere.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub orb_color: (f32, f32, f32),
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub orb_fluid_level: f32,
     pub hotkey: (u32, u32),
     pub hotkey_str: String,

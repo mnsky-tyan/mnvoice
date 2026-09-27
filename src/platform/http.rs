@@ -100,10 +100,11 @@ pub trait Transport {
 ///
 /// Linux and macOS each name their own type rather than sharing a `unix_impl`
 /// module, because the two differ in something that matters: on Linux rustls
-/// has no default crypto provider, so the backend has to install one before the
-/// first handshake, while macOS can lean on the platform's own verifier. A
-/// shared module would have to `#[cfg]` that difference anyway, so the split is
-/// honest about where the real difference is.
+/// needs an explicit crypto provider installed before the first handshake
+/// (done in `unix_http::ensure_tls_ready`), while macOS rides the platform's
+/// own verifier through native-tls. A shared module would have to `#[cfg]`
+/// that difference anyway, so the split is honest about where the real
+/// difference is.
 #[cfg(windows)]
 pub use crate::platform::windows_impl::WinHttpTransport as NativeTransport;
 
@@ -112,3 +113,12 @@ pub use crate::platform::linux_impl::LinuxTransport as NativeTransport;
 
 #[cfg(target_os = "macos")]
 pub use crate::platform::macos_impl::MacTransport as NativeTransport;
+
+/// A way for the Unix transport tests to exercise the full stack - the trait
+/// object a caller gets - without reaching into a specific backend module.
+/// Windows keeps its test inside update.rs, where the updater calls through
+/// the same name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn native_transport_for_tests() -> Box<dyn Transport> {
+    Box::new(NativeTransport)
+}

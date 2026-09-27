@@ -177,3 +177,64 @@ impl WebSocket for UnixSocket {
 // out here would surface as `Err`, which the loop treats as the end of the
 // stream, cutting off the last words of a dictation. So the parameter exists
 // for backends that can poll, and this one, like WinHTTP, honestly cannot.
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    /// The Windows backend has this exact test in update.rs, because the
+    /// updater lives there. The contract belongs to the transport, not the
+    /// updater: release assets are served from a CDN after a 302, and a
+    /// backend that stops at the redirect downloads a short HTML page instead
+    /// of a binary. So the Unix backends pin it too, through the same trait a
+    /// caller would use.
+    #[test]
+    fn a_get_follows_the_redirect_to_the_host_the_asset_lives_on() {
+        let final_body = b"asset-bytes";
+        let final_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let final_addr = final_listener.local_addr().unwrap();
+        let final_thread = std::thread::spawn(move || {
+            let (mut conn, _) = final_listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    final_body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            conn.write_all(final_body).unwrap();
+        });
+
+        let redirect_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let redirect_thread = std::thread::spawn(move || {
+            let (mut conn, _) = redirect_listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{final_addr}/cdn/asset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+
+        let transport = crate::platform::native_transport_for_tests();
+        let response = transport
+            .get(
+                &format!("http://{redirect_addr}/releases/download/v0.1.15/asset"),
+                "application/octet-stream",
+            )
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, final_body.to_vec());
+        redirect_thread.join().unwrap();
+        final_thread.join().unwrap();
+    }
+}
