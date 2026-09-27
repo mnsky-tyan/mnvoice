@@ -1,6 +1,7 @@
-// Generic WinHTTP-based REST client for OpenAI-compatible speech-to-text endpoints.
+// REST client for OpenAI-compatible speech-to-text endpoints.
 // Compatible with any standard audio/transcriptions endpoint (self-hosted Whisper, Groq, OpenAI, etc.).
-// Native TLS, system cert store, respects Windows system proxy settings.
+// Requests go through the platform transport seam: WinHTTP with the system cert store and
+// proxy settings on Windows, ureq with rustls (bundled roots) or native-tls elsewhere.
 
 use crate::config::Config;
 use crate::platform::http::Transport;
@@ -9,17 +10,7 @@ const BOUNDARY: &str = "mnvoiceboundary9f2a";
 
 /// Transcribe a WAV clip using an OpenAI-compatible REST endpoint. Returns plain text.
 pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
-    let (host, _port, _secure, base_path) = parse_base_url(&cfg.base_url)?;
-
-    let endpoint_path = if !base_path.is_empty() {
-        base_path
-    } else if host.contains("groq.com") {
-        "/openai/v1/audio/transcriptions".to_string()
-    } else {
-        "/v1/audio/transcriptions".to_string()
-    };
-    let url = format!("{}{}", cfg.base_url.trim_end_matches('/'), endpoint_path);
-
+    let url = endpoint_url(&cfg.base_url)?;
     let body = multipart_body(cfg, wav);
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
 
@@ -39,6 +30,25 @@ pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
     let parsed =
         parse_json_transcript(&raw_text).unwrap_or_else(|| raw_text.trim().to_string());
     Ok(parsed.trim().to_string())
+}
+
+/// The URL a transcription POST goes to.
+///
+/// A `BASE_URL` that already carries a path is the whole endpoint: that is how
+/// a custom endpoint or a reverse proxy is configured, so the default path is
+/// appended only when the base URL has none. Appending it anyway would ask the
+/// provider for `/deepgram/deepgram`.
+fn endpoint_url(base_url: &str) -> Result<String, String> {
+    let (host, _port, _secure, base_path) = parse_base_url(base_url)?;
+    if !base_path.is_empty() {
+        return Ok(base_url.trim_end_matches('/').to_string());
+    }
+    let endpoint_path = if host.contains("groq.com") {
+        "/openai/v1/audio/transcriptions"
+    } else {
+        "/v1/audio/transcriptions"
+    };
+    Ok(format!("{}{endpoint_path}", base_url.trim_end_matches('/')))
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -202,6 +212,41 @@ mod tests {
         assert_eq!(port, 8000);
         assert!(!secure);
         assert_eq!(path, "");
+    }
+
+    #[test]
+    fn test_endpoint_url_uses_a_configured_path_verbatim() {
+        // A custom endpoint or reverse proxy is configured as a BASE_URL that
+        // already carries the path, so the default path must not be appended
+        // to it a second time.
+        assert_eq!(
+            endpoint_url("https://stt.corp/deepgram").unwrap(),
+            "https://stt.corp/deepgram"
+        );
+        assert_eq!(
+            endpoint_url("https://stt.corp:8443/listen").unwrap(),
+            "https://stt.corp:8443/listen"
+        );
+        assert_eq!(
+            endpoint_url("https://stt.corp/deepgram/").unwrap(),
+            "https://stt.corp/deepgram"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_url_appends_the_default_path_only_when_absent() {
+        assert_eq!(
+            endpoint_url("https://api.deepgram.com").unwrap(),
+            "https://api.deepgram.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            endpoint_url("https://api.groq.com").unwrap(),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            endpoint_url("http://localhost:8000").unwrap(),
+            "http://localhost:8000/v1/audio/transcriptions"
+        );
     }
 
     #[test]

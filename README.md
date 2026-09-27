@@ -377,8 +377,9 @@ rather than a tray icon:
 - Put a `mnvoice.env` next to the binary (same format as the Windows one,
   `API_KEY=...` is all you need) and a `keywords.txt` if you use keyterms.
 - Press **Enter** to start a dictation. Press **Enter** again to stop early;
-  ~2.2 s of silence or the max duration also stops it. Words type into the
-  focused window as they are recognized and echo to stdout. Ctrl+C quits.
+  3 s of silence (`VAD_SILENCE_MS`) or the max duration also stops it. Words
+  type into the focused window as they are recognized and echo to stdout.
+  Ctrl+C quits.
 
 Known limits in this release, stated rather than papered over:
 

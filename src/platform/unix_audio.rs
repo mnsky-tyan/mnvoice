@@ -77,6 +77,7 @@ fn run_session(
         .default_input_config()
         .map_err(|e| format!("cannot query input device ({e})"))?;
     let in_rate = supported.sample_rate().0;
+    let channels = supported.channels().max(1) as usize;
     // Decimation factor from the device rate to the provider rate; a device
     // below 16 kHz would give zero, so clamp to pass-through.
     let step = (in_rate / SAMPLE_RATE).max(1) as usize;
@@ -117,7 +118,9 @@ fn run_session(
     stream.play().map_err(|e| format!("cannot start capture ({e})"))?;
 
     let started = Instant::now();
+    let mut speech_started = false;
     let mut since_voice_ms = 0u64;
+    let mut no_speech_ms = 0u64;
     loop {
         thread::sleep(Duration::from_millis(20));
 
@@ -126,14 +129,21 @@ fn run_session(
             .map(|mut buf| std::mem::take(&mut *buf))
             .unwrap_or_default();
 
-        // Keep every `step`-th sample: linear decimation to 16 kHz, mono
-        // (interleaved channels collapse onto the primary voice, which is
-        // where dictation microphones put it).
-        let chunk: Vec<i16> = raw
+        // Frames arrive interleaved, so the channels are averaged into mono
+        // before decimation. Taking every `step`-th sample of a stereo stream
+        // instead would alternate left and right, and the provider would be
+        // sent an alternating signal rather than the mixed-down voice the
+        // Windows engine hands it.
+        let mono: Vec<f32> = raw
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect();
+
+        // Keep every `step`-th sample: linear decimation to 16 kHz, mono.
+        let chunk: Vec<i16> = mono
             .iter()
-            .enumerate()
-            .filter(|(i, _)| i % step == 0)
-            .map(|(_, s)| (*s * i16::MAX as f32) as i16)
+            .step_by(step)
+            .map(|s| (*s * i16::MAX as f32) as i16)
             .collect();
 
         // The silence detector reads the same window that goes downstream,
@@ -154,13 +164,24 @@ fn run_session(
         {
             return Ok(());
         }
-        if rms < vad_rms_threshold {
+        if rms > vad_rms_threshold {
+            speech_started = true;
+            since_voice_ms = 0;
+        } else if speech_started {
+            // Silence only ends a dictation once there has been speech, which
+            // is what VAD_SILENCE_MS documents; waiting that long before the
+            // first word would stop a session the user is still thinking in.
             since_voice_ms += 20;
             if vad_silence_ms > 0 && since_voice_ms >= vad_silence_ms as u64 {
                 return Ok(());
             }
         } else {
-            since_voice_ms = 0;
+            // Nothing said at all: the same no-speech cutoff Windows uses, so a
+            // forgotten open mic cannot hold the device for max_seconds.
+            no_speech_ms += 20;
+            if no_speech_ms >= 10_000 {
+                return Ok(());
+            }
         }
     }
     // `stream` drops here, which stops capture and joins the device thread.

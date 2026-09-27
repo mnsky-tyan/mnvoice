@@ -9,7 +9,7 @@ use crate::config;
 use crate::platform::{audio, input};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,20 +39,44 @@ pub fn run() -> Result<(), String> {
     }
     println!();
     println!("Press Enter to start a dictation. Enter again to stop early;");
-    println!("{}s of silence or {}s total also stops it.", 300, 120);
+    println!(
+        "{}ms of silence or {}s total also stops it.",
+        cfg.vad_silence_ms, cfg.max_seconds
+    );
     println!("Ctrl+C quits.");
     println!();
 
-    let stdin = std::io::stdin();
-    for _ in stdin.lock().lines() {
-        dictate(&cfg, &engine)?;
+    // Stdin's lock is process-wide and not reentrant, so it gets exactly one
+    // owner: this thread holds it for the life of the process and hands the
+    // main loop a line at a time. A dictation therefore never runs with the
+    // lock held, and the "Enter again" control reads through the same channel.
+    let (line_tx, lines) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for _ in stdin.lock().lines() {
+            if line_tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        // A closed stdin ends the session instead of spinning on Enter.
+        if lines.recv().is_err() {
+            break;
+        }
+        dictate(&cfg, &engine, &lines)?;
         println!();
         println!("Press Enter for the next dictation.");
     }
     Ok(())
 }
 
-fn dictate(cfg: &config::Config, engine: &dyn audio::Audio) -> Result<(), String> {
+fn dictate(
+    cfg: &config::Config,
+    engine: &dyn audio::Audio,
+    lines: &Receiver<()>,
+) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let done = engine.capture_to_channel(
@@ -63,21 +87,16 @@ fn dictate(cfg: &config::Config, engine: &dyn audio::Audio) -> Result<(), String
         tx,
     )?;
 
-    // The stop arm doubles as the "Enter again" control: a reader thread turns
-    // a second line of input into the same stop signal the VAD would raise.
-    let stop_reader = Arc::clone(&stop);
-    let reader = std::thread::spawn(move || {
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_ok() {
-            stop_reader.store(true, Ordering::SeqCst);
-        }
-    });
-
     println!("recording... (Enter to stop)");
 
     let mut samples: Vec<i16> = Vec::new();
     let mut ended: Option<Result<(), String>> = None;
     while ended.is_none() {
+        // The "Enter again" control: the next line from the single reader
+        // thread raises the same stop signal the VAD would.
+        if lines.try_recv().is_ok() {
+            stop.store(true, Ordering::SeqCst);
+        }
         while let Ok(chunk) = rx.try_recv() {
             samples.extend_from_slice(&chunk);
         }
@@ -90,7 +109,6 @@ fn dictate(cfg: &config::Config, engine: &dyn audio::Audio) -> Result<(), String
     while let Ok(chunk) = rx.try_recv() {
         samples.extend_from_slice(&chunk);
     }
-    let _ = reader.join();
     if let Some(Err(e)) = ended {
         return Err(e);
     }

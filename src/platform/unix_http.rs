@@ -20,7 +20,10 @@
 
 use crate::platform::http::{Response, WebSocket};
 use std::io::Read as _;
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
@@ -91,12 +94,23 @@ pub fn post(
 /// full-duplex guarantee is approximated the way the trait docs prescribe: a
 /// short-held mutex. The socket underneath is still full duplex; the lock
 /// only serializes the library calls, and neither call holds it across a
-/// network wait that the other side did not ask for.
-pub struct UnixSocket(Arc<Mutex<WsRaw<MaybeTlsStream<std::net::TcpStream>>>>);
+/// network wait that the other side did not ask for - the socket carries a
+/// short read timeout, so a quiet provider releases the lock between polls.
+pub struct UnixSocket(Arc<Mutex<WsRaw<MaybeTlsStream<TcpStream>>>>);
+
+/// How long one read attempt may hold the socket. The socket read is the wait,
+/// so a quiet provider costs no spinning, and a send on another thread never
+/// queues behind a frame that has not arrived.
+const READ_POLL_MS: u64 = 25;
 
 /// Open a WebSocket to `url`, sending `headers` on the handshake.
+///
+/// The TCP connection is made here rather than by `tungstenite::connect` so
+/// that the read timeout can be installed once the handshake is done: a
+/// handshake read that timed out mid-flight would fail the connection.
 pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> {
     use tungstenite::client::IntoClientRequest;
+
     ensure_tls_ready();
     let mut request = url
         .into_client_request()
@@ -110,8 +124,36 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
             .map_err(|_| format!("invalid header value for {name}"))?;
         request.headers_mut().insert(name, value);
     }
-    let (socket, _) = tungstenite::connect(request)
+
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("websocket url has no host ({url})"))?
+        .to_string();
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("ws") | Some("http") => 80,
+        _ => 443,
+    });
+
+    let stream = TcpStream::connect(format!("{host}:{port}").as_str())
         .map_err(|e| format!("websocket connect failed ({e})"))?;
+    // tungstenite's own `connect` sets this; the streaming loop types words as
+    // they arrive, so a delayed small frame is a visible stutter.
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+    // A second handle on the same socket: the stream itself moves into the TLS
+    // wrapper, and a duplicated descriptor shares the socket's options.
+    let options = stream
+        .try_clone()
+        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+
+    let (socket, _) = tungstenite::client_tls_with_config(request, stream, None, None)
+        .map_err(|e| format!("websocket connect failed ({e})"))?;
+    options
+        .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))
+        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+
     Ok(UnixSocket(Arc::new(Mutex::new(socket))))
 }
 
@@ -144,14 +186,16 @@ impl WebSocket for UnixSocket {
 
     fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
         let _ = timeout_ms; // see the note below
-        let mut ws = self
-            .0
-            .lock()
-            .map_err(|_| "websocket lock poisoned".to_string())?;
         loop {
+            let mut ws = self
+                .0
+                .lock()
+                .map_err(|_| "websocket lock poisoned".to_string())?;
             match ws.read() {
                 Ok(Message::Binary(data)) => return Ok(Some(data.to_vec())),
-                Ok(Message::Text(text)) => return Ok(Some(text.as_str().as_bytes().to_vec())),
+                Ok(Message::Text(text)) => {
+                    return Ok(Some(text.as_str().as_bytes().to_vec()))
+                }
                 Ok(Message::Close(_)) => return Ok(None),
                 // Protocol-level pings must be answered for the server to keep
                 // the connection; the pong goes out on the next write, and
@@ -164,6 +208,24 @@ impl WebSocket for UnixSocket {
                 // future additions); anything that is not payload or a ping
                 // carries nothing the transcript loop needs.
                 Ok(_) => {}
+                // The socket's read timeout turns "the provider is quiet" into
+                // a poll miss rather than a wait: the lock is dropped before
+                // the next attempt, so a send on another thread never queues
+                // behind a frame that has not arrived yet.
+                Err(tungstenite::Error::Io(ref e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // Standing off the lock for a moment is what makes the
+                    // bound real: a thread that unlocks and immediately locks
+                    // again wins that race every time, so a sender parked in
+                    // `lock()` would wait for however long the reader cared to
+                    // keep polling.
+                    drop(ws);
+                    thread::sleep(Duration::from_millis(1));
+                }
                 Err(e) => return Err(format!("websocket read failed ({e})")),
             }
         }
@@ -173,10 +235,12 @@ impl WebSocket for UnixSocket {
 // A note on `read`'s ignored timeout, matching the Windows backend's stated
 // behaviour: the streaming loop is built around a blocking read - the reader
 // thread simply waits until the provider sends the next final or closes, and
-// cancellation unblocks it because the writer side closes the socket. Timing
-// out here would surface as `Err`, which the loop treats as the end of the
-// stream, cutting off the last words of a dictation. So the parameter exists
-// for backends that can poll, and this one, like WinHTTP, honestly cannot.
+// cancellation unblocks it because the writer side closes the socket. The
+// trait has no spelling for "nothing arrived this tick": `None` and `Err` are
+// both read by the loop as the end of the stream, so honouring the deadline
+// here would cut off the last words of a dictation. The socket's short read
+// timeout therefore bounds only how long the mutex can be held, which is what
+// keeps a send on the main thread moving while the provider is quiet.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tests {

@@ -22,9 +22,12 @@ pub trait Injector: Send + Sync {
     fn type_text(&self, text: &str) -> Result<(), String>;
 }
 
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
+static REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// The platform's injector, installing the default on first use.
 ///
@@ -48,8 +51,18 @@ pub fn global() -> &'static dyn Injector {
     })
 }
 
-/// Convenience matching the pre-seam call sites: type and swallow the error,
-/// exactly as the Win32 code did. The streaming loop logs upstream.
+/// Convenience matching the pre-seam call sites: type, and report a failure
+/// instead of dropping words silently. The streaming loop calls this once per
+/// commit, so only the first error of a session is printed - a refused
+/// permission or a Wayland session without XWayland fails every keystroke, and
+/// a transcript's worth of identical lines would bury the reason.
 pub fn type_text(text: &str) {
-    let _ = global().type_text(text);
+    if let Err(e) = global().type_text(text) {
+        if !REPORTED.swap(true, Ordering::SeqCst) {
+            // Written through `writeln!` with the result dropped, not
+            // `eprintln!`: the Windows tray build has no stderr to write to,
+            // and a failed print there panics instead of staying silent.
+            let _ = writeln!(std::io::stderr(), "mnvoice: {e}");
+        }
+    }
 }
