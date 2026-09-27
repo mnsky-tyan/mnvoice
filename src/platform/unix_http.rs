@@ -19,6 +19,7 @@
 // A failed request cannot poison the next one.
 
 use crate::platform::http::{Response, WebSocket};
+use std::io::Read as _;
 use std::sync::{Arc, Mutex};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
@@ -45,13 +46,13 @@ fn ensure_tls_ready() {}
 // errors are unpacked into a normal Response here, and only genuine transport
 // failures (DNS, TLS, connection refused) surface as Err.
 fn finish(resp: ureq::Response) -> Result<Response, String> {
+    let mut body = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut body)
+        .map_err(|e| format!("reading response body failed ({e})"))?;
     Ok(Response {
         status: resp.status(),
-        body: resp
-            .into_reader()
-            .bytes()
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("reading response body failed ({e})"))?,
+        body,
     })
 }
 

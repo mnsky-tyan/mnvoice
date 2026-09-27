@@ -136,6 +136,15 @@ fn run_session(
             .map(|(_, s)| (*s * i16::MAX as f32) as i16)
             .collect();
 
+        // The silence detector reads the same window that goes downstream,
+        // so it runs before the hand-off (sending moves the chunk).
+        let rms = if chunk.is_empty() {
+            0.0
+        } else {
+            let sum: f64 = chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+            (sum / chunk.len() as f64).sqrt()
+        };
+
         if !chunk.is_empty() {
             let _ = tx.send(chunk);
         }
@@ -145,13 +154,6 @@ fn run_session(
         {
             return Ok(());
         }
-
-        let rms = if chunk.is_empty() {
-            0.0
-        } else {
-            let sum: f64 = chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum();
-            (sum / chunk.len() as f64).sqrt()
-        };
         if rms < vad_rms_threshold {
             since_voice_ms += 20;
             if vad_silence_ms > 0 && since_voice_ms >= vad_silence_ms as u64 {
