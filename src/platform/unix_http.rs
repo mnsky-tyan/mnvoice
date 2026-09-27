@@ -46,14 +46,13 @@ fn ensure_tls_ready() {}
 // errors are unpacked into a normal Response here, and only genuine transport
 // failures (DNS, TLS, connection refused) surface as Err.
 fn finish(resp: ureq::Response) -> Result<Response, String> {
+    // status() borrows, into_reader() consumes - so status comes first.
+    let status = resp.status();
     let mut body = Vec::new();
     resp.into_reader()
         .read_to_end(&mut body)
         .map_err(|e| format!("reading response body failed ({e})"))?;
-    Ok(Response {
-        status: resp.status(),
-        body,
-    })
+    Ok(Response { status, body })
 }
 
 /// A GET with an `Accept` header. Redirects are followed - the contract.
