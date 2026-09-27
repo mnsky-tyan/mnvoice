@@ -45,7 +45,7 @@ pub fn run() -> Result<(), String> {
 
     let stdin = std::io::stdin();
     for _ in stdin.lock().lines() {
-        dictate(&cfg, engine.as_ref())?;
+        dictate(&cfg, &engine)?;
         println!();
         println!("Press Enter for the next dictation.");
     }

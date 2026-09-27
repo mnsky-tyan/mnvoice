@@ -34,14 +34,17 @@ pub mod native;
 #[cfg(windows)]
 pub mod windows_impl;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_audio;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_http;
+
 #[cfg(target_os = "linux")]
 pub mod linux_impl;
 
 #[cfg(target_os = "macos")]
 pub mod macos_impl;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod unix_audio;
 
 /// The version this build reports, baked by build.rs from the release tag
 /// (falling back to the crate version for local builds). Windows and the
@@ -50,12 +53,6 @@ pub mod unix_audio;
 pub fn version() -> String {
     env!("MNVOICE_VERSION").to_string()
 }
-
-#[cfg(target_os = "linux")]
-pub mod linux_impl;
-
-#[cfg(target_os = "macos")]
-pub mod macos_impl;
 
 /// Which release asset this platform's updater should download. The names are
 /// stable and platform-specific so an existing install never has to be told

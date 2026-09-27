@@ -19,6 +19,7 @@ use crate::platform::audio::{Audio, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub struct CpalAudio;

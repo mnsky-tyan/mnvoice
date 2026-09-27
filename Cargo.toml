@@ -26,12 +26,33 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# The Linux and macOS ports: audio capture and text injection. Both are
-# cfg-gated by target rather than optional features so a plain `cargo build`
-# on those platforms produces a working binary.
+# The Linux and macOS ports: audio capture, text injection, and network
+# transport. All are cfg-gated by target rather than optional features so a
+# plain `cargo build` on those platforms produces a working binary.
+#
+# TLS is split per target on purpose: Linux gets rustls + ring with Mozilla
+# root certificates compiled in, macOS gets native-tls (Security.framework),
+# so the platform's own verifier decides trust. See unix_http.rs.
 [target.'cfg(not(windows))'.dependencies]
 cpal = "0.15"
 enigo = "0.2"
+tungstenite = "0.26"
+ureq = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The rustls dependency is for the crypto provider only (see unix_http.rs);
+# the stack itself is behind ureq and tungstenite's rustls feature.
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "ring",
+    "std",
+    "tls12",
+] }
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+tungstenite = { version = "0.26", features = ["native-tls"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

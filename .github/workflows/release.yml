@@ -67,6 +67,9 @@ jobs:
 
       # Belt and braces: an empty release must never ship unnoticed again.
       - name: Verify asset attached
+        # Tag-gated like the publish step above it - on a pull_request run
+        # there is no release to verify and the API call would 404.
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
