@@ -30,16 +30,23 @@ Reverse-chronological. Every claim links to a check that was run.
 ## Stage: Unix backends (commits 0cd5b0c..HEAD)
 
 - `unix_audio` (cpal): stream is `!Send`, so the whole session lives in one
-  thread; realtime callback only appends to a buffer, a 20 ms ticker decimates
-  to 16 kHz mono + VAD + feeds the transcriber. Device-open per session is the
-  stated cost of no cpal standby equivalent.
+  thread; realtime callback only appends to a buffer, a 20 ms ticker mixes to
+  mono and resamples to 16 kHz (fractional step + linear interpolation, the
+  conversion `audio.rs` applies to the device's mix format) + VAD + feeds the
+  transcriber. Device-open per session is the stated cost of no cpal standby
+  equivalent.
 - `unix_http`: ureq + tungstenite. GET follows redirects (pinned by the same
   loopback 302 test the Windows updater has, run through the trait), status
   codes ride as data, read's timeout ignored like WinHTTP's (the loop treats
-  Err as end-of-stream), TLS by feature flags: rustls+ring+bundled roots on
-  Linux, native-tls/Security.framework on macOS.
-- `linux_impl`/`macos_impl`: unit-struct transports, cpal audio, enigo
-  injection (x11rb backend - no libxdo system dependency).
+  Err as end-of-stream), every call carries a wall-clock bound the Windows
+  WinHTTP backend sets and std/ureq do not (60 s REST, 45 s download, 10 s
+  connect, 30 s handshake), TLS by feature flags: rustls+ring+bundled roots on
+  Linux, native-tls/Security.framework on macOS. One `UnixTransport` serves
+  both Unix backends: the TLS split is already decided by Cargo.toml's
+  per-target features and by `ensure_tls_ready`, so only the audio device and
+  the injector genuinely differ per platform.
+- `linux_impl`/`macos_impl`: cpal audio, enigo injection (x11rb backend - no
+  libxdo system dependency).
 - CI iterations to green: 6 rounds, each fixing exactly what rustc on the real
   platform said (duplicate mod decls, tungstenite Bytes/Utf8Bytes, cpal
   traits in scope, non-exhaustive Message match, moved chunk, ureq unsized

@@ -18,9 +18,9 @@
 // Like the Windows transport, every call is stateless: open, complete, close.
 // A failed request cannot poison the next one.
 
-use crate::platform::http::{Response, WebSocket};
+use crate::platform::http::{Response, Transport, WebSocket};
 use std::io::Read as _;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -30,6 +30,21 @@ use tungstenite::Message;
 // tungstenite re-exports the http types its handshake needs.
 use tungstenite::http as http;
 use tungstenite::WebSocket as WsRaw;
+
+/// Overall bound on a REST request. ureq's own defaults put no limit on the
+/// socket reads at all, so a proxy or captive portal that completes the TCP
+/// handshake and then goes silent would hold the CLI forever; the Windows
+/// backend this replaces bounds the same call through WinHttpSetTimeouts.
+const REST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Overall bound on an updater download, matching the Windows GET's budget.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Bound on the TCP connect and on the WebSocket handshake that follows it.
+/// Windows bounds the same steps; std's and ureq's defaults are either looser
+/// than a dictation can wait or absent.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(target_os = "linux")]
 fn ensure_tls_ready() {
@@ -61,7 +76,11 @@ fn finish(resp: ureq::Response) -> Result<Response, String> {
 /// A GET with an `Accept` header. Redirects are followed - the contract.
 pub fn get(url: &str, accept: &str) -> Result<Response, String> {
     ensure_tls_ready();
-    match ureq::get(url).set("Accept", accept).call() {
+    match ureq::get(url)
+        .set("Accept", accept)
+        .timeout(DOWNLOAD_TIMEOUT)
+        .call()
+    {
         Ok(resp) => finish(resp),
         Err(ureq::Error::Status(_, resp)) => finish(resp),
         Err(e) => Err(format!("{e}")),
@@ -81,7 +100,7 @@ pub fn post(
     if let Some(auth) = auth {
         req = req.set("Authorization", auth);
     }
-    match req.send(body) {
+    match req.timeout(REST_TIMEOUT).send(body) {
         Ok(resp) => finish(resp),
         Err(ureq::Error::Status(_, resp)) => finish(resp),
         Err(e) => Err(format!("{e}")),
@@ -106,8 +125,9 @@ const READ_POLL_MS: u64 = 25;
 /// Open a WebSocket to `url`, sending `headers` on the handshake.
 ///
 /// The TCP connection is made here rather than by `tungstenite::connect` so
-/// that the read timeout can be installed once the handshake is done: a
-/// handshake read that timed out mid-flight would fail the connection.
+/// that timeouts can be put on the socket: `connect` leaves the connect and
+/// the handshake unbounded, and a host that resolves but never answers would
+/// hold the CLI forever.
 pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> {
     use tungstenite::client::IntoClientRequest;
 
@@ -135,8 +155,17 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
         _ => 443,
     });
 
-    let stream = TcpStream::connect(format!("{host}:{port}").as_str())
-        .map_err(|e| format!("websocket connect failed ({e})"))?;
+    let stream = connect_with_timeout(&host, port, CONNECT_TIMEOUT)?;
+    // `connect_timeout` completes the connect through a non-blocking socket,
+    // so the mode is set back explicitly rather than assumed.
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+    // The handshake runs under its own bound; it is replaced by the much
+    // shorter poll interval once the socket exists.
+    stream
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
     // tungstenite's own `connect` sets this; the streaming loop types words as
     // they arrive, so a delayed small frame is a visible stutter.
     stream
@@ -155,6 +184,60 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
         .map_err(|e| format!("websocket socket setup failed ({e})"))?;
 
     Ok(UnixSocket(Arc::new(Mutex::new(socket))))
+}
+
+/// Connects to `host:port`, trying every address it resolves to with `timeout`
+/// applied to each. `TcpStream::connect` has no bound of its own, and a host
+/// that resolves but never completes a handshake would otherwise hold the
+/// caller for as long as the operating system cares to wait.
+fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = format!("{host}:{port}")
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host} ({e})"))?
+        .collect();
+    let mut last_err = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(match last_err {
+        Some(e) => format!("websocket connect failed ({e})"),
+        None => format!("cannot resolve {host}"),
+    })
+}
+
+/// The transport for both Unix backends.
+///
+/// Linux and macOS differ only in their TLS stack, and that difference is
+/// already decided by Cargo.toml's per-target features plus `ensure_tls_ready`,
+/// so one type serves both. What genuinely differs per platform - the audio
+/// device and the injector - stays in `linux_impl` and `macos_impl`.
+pub struct UnixTransport;
+
+impl Transport for UnixTransport {
+    fn get(&self, url: &str, accept: &str) -> Result<Response, String> {
+        get(url, accept)
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        auth: Option<&str>,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Response, String> {
+        post(url, auth, content_type, body)
+    }
+
+    fn websocket(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Box<dyn WebSocket>, String> {
+        Ok(Box::new(websocket(url, headers)?))
+    }
 }
 
 impl WebSocket for UnixSocket {

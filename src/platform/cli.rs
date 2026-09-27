@@ -13,6 +13,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The packet size the streaming loop and the provider expect, in samples.
+const PACKET_SAMPLES: usize = 640;
+
 pub fn run() -> Result<(), String> {
     let cfg = config::load().map_err(|e| {
         format!(
@@ -118,15 +121,28 @@ fn dictate(
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
             let cancelled = Arc::new(AtomicBool::new(false));
-            // The channel is already drained; the stream is given the whole
-            // clip at once and the loop types as frames arrive, exactly as on
-            // Windows.
+            // The clip is handed to the streaming loop in real time, the way
+            // the Windows engine feeds it from the live microphone: one 40 ms
+            // packet every 40 ms. Emptying the whole clip into the channel at
+            // once instead would leave the provider transcribing a backlog
+            // long after the final-transcript wait had expired, and the tail
+            // of the dictation would be dropped from the transcript.
             let (tx, rx) = mpsc::channel();
-            for chunk in samples.chunks(640) {
-                let _ = tx.send(chunk.to_vec());
-            }
-            drop(tx);
-            let typed = crate::stream::run_stream(cfg, &stop, &cancelled, rx);
+            let packet_ms = (PACKET_SAMPLES as u64 * 1000) / crate::platform::audio::SAMPLE_RATE as u64;
+            std::thread::spawn(move || {
+                for chunk in samples.chunks(PACKET_SAMPLES) {
+                    // A failed send means the stream is finished and its
+                    // receiver is gone, which is the only early exit here.
+                    if tx.send(chunk.to_vec()).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(packet_ms));
+                }
+            });
+            // The capture's own stop flag is spent by the time the clip is
+            // recorded; the streaming loop drives this one itself.
+            let sending = Arc::new(AtomicBool::new(false));
+            let typed = crate::stream::run_stream(cfg, &sending, &cancelled, rx);
             typed?
         }
         config::Protocol::Rest => {

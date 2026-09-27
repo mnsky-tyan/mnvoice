@@ -98,21 +98,15 @@ pub trait Transport {
 
 /// The transport for this build.
 ///
-/// Linux and macOS each name their own type rather than sharing a `unix_impl`
-/// module, because the two differ in something that matters: on Linux rustls
-/// needs an explicit crypto provider installed before the first handshake
-/// (done in `unix_http::ensure_tls_ready`), while macOS rides the platform's
-/// own verifier through native-tls. A shared module would have to `#[cfg]`
-/// that difference anyway, so the split is honest about where the real
-/// difference is.
+/// Windows has its own WinHTTP client; Linux and macOS share one pure-Rust
+/// client whose TLS stack is chosen per target by Cargo.toml's features and by
+/// `unix_http::ensure_tls_ready` (rustls needs an explicit crypto provider on
+/// Linux, macOS rides the platform's verifier through native-tls).
 #[cfg(windows)]
 pub use crate::platform::windows_impl::WinHttpTransport as NativeTransport;
 
-#[cfg(target_os = "linux")]
-pub use crate::platform::linux_impl::LinuxTransport as NativeTransport;
-
-#[cfg(target_os = "macos")]
-pub use crate::platform::macos_impl::MacTransport as NativeTransport;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use crate::platform::unix_http::UnixTransport as NativeTransport;
 
 /// A way for the Unix transport tests to exercise the full stack - the trait
 /// object a caller gets - without reaching into a specific backend module.

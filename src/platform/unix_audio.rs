@@ -17,9 +17,9 @@
 //     arrive through the done-channel rather than at construction time.
 //   - Devices rarely capture at 16 kHz mono, and the realtime callback must
 //     never block, so the callback only appends raw samples to a shared
-//     buffer. A 20 ms ticker does the rest: decimate to the provider rate,
-//     convert to i16 mono, run the silence detector, feed the transcriber.
-//     A slow transcriber consumer can never make the callback overrun.
+//     buffer. A 20 ms ticker does the rest: mix to mono, resample to the
+//     provider rate, run the silence detector, feed the transcriber. A slow
+//     transcriber consumer can never make the callback overrun.
 
 use crate::platform::audio::{Audio, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,9 +78,12 @@ fn run_session(
         .map_err(|e| format!("cannot query input device ({e})"))?;
     let in_rate = supported.sample_rate().0;
     let channels = supported.channels().max(1) as usize;
-    // Decimation factor from the device rate to the provider rate; a device
-    // below 16 kHz would give zero, so clamp to pass-through.
-    let step = (in_rate / SAMPLE_RATE).max(1) as usize;
+    // Input samples per output sample. Fractional on purpose: a device rate
+    // that is not a multiple of the provider rate (44.1 kHz, the macOS
+    // built-in input's nominal rate, is not) has to be resampled rather than
+    // decimated, or the provider is told 16 kHz and handed audio running at
+    // some other rate entirely.
+    let resample_step = in_rate as f64 / SAMPLE_RATE as f64;
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -130,7 +133,7 @@ fn run_session(
             .unwrap_or_default();
 
         // Frames arrive interleaved, so the channels are averaged into mono
-        // before decimation. Taking every `step`-th sample of a stereo stream
+        // before resampling. Taking every nth sample of a stereo stream
         // instead would alternate left and right, and the provider would be
         // sent an alternating signal rather than the mixed-down voice the
         // Windows engine hands it.
@@ -139,12 +142,7 @@ fn run_session(
             .map(|frame| frame.iter().sum::<f32>() / channels as f32)
             .collect();
 
-        // Keep every `step`-th sample: linear decimation to 16 kHz, mono.
-        let chunk: Vec<i16> = mono
-            .iter()
-            .step_by(step)
-            .map(|s| (*s * i16::MAX as f32) as i16)
-            .collect();
+        let chunk = resample(&mono, resample_step);
 
         // The silence detector reads the same window that goes downstream,
         // so it runs before the hand-off (sending moves the chunk).
@@ -185,4 +183,74 @@ fn run_session(
         }
     }
     // `stream` drops here, which stops capture and joins the device thread.
+}
+
+/// Resamples mono audio to the provider rate by linear interpolation, the same
+/// conversion the Windows engine applies to the device's mix format. The step
+/// is fractional so a device rate that is not a multiple of the provider rate
+/// still comes out at exactly the provider rate.
+fn resample(mono: &[f32], step: f64) -> Vec<i16> {
+    let mut out = Vec::with_capacity((mono.len() as f64 / step) as usize + 1);
+    let mut pos = 0f64;
+    while (pos as usize) < mono.len() {
+        let i = pos as usize;
+        let frac = (pos - i as f64) as f32;
+        let a = mono[i];
+        let b = if i + 1 < mono.len() { mono[i + 1] } else { a };
+        let v = (a + (b - a) * frac).clamp(-1.0, 1.0);
+        out.push((v * i16::MAX as f32) as i16);
+        pos += step;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device rate that is not a multiple of the provider rate must still
+    /// come out at the provider rate. 44.1 kHz is the macOS built-in input's
+    /// nominal rate: keeping every second sample of it hands the provider
+    /// 22 050 samples per second while the request still says 16 000, so a
+    /// one second utterance arrives as 1.38 s of sped-up audio.
+    #[test]
+    fn a_44100hz_second_resamples_to_the_provider_rate() {
+        let input: Vec<f32> = (0..44_100).map(|i| i as f32 / 44_100.0).collect();
+        let out = resample(&input, 44_100.0 / SAMPLE_RATE as f64);
+        assert!(
+            (out.len() as i64 - SAMPLE_RATE as i64).abs() <= 2,
+            "one second of 44.1 kHz audio produced {} samples",
+            out.len()
+        );
+    }
+
+    /// The resampled signal must be the same signal and not merely the same
+    /// length: interpolating a linear ramp reproduces it exactly, so anything
+    /// beyond quantisation is the resampler mangling the waveform.
+    #[test]
+    fn resampling_preserves_the_waveform() {
+        let rate = 44_100.0;
+        let n = 44_100usize;
+        let input: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let step = rate / SAMPLE_RATE as f64;
+        let out = resample(&input, step);
+        let worst = out
+            .iter()
+            .enumerate()
+            .map(|(k, sample)| {
+                let expected = (k as f64 * step) / n as f64;
+                (*sample as f64 / i16::MAX as f64 - expected).abs()
+            })
+            .fold(0.0f64, f64::max);
+        assert!(worst < 2.0 / i16::MAX as f64, "worst deviation was {worst}");
+    }
+
+    /// A device slower than the provider rate is upsampled rather than
+    /// clamped to pass-through, so the provider still receives its own rate.
+    #[test]
+    fn an_8000hz_device_is_upsampled_to_the_provider_rate() {
+        let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
+        let out = resample(&input, 8_000.0 / SAMPLE_RATE as f64);
+        assert_eq!(out.len(), 16_000);
+    }
 }
