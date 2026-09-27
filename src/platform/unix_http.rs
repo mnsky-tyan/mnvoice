@@ -117,10 +117,14 @@ pub fn post(
 /// short read timeout, so a quiet provider releases the lock between polls.
 pub struct UnixSocket(Arc<Mutex<WsRaw<MaybeTlsStream<TcpStream>>>>);
 
-/// How long one read attempt may hold the socket. The socket read is the wait,
-/// so a quiet provider costs no spinning, and a send on another thread never
-/// queues behind a frame that has not arrived.
-const READ_POLL_MS: u64 = 25;
+/// How long the reader waits for a frame before releasing the lock, and how
+/// long it stands off before trying again. Both are the same number because
+/// they exist for the same reason: the contract on the trait forbids holding
+/// the lock across a wait for a frame that has not arrived, and a send on the
+/// main thread must never queue behind the provider's silence. One
+/// millisecond is the smallest value that is not zero - a zero read timeout
+/// means "block forever" to the socket, not "return immediately".
+const READ_POLL_MS: u64 = 1;
 
 /// Open a WebSocket to `url`, sending `headers` on the handshake.
 ///
@@ -301,13 +305,14 @@ impl WebSocket for UnixSocket {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    // Standing off the lock for a moment is what makes the
-                    // bound real: a thread that unlocks and immediately locks
-                    // again wins that race every time, so a sender parked in
-                    // `lock()` would wait for however long the reader cared to
-                    // keep polling.
+                    // Standing off the lock for as long as the reader was
+                    // willing to wait for a frame is what makes the bound real:
+                    // a thread that unlocks and immediately locks again wins
+                    // that race every time, so a sender parked in `lock()`
+                    // would wait for however long the reader cared to keep
+                    // polling.
                     drop(ws);
-                    thread::sleep(Duration::from_millis(1));
+                    thread::sleep(Duration::from_millis(READ_POLL_MS));
                 }
                 Err(e) => return Err(format!("websocket read failed ({e})")),
             }
