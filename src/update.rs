@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Networking::WinHttp::*;
-
-use crate::rest::{self, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS};
+use crate::platform::http::Transport;
 
 /// Repository that publishes mnvoice releases.
 const REPO: &str = "mnsky-tyan/mnvoice";
@@ -68,115 +65,22 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     false
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn wptr(v: &[u16]) -> PCWSTR {
-    PCWSTR(v.as_ptr())
-}
-
 /// Minimal GET against an https URL, returning the whole body.
+///
+/// Routed through the platform seam so the Windows build and the Linux and
+/// macOS ports share one redirect contract. A non-200 is an error here rather
+/// than a `Response`, because a 404 or 403 body must not be mistaken for a
+/// release that names no version, or for an executable missing its MZ header.
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
-    unsafe {
-        let (host, port, secure, path) = rest::parse_base_url(url)?;
-        let session = WinHttpOpen(
-            w!("mnvoice-update"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("cannot create HTTP session".into());
-        }
-        WinHttpSetTimeouts(session, 0, 15_000, 45_000, 45_000)
-            .map_err(|e| format!("set timeouts ({e})"))?;
-
-        let host_w = wide(&host);
-        let connect = WinHttpConnect(session, wptr(&host_w), port, 0);
-        if connect.is_null() {
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("cannot connect to {host}"));
-        }
-
-        let path_w = wide(&path);
-        let request = WinHttpOpenRequest(
-            connect,
-            w!("GET"),
-            wptr(&path_w),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            if secure {
-                WINHTTP_FLAG_SECURE
-            } else {
-                WINHTTP_OPEN_REQUEST_FLAGS(0)
-            },
-        );
-        if request.is_null() {
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err("cannot create HTTP request".into());
-        }
-
-        // Headers must be attached before the send: anything added afterwards is
-        // never put on the wire. Mirrors the REST client's ordering.
-        let headers = wide(&format!(
-            "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
+    let response = crate::platform::http::NativeTransport.get(url, accept)?;
+    if response.status != 200 {
+        let preview: String = String::from_utf8_lossy(&response.body).chars().take(200).collect();
+        return Err(format!(
+            "update request returned HTTP {}: {preview}",
+            response.status
         ));
-        let mut body = Vec::new();
-        let result = (|| {
-            WinHttpAddRequestHeaders(
-                request,
-                &headers[..headers.len() - 1],
-                WINHTTP_ADDREQ_FLAG_ADD,
-            )?;
-            WinHttpSendRequest(request, None, None, 0, 0, 0)?;
-            WinHttpReceiveResponse(request, std::ptr::null_mut())?;
-            // The status line is only readable while the response is still open,
-            // so it is collected here next to the body it describes.
-            let mut status: u32 = 0;
-            let mut len = std::mem::size_of::<u32>() as u32;
-            let mut index = 0u32;
-            let _ = WinHttpQueryHeaders(
-                request,
-                WINHTTP_QUERY_STATUS | WINHTTP_QUERY_FLAG_NUMBER,
-                PCWSTR::null(),
-                Some(&mut status as *mut u32 as *mut std::ffi::c_void),
-                &mut len,
-                &mut index,
-            );
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                let mut read = 0u32;
-                let ok = WinHttpReadData(
-                    request,
-                    chunk.as_mut_ptr() as *mut std::ffi::c_void,
-                    chunk.len() as u32,
-                    &mut read,
-                );
-                if ok.is_err() || read == 0 {
-                    break;
-                }
-                body.extend_from_slice(&chunk[..read as usize]);
-            }
-            Ok::<(u32, Vec<u8>), windows::core::Error>((status, body))
-        })();
-        let _ = WinHttpCloseHandle(request);
-        let _ = WinHttpCloseHandle(connect);
-        let _ = WinHttpCloseHandle(session);
-        let (status, body) = result.map_err(|e| format!("request failed ({e})"))?;
-
-        // A 404 or 403 body must not be mistaken for a release that names no
-        // version, or for an executable missing its MZ header.
-        if status != 200 {
-            let preview: String = String::from_utf8_lossy(&body).chars().take(200).collect();
-            return Err(format!("update request returned HTTP {status}: {preview}"));
-        }
-
-        Ok(body)
     }
+    Ok(response.body)
 }
 
 /// Version named by the newest entry of the release feed, e.g. the "0.1.10"

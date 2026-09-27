@@ -9,6 +9,7 @@ mod audio;
 mod config;
 mod orb;
 mod paste;
+mod platform;
 mod rest;
 mod stream;
 mod update;
