@@ -24,27 +24,36 @@ pub struct Response {
 
 /// A blocking WebSocket client for the streaming transcription path.
 ///
+/// Implementations MUST allow `read` on one thread to proceed while `send`
+/// is in flight on another: the streaming loop types words from a reader
+/// thread while the main thread keeps pushing 40 ms audio packets, and a
+/// socket that serializes those would stop sending audio whenever the
+/// provider goes quiet. WinHTTP's socket handle is naturally full duplex;
+/// backends built on a single TCP stream get there with a short read timeout
+/// so the lock is never held long.
+///
 /// The concrete type differs per platform - WinHTTP's WebSocket on Windows, a
 /// pure-Rust client elsewhere - so this is a trait rather than a struct. The
 /// methods are the minimum the streaming loop actually uses: send a binary
 /// frame, send a text frame, and read one frame with a timeout.
-pub trait WebSocket {
+pub trait WebSocket: Send + Sync {
     /// Send a binary frame (a slice of PCM audio).
-    fn send_binary(&mut self, data: &[u8]) -> Result<(), String>;
+    fn send_binary(&self, data: &[u8]) -> Result<(), String>;
 
     /// Send a text frame (the provider's config message).
-    fn send_text(&mut self, text: &str) -> Result<(), String>;
+    fn send_text(&self, text: &str) -> Result<(), String>;
 
     /// Send a close frame and shut down without waiting for the peer.
-    fn close(&mut self);
+    fn close(&self);
 
     /// Read the next frame, returning `None` on a clean close.
     ///
     /// `timeout_ms` is what keeps the streaming loop responsive to the user
     /// releasing the hotkey: a blocking read with no timeout would hold the
     /// worker until the provider decided to speak, so the transcript would
-    /// arrive long after the user stopped talking.
-    fn read(&mut self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String>;
+    /// arrive long after the user stopped talking. A backend that cannot vary
+    /// this per read should say so in its implementation.
+    fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// The whole network surface, one implementation per platform.
@@ -61,9 +70,20 @@ pub trait Transport {
     /// it, and asserted by a test against a real redirecting loopback endpoint.
     fn get(&self, url: &str, accept: &str) -> Result<Response, String>;
 
-    /// A POST with a raw body and a Content-Type. Used by the REST transcription
-    /// fallback, which uploads a WAV as multipart/form-data.
-    fn post(&self, url: &str, content_type: &str, body: &[u8]) -> Result<Response, String>;
+    /// A POST with a raw body. Used by the REST transcription fallback, which
+    /// uploads a WAV as multipart/form-data.
+    ///
+    /// `auth` is the full `Authorization` header value when the endpoint needs
+    /// one - providers disagree on the scheme (Deepgram wants `Token`, OpenAI
+    /// compatible endpoints want `Bearer`), so the caller owns the prefix and
+    /// the transport only puts it on the wire.
+    fn post(
+        &self,
+        url: &str,
+        auth: Option<&str>,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Response, String>;
 
     /// Open a WebSocket to `url`, sending the given headers on the handshake.
     ///

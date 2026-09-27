@@ -2,132 +2,43 @@
 // Compatible with any standard audio/transcriptions endpoint (self-hosted Whisper, Groq, OpenAI, etc.).
 // Native TLS, system cert store, respects Windows system proxy settings.
 
-use windows::Win32::Networking::WinHttp::*;
-use windows::core::{w, PCWSTR};
-
 use crate::config::Config;
+use crate::platform::http::Transport;
 
 const BOUNDARY: &str = "mnvoiceboundary9f2a";
-const WINHTTP_ADDREQUEST_HEADER_FLAG: u32 = 0x2000_0000; // add or replace
-// The windows crate does not export these two, and both WinHTTP clients here
-// need the same pair.
-pub(crate) const WINHTTP_QUERY_STATUS: u32 = 19;
-pub(crate) const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn wptr(v: &[u16]) -> PCWSTR {
-    PCWSTR(v.as_ptr())
-}
 
 /// Transcribe a WAV clip using an OpenAI-compatible REST endpoint. Returns plain text.
 pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
-    unsafe {
-        let session = WinHttpOpen(
-            w!("mnvoice/0.1"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("cannot create HTTP session".into());
-        }
-        WinHttpSetTimeouts(session, 0, 10_000, 30_000, 30_000)
-            .map_err(|e| format!("set timeouts ({e})"))?;
+    let (host, _port, _secure, base_path) = parse_base_url(&cfg.base_url)?;
 
-        let (host, port, secure, base_path) = parse_base_url(&cfg.base_url)?;
-        let host_w = wide(&host);
-        let connect = WinHttpConnect(session, wptr(&host_w), port, 0);
-        if connect.is_null() {
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("cannot connect to {host}"));
-        }
+    let endpoint_path = if !base_path.is_empty() {
+        base_path
+    } else if host.contains("groq.com") {
+        "/openai/v1/audio/transcriptions".to_string()
+    } else {
+        "/v1/audio/transcriptions".to_string()
+    };
+    let url = format!("{}{}", cfg.base_url.trim_end_matches('/'), endpoint_path);
 
-        let endpoint_path = if !base_path.is_empty() {
-            base_path
-        } else if host.contains("groq.com") {
-            "/openai/v1/audio/transcriptions".to_string()
-        } else {
-            "/v1/audio/transcriptions".to_string()
-        };
+    let body = multipart_body(cfg, wav);
+    let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
 
-        let headers_str = format!(
-            "Authorization: Bearer {}\r\nContent-Type: multipart/form-data; boundary={}\r\n",
-            cfg.api_key, BOUNDARY
-        );
-        let body = multipart_body(cfg, wav);
+    let response = crate::platform::http::NativeTransport
+        .post(&url, Some(&format!("Bearer {}", cfg.api_key)), &content_type, &body)?;
 
-        let path_w = wide(&endpoint_path);
-        let request = WinHttpOpenRequest(
-            connect,
-            w!("POST"),
-            wptr(&path_w),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            if secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) },
-        );
-        if request.is_null() {
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err("cannot create HTTP request".into());
-        }
-
-        let headers_w = wide(&headers_str);
-
-        let result = (|| {
-            WinHttpAddRequestHeaders(
-                request,
-                &headers_w[..headers_w.len() - 1],
-                WINHTTP_ADDREQUEST_HEADER_FLAG,
-            )?;
-            WinHttpSendRequest(
-                request,
-                None,
-                Some(body.as_ptr() as *const std::ffi::c_void),
-                body.len() as u32,
-                body.len() as u32,
-                0,
-            )?;
-            WinHttpReceiveResponse(request, std::ptr::null_mut())?;
-            Ok::<(), windows::core::Error>(())
-        })();
-        if let Err(e) = result {
-            let _ = WinHttpCloseHandle(request);
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("request failed ({e})"));
-        }
-
-        let mut status: u32 = 0;
-        let mut len = std::mem::size_of::<u32>() as u32;
-        let mut index = 0u32;
-        let _ = WinHttpQueryHeaders(
-            request,
-            WINHTTP_QUERY_STATUS | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status as *mut u32 as *mut std::ffi::c_void),
-            &mut len,
-            &mut index,
-        );
-
-        let response = read_all(request);
-        let _ = WinHttpCloseHandle(request);
-        let _ = WinHttpCloseHandle(connect);
-        let _ = WinHttpCloseHandle(session);
-
-        if status != 200 {
-            let preview: String = String::from_utf8_lossy(&response).chars().take(200).collect();
-            return Err(format!("ASR endpoint returned HTTP {status}: {preview}"));
-        }
-
-        let raw_text = String::from_utf8_lossy(&response);
-        let parsed = parse_json_transcript(&raw_text).unwrap_or_else(|| raw_text.trim().to_string());
-        Ok(parsed.trim().to_string())
+    if response.status != 200 {
+        let preview: String =
+            String::from_utf8_lossy(&response.body).chars().take(200).collect();
+        return Err(format!(
+            "ASR endpoint returned HTTP {}: {preview}",
+            response.status
+        ));
     }
+
+    let raw_text = String::from_utf8_lossy(&response.body);
+    let parsed =
+        parse_json_transcript(&raw_text).unwrap_or_else(|| raw_text.trim().to_string());
+    Ok(parsed.trim().to_string())
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -175,27 +86,6 @@ pub fn parse_json_transcript(json: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn read_all(request: *mut std::ffi::c_void) -> Vec<u8> {
-    unsafe {
-        let mut out = Vec::new();
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            let mut read = 0u32;
-            let ok = WinHttpReadData(
-                request,
-                chunk.as_mut_ptr() as *mut std::ffi::c_void,
-                chunk.len() as u32,
-                &mut read,
-            );
-            if ok.is_err() || read == 0 {
-                break;
-            }
-            out.extend_from_slice(&chunk[..read as usize]);
-        }
-        out
-    }
 }
 
 /// Disfluency tokens. These are vocal stumbles that carry no meaning in

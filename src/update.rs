@@ -20,11 +20,9 @@ const REPO: &str = "mnsky-tyan/mnvoice";
 /// version.
 const RELEASES_FEED: &str = "https://github.com/mnsky-tyan/mnvoice/releases.atom";
 
-/// Name of the standalone executable asset published alongside the zip.
-const EXE_ASSET: &str = "mnvoice.exe";
-
 /// What a published release offers: the version to compare against and the
-/// raw exe asset to download.
+/// platform's asset to download. The asset name comes from the platform seam,
+/// so every platform resolves its own artifact from the same release.
 #[derive(Debug)]
 pub struct Release {
     pub version: String,
@@ -112,7 +110,10 @@ pub fn parse_version_from_feed(feed: &str) -> Option<String> {
 /// assets from a predictable path, so the URL can be derived rather than parsed
 /// out of a listing.
 fn asset_url(tag: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/{tag}/{EXE_ASSET}")
+    format!(
+        "https://github.com/{REPO}/releases/download/{tag}/{}",
+        crate::platform::asset_name()
+    )
 }
 
 /// Ask GitHub what the latest published version is, and where its exe lives.

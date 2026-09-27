@@ -15,9 +15,14 @@
 // trait documents the contract; the test in `update.rs` pins it.
 
 use crate::platform::http::{Response, Transport, WebSocket};
-use crate::rest::{parse_base_url, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS};
+use crate::rest::parse_base_url;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Networking::WinHttp::*;
+
+// The windows crate does not export these two, and every WinHTTP client needs
+// the same pair: query-the-status-line, as a number.
+const WINHTTP_QUERY_STATUS: u32 = 19;
+const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
 /// Build a NUL-terminated UTF-16 buffer for the wide-string Win32 APIs.
 fn wide(s: &str) -> Vec<u16> {
@@ -169,15 +174,24 @@ impl Transport for WinHttpTransport {
         }
     }
 
-    fn post(&self, url: &str, content_type: &str, body: &[u8]) -> Result<Response, String> {
+    fn post(
+        &self,
+        url: &str,
+        auth: Option<&str>,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Response, String> {
         unsafe {
             // Uploads carry audio, so the read timeout is longer than the
             // feed's: a slow provider transcoding a long clip is not an error.
             let (request, connect, session, _) =
                 Self::open("POST", url, (0, 10_000, 60_000))?;
 
+            let auth_line = auth
+                .map(|v| format!("Authorization: {v}\r\n"))
+                .unwrap_or_default();
             let headers = wide(&format!(
-                "Content-Type: {content_type}\r\nContent-Length: {}\r\n",
+                "{auth_line}Content-Type: {content_type}\r\nContent-Length: {}\r\n",
                 body.len()
             ));
             let result = (|| {
@@ -287,14 +301,27 @@ impl Transport for WinHttpTransport {
 /// WinHTTP's socket handle is a child of the request's connection and session,
 /// so all three travel together and are closed together in `Drop`. Dropping
 /// them out of order leaks the parents.
+///
+/// The handle itself is just an integer to WinHTTP, which is what makes the
+/// full-duplex promise above free here: a send and a receive on the same
+/// handle from two threads are independent calls, exactly as the pre-seam
+/// code did when it passed the raw pointer into a reader thread.
 struct WinHttpSocket {
     ws: *mut std::ffi::c_void,
     connect: *mut std::ffi::c_void,
     session: *mut std::ffi::c_void,
 }
 
+// SAFETY: WinHTTP socket handles are usable concurrently for send and
+// receive, and none of the three handles are mutated through this type - the
+// only mutation is in Drop, which by definition has exclusive access. The
+// streaming loop relies on both halves: reader thread reads while the main
+// thread sends audio.
+unsafe impl Send for WinHttpSocket {}
+unsafe impl Sync for WinHttpSocket {}
+
 impl WebSocket for WinHttpSocket {
-    fn send_binary(&mut self, data: &[u8]) -> Result<(), String> {
+    fn send_binary(&self, data: &[u8]) -> Result<(), String> {
         unsafe {
             let res = WinHttpWebSocketSend(
                 self.ws,
@@ -308,7 +335,7 @@ impl WebSocket for WinHttpSocket {
         }
     }
 
-    fn send_text(&mut self, text: &str) -> Result<(), String> {
+    fn send_text(&self, text: &str) -> Result<(), String> {
         unsafe {
             let res = WinHttpWebSocketSend(
                 self.ws,
@@ -322,7 +349,7 @@ impl WebSocket for WinHttpSocket {
         }
     }
 
-    fn close(&mut self) {
+    fn close(&self) {
         unsafe {
             let _ = WinHttpWebSocketClose(
                 self.ws,
@@ -341,7 +368,12 @@ impl WebSocket for WinHttpSocket {
     /// error, because from the streaming loop's point of view "the provider
     /// said nothing this tick" and "the socket broke" are different things and
     /// only the second should end the session.
-    fn read(&mut self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
+    fn read(&self, _timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
+        // The timeout is accepted for the trait but not honoured here: once a
+        // WinHTTP request is upgraded to a socket, its receive timeout is fixed
+        // at what the session was configured with, and the pre-seam behaviour
+        // this preserves is a blocking read ended by a frame or a close. The
+        // streaming loop re-checks its flags before every call.
         unsafe {
             let mut buffer = vec![0u8; 64 * 1024];
             let mut read = 0u32;
