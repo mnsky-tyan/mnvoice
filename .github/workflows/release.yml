@@ -153,15 +153,19 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      # The target is named explicitly so the artifact's name is true by
+      # construction: the published binary is the one the release asset name
+      # mnvoice-macos-arm64 promises, whatever architecture the runner image
+      # happens to be.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --target aarch64-apple-darwin
 
       - name: Build release
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Package artifact
         run: |
-          cp target/release/mnvoice mnvoice-macos-arm64
+          cp target/aarch64-apple-darwin/release/mnvoice mnvoice-macos-arm64
           shasum -a 256 mnvoice-macos-arm64 | awk '{print $1"  "$2}' > mnvoice-macos-arm64.sha256
 
       - name: Upload to release

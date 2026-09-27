@@ -57,9 +57,6 @@ tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 tungstenite = { version = "0.26", features = ["native-tls"] }
 
-[target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
-
 [profile.release]
 opt-level = "z"
 lto = true

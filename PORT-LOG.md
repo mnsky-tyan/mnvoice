@@ -61,3 +61,10 @@ Reverse-chronological. Every claim links to a check that was run.
 - Orb, tray, hotkeys, single-instance, autostart, self-update on Unix: all
   Windows-native surfaces; the updater especially (running-image swap) is
   per-platform work. README documents all of it.
+- Proxy support: WinHTTP resolves a system proxy (`WINHTTP_ACCESS_TYPE_DEFAULT_PROXY`),
+  while the Unix transport dials the provider directly, so `HTTP_PROXY` /
+  `HTTPS_PROXY` / `ALL_PROXY` are ignored on both the REST path (ureq's
+  `proxy-from-env` feature is off) and the streaming path (`connect_with_timeout`
+  hands a raw TCP stream to tungstenite, which has no CONNECT tunnel). A
+  CONNECT tunnel for the socket would be new machinery the port does not need
+  yet, so the limit is stated in the README instead.

@@ -392,6 +392,10 @@ Known limits in this release, stated rather than papered over:
 - **No orb, tray, hotkey or self-update yet** on these platforms; capture
   start is a device open rather than Windows' ~4 ms standby trick, because
   the audio library has no equivalent.
+- **No proxy support.** Windows resolves a proxy from the system, but the
+  Unix transport dials the provider directly, so `HTTP_PROXY` / `HTTPS_PROXY`
+  / `ALL_PROXY` are ignored on both the REST and the streaming path. A network
+  that only reaches `api.deepgram.com` through a proxy needs a direct route.
 - The updater is Windows-only; check the releases page by hand for now.
 
 ---

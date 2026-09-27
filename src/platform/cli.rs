@@ -97,12 +97,29 @@ pub fn run() -> Result<(), String> {
         }
     });
 
+    dictation_loop(&lines, || dictate(&cfg, &engine, &lines))?;
+    Ok(())
+}
+
+/// Runs dictations until stdin closes.
+///
+/// One dictation failing must not end the session: the Windows product logs the
+/// error and returns its tray to idle, so a transient network or audio failure
+/// costs the user one attempt rather than the whole process - which matters
+/// most exactly when it hurts, because the words already typed into the focused
+/// window stay there and the user is not asked to restart the binary.
+fn dictation_loop<F>(lines: &Receiver<()>, mut dictate: F) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
     loop {
         // A closed stdin ends the session instead of spinning on Enter.
         if lines.recv().is_err() {
             break;
         }
-        dictate(&cfg, &engine, &lines)?;
+        if let Err(e) = dictate() {
+            println!("dictation failed: {e}");
+        }
         println!();
         println!("Press Enter for the next dictation.");
     }
@@ -265,5 +282,48 @@ mod tests {
         let (text, space) = rest_typing("   ", true, true);
         assert!(text.is_empty());
         assert!(!space);
+    }
+
+    /// A failed dictation must cost one attempt, not the session. The Windows
+    /// product logs a streaming or transcription error and returns its tray to
+    /// idle; propagating it out of the loop instead exits the process, so a
+    /// single transient network failure ends a session the user was still in.
+    #[test]
+    fn a_failed_dictation_does_not_end_the_session() {
+        let (tx, rx) = mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        drop(tx);
+
+        let mut attempts = 0usize;
+        let result = dictation_loop(&rx, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err("streaming error: handshake failed".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        // The loop only ever ends on a closed stdin, and every line the user
+        // pressed Enter for still gets a dictation.
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts, 2);
+    }
+
+    /// A closed stdin still ends the session, which is how the user quits.
+    #[test]
+    fn a_closed_stdin_ends_the_session() {
+        let (tx, rx) = mpsc::channel::<()>();
+        drop(tx);
+
+        let mut attempts = 0usize;
+        let result = dictation_loop(&rx, || {
+            attempts += 1;
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts, 0);
     }
 }
