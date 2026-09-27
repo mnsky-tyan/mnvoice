@@ -160,6 +160,10 @@ impl WebSocket for UnixSocket {
                     let _ = ws.send(Message::Pong(Vec::new().into()));
                 }
                 Ok(Message::Pong(_)) => {}
+                // The enum is non-exhaustive across versions (raw frames,
+                // future additions); anything that is not payload or a ping
+                // carries nothing the transcript loop needs.
+                Ok(_) => {}
                 Err(e) => return Err(format!("websocket read failed ({e})")),
             }
         }
