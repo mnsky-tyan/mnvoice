@@ -224,7 +224,7 @@ mod tests {
             .unwrap();
         });
 
-        let transport = crate::platform::native_transport_for_tests();
+        let transport = crate::platform::http::native_transport_for_tests();
         let response = transport
             .get(
                 &format!("http://{redirect_addr}/releases/download/v0.1.15/asset"),
