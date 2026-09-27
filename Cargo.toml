@@ -26,6 +26,16 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# The Linux and macOS ports: audio capture and text injection. Both are
+# cfg-gated by target rather than optional features so a plain `cargo build`
+# on those platforms produces a working binary.
+[target.'cfg(not(windows))'.dependencies]
+cpal = "0.15"
+enigo = "0.2"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = true

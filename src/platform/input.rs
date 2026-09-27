@@ -21,3 +21,35 @@ pub trait Injector: Send + Sync {
     /// no - so the caller can surface that instead of failing silently.
     fn type_text(&self, text: &str) -> Result<(), String>;
 }
+
+use std::sync::OnceLock;
+
+static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
+
+/// The platform's injector, installing the default on first use.
+///
+/// Shared code (the streaming loop) types through this rather than naming a
+/// backend, which is what lets the same streaming loop type on Windows, X11
+/// and macOS without a single cfg in its body.
+pub fn global() -> &'static dyn Injector {
+    *INJECTOR.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            &crate::platform::windows_impl::SEND_INPUT_INJECTOR
+        }
+        #[cfg(target_os = "linux")]
+        {
+            crate::platform::linux_impl::default_injector()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos_impl::default_injector()
+        }
+    })
+}
+
+/// Convenience matching the pre-seam call sites: type and swallow the error,
+/// exactly as the Win32 code did. The streaming loop logs upstream.
+pub fn type_text(text: &str) {
+    let _ = global().type_text(text);
+}

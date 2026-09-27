@@ -25,11 +25,31 @@
 // own sake.
 
 pub mod audio;
+#[cfg(not(windows))]
+pub mod cli;
 pub mod http;
 pub mod input;
+pub mod native;
 
 #[cfg(windows)]
 pub mod windows_impl;
+
+#[cfg(target_os = "linux")]
+pub mod linux_impl;
+
+#[cfg(target_os = "macos")]
+pub mod macos_impl;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_audio;
+
+/// The version this build reports, baked by build.rs from the release tag
+/// (falling back to the crate version for local builds). Windows and the
+/// other platforms read the same value, so a release's three assets all
+/// identify identically.
+pub fn version() -> String {
+    env!("MNVOICE_VERSION").to_string()
+}
 
 #[cfg(target_os = "linux")]
 pub mod linux_impl;

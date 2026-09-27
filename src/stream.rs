@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::paste;
+use crate::platform::input;
 use crate::platform::http::{NativeTransport, Transport, WebSocket};
 
 pub fn url_encode(s: &str) -> String {
@@ -178,7 +178,7 @@ pub fn run_stream(
                             if has_typed_any {
                                 to_type = format!(" {to_type}");
                             }
-                            let _ = paste::type_text(&to_type);
+                            let _ = input::type_text(&to_type);
                             has_typed_any = true;
 
                             let mut full = full_transcript_clone.lock().unwrap();
@@ -197,7 +197,7 @@ pub fn run_stream(
                             if has_typed_any {
                                 to_type = format!(" {to_type}");
                             }
-                            let _ = paste::type_text(&to_type);
+                            let _ = input::type_text(&to_type);
                             has_typed_any = true;
 
                             let mut full = full_transcript_clone.lock().unwrap();
@@ -227,7 +227,7 @@ pub fn run_stream(
                 if has_typed_any {
                     to_type = format!(" {to_type}");
                 }
-                let _ = paste::type_text(&to_type);
+                let _ = input::type_text(&to_type);
                 let mut full = full_transcript_clone.lock().unwrap();
                 if !full.is_empty() {
                     full.push(' ');
@@ -286,7 +286,7 @@ pub fn run_stream(
 
     // Add trailing space if configured, but never on a cancelled session
     if cfg.trailing_space && !full_text.is_empty() && !cancelled.load(Ordering::SeqCst) {
-        let _ = paste::type_text(" ");
+        let _ = input::type_text(" ");
     }
 
     Ok(full_text)

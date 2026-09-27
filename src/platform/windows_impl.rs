@@ -406,6 +406,10 @@ impl WebSocket for WinHttpSocket {
 /// characters - and stays the single source of that behaviour.
 pub struct SendInputInjector;
 
+/// The process-wide instance, registered as the global injector at startup by
+/// the Windows app shell.
+pub static SEND_INPUT_INJECTOR: SendInputInjector = SendInputInjector;
+
 impl crate::platform::input::Injector for SendInputInjector {
     fn type_text(&self, text: &str) -> Result<(), String> {
         crate::paste::type_text(text)

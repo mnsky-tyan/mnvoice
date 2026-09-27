@@ -200,7 +200,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
         reap_helpers();
         return Err(format!("cannot start the new exe ({e})"));
     }
-    crate::log(&format!("updated to v{version}, relaunching"));
+    crate::windows_app::log(&format!("updated to v{version}, relaunching"));
     let _ = helper.kill();
     reap_helpers();
     std::process::exit(0);
@@ -271,23 +271,23 @@ pub fn finish_install(install: Option<&Path>) {
     let _ = std::io::copy(&mut pipe, &mut drain);
 
     let Some(exe) = install else {
-        crate::log("update helper: no install to repair");
+        crate::windows_app::log("update helper: no install to repair");
         return;
     };
     if !swap_interrupted(exe) {
         return;
     }
     if let Err(e) = finish_swap(exe) {
-        crate::log(&format!("update helper: {e}"));
+        crate::windows_app::log(&format!("update helper: {e}"));
         return;
     }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
     if let Err(e) = Command::new(exe).arg("--restart").spawn() {
-        crate::log(&format!("update helper: cannot start the new exe ({e})"));
+        crate::windows_app::log(&format!("update helper: cannot start the new exe ({e})"));
         return;
     }
-    crate::log("update helper: finished the interrupted install");
+    crate::windows_app::log("update helper: finished the interrupted install");
 }
 
 /// The state an interrupted swap leaves behind: nothing at the exe path, with
@@ -422,7 +422,7 @@ pub fn background_check_auto() {
     }
     mark_checked();
     // quiet: an automatic run reports only problems, never balloons.
-    crate::check_for_updates_async(true);
+    crate::windows_app::check_for_updates_async(true);
 }
 
 /// Called once at startup: tidy up after the previous update, then hand the
