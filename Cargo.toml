@@ -35,7 +35,10 @@ windows = { version = "0.58", features = [
 # so the platform's own verifier decides trust. See unix_http.rs.
 [target.'cfg(not(windows))'.dependencies]
 cpal = "0.15"
-enigo = "0.2"
+# The x11 feature is x11rb, pure Rust - the default xdo backend would make
+# every builder install libxdo, a system package, which a downloaded binary
+# must never ask of its user.
+enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
 tungstenite = "0.26"
 ureq = "2"
 
