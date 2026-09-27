@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -85,3 +86,92 @@ jobs:
             }
           }
           Write-Host "confirmed assets on $tag"
+
+  # The Linux and macOS builds exist from v0.1.15. They run on pull_request so
+  # a port change is compiled and tested on its own platform before merge, not
+  # only when someone cuts a tag. Publishing is tag-gated, same as Windows:
+  # a pull_request run must never create a release. Both jobs run after the
+  # Windows one so the release always exists before they upload, which keeps
+  # the create-or-upload race deterministic.
+  linux:
+    needs: build
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ALSA headers (cpal needs libasound at build time)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package artifact
+        run: |
+          cp target/release/mnvoice mnvoice-linux-x64
+          sha256sum mnvoice-linux-x64 | awk '{print $1"  "$2}' > mnvoice-linux-x64.sha256
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" mnvoice-linux-x64 mnvoice-linux-x64.sha256 --clobber
+
+      - name: Verify asset attached
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          names=$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/${{ github.ref_name }}" \
+            | jq -r '.assets[].name')
+          echo "$names" | grep -qx 'mnvoice-linux-x64'
+
+  macos:
+    needs: build
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request')
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package artifact
+        run: |
+          cp target/release/mnvoice mnvoice-macos-arm64
+          shasum -a 256 mnvoice-macos-arm64 | awk '{print $1"  "$2}' > mnvoice-macos-arm64.sha256
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" mnvoice-macos-arm64 mnvoice-macos-arm64.sha256 --clobber
+
+      - name: Verify asset attached
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          names=$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/${{ github.ref_name }}" \
+            | jq -r '.assets[].name')
+          echo "$names" | grep -qx 'mnvoice-macos-arm64'
