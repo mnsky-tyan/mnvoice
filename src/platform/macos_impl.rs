@@ -50,7 +50,7 @@ impl Transport for MacTransport {
 pub fn default_injector() -> &'static dyn Injector {
     use std::sync::OnceLock;
     static INJECTOR: OnceLock<CgInjector> = OnceLock::new();
-    INJECTOR.get_or_init(CgInjector)
+    INJECTOR.get_or_init(|| CgInjector)
 }
 
 struct CgInjector;

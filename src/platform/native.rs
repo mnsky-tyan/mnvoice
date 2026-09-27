@@ -4,7 +4,7 @@
 // platform's answer without a single cfg of its own.
 
 #[cfg(target_os = "linux")]
-pub use crate::platform::linux_impl::{audio, default_injector};
+pub use crate::platform::linux_impl::audio;
 
 #[cfg(target_os = "macos")]
-pub use crate::platform::macos_impl::{audio, default_injector};
+pub use crate::platform::macos_impl::audio;

@@ -51,7 +51,7 @@ impl Transport for LinuxTransport {
 pub fn default_injector() -> &'static dyn Injector {
     use std::sync::OnceLock;
     static INJECTOR: OnceLock<X11Injector> = OnceLock::new();
-    INJECTOR.get_or_init(X11Injector)
+    INJECTOR.get_or_init(|| X11Injector)
 }
 
 struct X11Injector;

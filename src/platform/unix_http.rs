@@ -22,6 +22,9 @@ use crate::platform::http::{Response, WebSocket};
 use std::sync::{Arc, Mutex};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
+
+// tungstenite re-exports the http types its handshake needs.
+use tungstenite::http as http;
 use tungstenite::WebSocket as WsRaw;
 
 #[cfg(target_os = "linux")]
@@ -99,10 +102,13 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
         .into_client_request()
         .map_err(|e| format!("not a websocket url ({e})"))?;
     for (name, value) in headers {
-        let value = value
-            .parse()
+        // Owned name and value: the http types only take 'static keys, and
+        // the caller's slices must not outlive this function anyway.
+        let name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("invalid header name {name}"))?;
+        let value = http::HeaderValue::from_str(value)
             .map_err(|_| format!("invalid header value for {name}"))?;
-        request.headers_mut().insert(*name, value);
+        request.headers_mut().insert(name, value);
     }
     let (socket, _) = tungstenite::connect(request)
         .map_err(|e| format!("websocket connect failed ({e})"))?;
@@ -114,7 +120,7 @@ impl WebSocket for UnixSocket {
         self.0
             .lock()
             .map_err(|_| "websocket lock poisoned".to_string())?
-            .send(Message::Binary(data.to_vec()))
+            .send(Message::Binary(data.to_vec().into()))
             .map_err(|e| format!("websocket send failed ({e})"))
     }
 
@@ -122,7 +128,7 @@ impl WebSocket for UnixSocket {
         self.0
             .lock()
             .map_err(|_| "websocket lock poisoned".to_string())?
-            .send(Message::Text(text.to_owned()))
+            .send(Message::Text(text.to_owned().into()))
             .map_err(|e| format!("websocket send failed ({e})"))
     }
 
@@ -144,14 +150,14 @@ impl WebSocket for UnixSocket {
             .map_err(|_| "websocket lock poisoned".to_string())?;
         loop {
             match ws.read() {
-                Ok(Message::Binary(data)) => return Ok(Some(data)),
-                Ok(Message::Text(text)) => return Ok(Some(text.into_bytes())),
+                Ok(Message::Binary(data)) => return Ok(Some(data.to_vec())),
+                Ok(Message::Text(text)) => return Ok(Some(text.as_str().as_bytes().to_vec())),
                 Ok(Message::Close(_)) => return Ok(None),
                 // Protocol-level pings must be answered for the server to keep
                 // the connection; the pong goes out on the next write, and
                 // neither frame carries transcript payload.
                 Ok(Message::Ping(_)) => {
-                    let _ = ws.send(Message::Pong(Vec::new()));
+                    let _ = ws.send(Message::Pong(Vec::new().into()));
                 }
                 Ok(Message::Pong(_)) => {}
                 Err(e) => return Err(format!("websocket read failed ({e})")),

@@ -26,8 +26,8 @@ pub struct CpalAudio;
 
 impl CpalAudio {
     pub fn new() -> Result<Self, String> {
-        // Building the host once at startup warms the audio stack, which is as
-        // close to the standby trick as cpal allows.
+        // Touching the host once at startup warms the audio stack, which is
+        // as close to the standby trick as cpal allows.
         let _ = cpal::default_host();
         Ok(Self)
     }
@@ -44,7 +44,9 @@ impl Audio for CpalAudio {
     ) -> Result<Receiver<Result<(), String>>, String> {
         let (done_tx, done_rx) = channel();
 
-        let device = cpal::default_input_device().ok_or("no input audio device found")?;
+        let device = cpal::default_host()
+            .default_input_device()
+            .ok_or("no input audio device found")?;
         let supported = device
             .default_input_config()
             .map_err(|e| format!("cannot query input device ({e})"))?;
