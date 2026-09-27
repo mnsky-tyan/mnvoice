@@ -13,8 +13,26 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The packet size the streaming loop and the provider expect, in samples.
+/// The chunk size the Windows engine pushes, in samples: 40 ms at the
+/// provider rate. Purely a granularity choice here, nothing depends on it.
 const PACKET_SAMPLES: usize = 640;
+
+/// Queues a recorded clip for the streaming loop.
+///
+/// Every sample is in the channel and the sender is gone before the stream
+/// opens, so the loop's drain phase hands the provider the whole clip. That
+/// ordering is the point: the loop stops sending the moment the provider
+/// reports the end of an utterance, and its drain phase only flushes what is
+/// already queued, so a clip still being fed at that point loses everything
+/// after the first utterance.
+fn queue_clip(samples: &[i16]) -> Receiver<Vec<i16>> {
+    let (tx, rx) = mpsc::channel();
+    for chunk in samples.chunks(PACKET_SAMPLES) {
+        let _ = tx.send(chunk.to_vec());
+    }
+    drop(tx);
+    rx
+}
 
 pub fn run() -> Result<(), String> {
     let cfg = config::load().map_err(|e| {
@@ -121,28 +139,10 @@ fn dictate(
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
             let cancelled = Arc::new(AtomicBool::new(false));
-            // The clip is handed to the streaming loop in real time, the way
-            // the Windows engine feeds it from the live microphone: one 40 ms
-            // packet every 40 ms. Emptying the whole clip into the channel at
-            // once instead would leave the provider transcribing a backlog
-            // long after the final-transcript wait had expired, and the tail
-            // of the dictation would be dropped from the transcript.
-            let (tx, rx) = mpsc::channel();
-            let packet_ms = (PACKET_SAMPLES as u64 * 1000) / crate::platform::audio::SAMPLE_RATE as u64;
-            std::thread::spawn(move || {
-                for chunk in samples.chunks(PACKET_SAMPLES) {
-                    // A failed send means the stream is finished and its
-                    // receiver is gone, which is the only early exit here.
-                    if tx.send(chunk.to_vec()).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(packet_ms));
-                }
-            });
-            // The capture's own stop flag is spent by the time the clip is
-            // recorded; the streaming loop drives this one itself.
-            let sending = Arc::new(AtomicBool::new(false));
-            let typed = crate::stream::run_stream(cfg, &sending, &cancelled, rx);
+            // Capture is already drained, so the clip is queued whole and the
+            // loop types as frames arrive, exactly as on Windows.
+            let rx = queue_clip(&samples);
+            let typed = crate::stream::run_stream(cfg, &stop, &cancelled, rx);
             typed?
         }
         config::Protocol::Rest => {
@@ -162,4 +162,51 @@ fn dictate(
         println!("transcript: {text}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streaming loop stops sending as soon as the provider reports the end
+    /// of an utterance, and its drain phase only flushes packets that are
+    /// already queued. A clip still being fed at that point loses everything
+    /// after the first utterance - a pause of 1.5 s is enough for the provider
+    /// to end an utterance while the CLI's own silence detector is still
+    /// recording - so the whole clip has to be queued, and the sender dropped,
+    /// before the stream opens.
+    #[test]
+    fn the_whole_clip_is_queued_before_the_stream_opens() {
+        // Three seconds of audio with a two second pause in the middle: the
+        // shape that truncated.
+        let mut clip: Vec<i16> = Vec::new();
+        clip.extend(std::iter::repeat(2_000).take(16_000));
+        clip.extend(std::iter::repeat(0).take(16_000 * 2));
+        clip.extend(std::iter::repeat(3_000).take(16_000));
+
+        let rx = queue_clip(&clip);
+
+        // Nothing may block: the loop's send phase is either skipped or ends on
+        // disconnect, and its drain phase is a non-blocking poll.
+        let mut queued: Vec<i16> = Vec::new();
+        while let Ok(packet) = rx.try_recv() {
+            queued.extend_from_slice(&packet);
+        }
+
+        assert_eq!(queued, clip);
+    }
+
+    /// The sender must be gone once the clip is queued, or the loop's send
+    /// phase waits out its 250 ms poll timeout per packet instead of ending on
+    /// disconnect.
+    #[test]
+    fn queuing_a_clip_leaves_the_channel_disconnected() {
+        let clip: Vec<i16> = (0..PACKET_SAMPLES * 3).map(|i| i as i16).collect();
+        let rx = queue_clip(&clip);
+        while rx.try_recv().is_ok() {}
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
 }
