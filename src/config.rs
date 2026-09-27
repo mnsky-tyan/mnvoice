@@ -49,7 +49,6 @@ pub fn load() -> Result<Config, String> {
     let mut vad_silence_ms = 3000u32;
     let mut vad_rms_threshold = 400.0f64;
     let mut filler_words_str = String::new();
-    let mut auto_update_str = String::new();
 
     // Check for keywords.txt beside the executable
     if let Ok(exe) = std::env::current_exe() {
@@ -84,7 +83,6 @@ pub fn load() -> Result<Config, String> {
                     &mut vad_silence_ms,
                     &mut vad_rms_threshold,
                     &mut filler_words_str,
-                    &mut auto_update_str,
                 )
             });
         }
@@ -152,9 +150,6 @@ pub fn load() -> Result<Config, String> {
     if let Ok(v) = std::env::var("FILLER_WORDS") {
         filler_words_str = v;
     }
-    if let Ok(v) = std::env::var("AUTO_UPDATE") {
-        auto_update_str = v;
-    }
 
     // Determine protocol: streaming vs rest
     let protocol = match protocol_str.to_lowercase().as_str() {
@@ -213,9 +208,7 @@ pub fn load() -> Result<Config, String> {
         "1" | "true" | "on" | "yes" | "keep"
     );
 
-    // AUTO_UPDATE is opt-in: silently replacing a binary is a decision the user
-    // must make, so absence and typos both mean "off".
-    let auto_update = parse_auto_update(&auto_update_str);
+    // AUTO_UPDATE is read by auto_update_enabled() above, not from this pass.
 
     Ok(Config {
         protocol,
@@ -235,8 +228,49 @@ pub fn load() -> Result<Config, String> {
         vad_silence_ms,
         vad_rms_threshold,
         strip_fillers,
-        auto_update,
+        // Deliberately not parsed inline below: a broken API key aborts load(),
+        // and if AUTO_UPDATE were derived from the same pass the updater would
+        // silently go dark exactly when the config is least trustworthy.
+        auto_update: auto_update_enabled(),
     })
+}
+
+/// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
+/// the rest of the config being valid. `load()` fails outright on a missing API
+/// key, so this is what keeps a typo'd config from also silencing updates.
+pub fn auto_update_enabled() -> bool {
+    let mut raw = auto_update_from_file();
+    // The real environment wins over the file beside the exe, matching load().
+    if let Ok(v) = std::env::var("AUTO_UPDATE") {
+        raw = Some(v);
+    }
+    raw.as_deref().map(parse_auto_update).unwrap_or(false)
+}
+
+/// The `AUTO_UPDATE` value from `mnvoice.env` beside the executable, if it names
+/// one. Last entry wins so a later correction overrides an earlier one.
+fn auto_update_from_file() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let text = std::fs::read_to_string(exe.with_file_name("mnvoice.env")).ok()?;
+    parse_auto_update_text(&text)
+}
+
+/// The `AUTO_UPDATE` value out of an env file body, or `None` if it never names
+/// one. `Some("")` means the key was present but empty, which is "off".
+pub fn parse_auto_update_text(text: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("AUTO_UPDATE") {
+                found = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+            }
+        }
+    }
+    found
 }
 
 /// Whether an `AUTO_UPDATE` value asks for automatic installs. Opt-in, so an
@@ -288,7 +322,6 @@ fn apply(
     vad_silence_ms: &mut u32,
     vad_rms_threshold: &mut f64,
     filler_words_str: &mut String,
-    auto_update_str: &mut String,
 ) {
     match k {
         "PROTOCOL" | "MODE" | "PROVIDER" => *protocol_str = v.to_string(),
@@ -330,7 +363,6 @@ fn apply(
             if let Ok(n) = v.parse() { *vad_rms_threshold = n; }
         }
         "FILLER_WORDS" => *filler_words_str = v.to_string(),
-        "AUTO_UPDATE" => *auto_update_str = v.to_string(),
         _ => {}
     }
 }
@@ -474,6 +506,29 @@ mod tests {
         for off in ["", "  ", "0", "false", "no", "off", "ture", "enabled"] {
             assert!(!parse_auto_update(off), "{off:?} must not arm auto-update");
         }
+    }
+
+    #[test]
+    fn test_auto_update_is_read_from_the_env_file_without_the_api_key() {
+        // A config that fails load() outright - no API key anywhere - must not
+        // also take AUTO_UPDATE down with it, so this runs the same extraction
+        // the fallback uses and only needs the env text.
+        let broken = "PROVIDER=deepgram\nHOTKEY=Alt+Space\n";
+        assert_eq!(parse_auto_update_text(broken), None);
+
+        // Named but empty counts as present, and empty is off.
+        assert_eq!(parse_auto_update_text("AUTO_UPDATE=\n"), Some(String::new()));
+        assert!(!parse_auto_update(&String::new()), "an empty value is off");
+
+        // Last entry wins, so a later correction overrides an earlier one, and
+        // comments, stray spaces, quotes and case do not derail the read.
+        let text = "# not this: AUTO_UPDATE=0\n'AUTO_UPDATE'=\"\n1\"\nAPI_KEY=\nAUTO_UPDATE = on \n";
+        assert_eq!(parse_auto_update_text(text).as_deref(), Some("on"));
+        assert!(
+            parse_auto_update(parse_auto_update_text(text).as_deref().unwrap()),
+            "a corrected later entry must arm the updater"
+        );
+        assert_eq!(parse_auto_update_text("auto_update=true").as_deref(), Some("true"));
     }
 
     #[test]

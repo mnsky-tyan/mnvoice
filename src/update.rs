@@ -521,9 +521,9 @@ pub fn background_check_auto() {
 }
 
 /// Called once at startup: tidy up after the previous update, then hand the
-/// periodic check to a background thread so nothing blocks the tray. The
-/// caller already holds the loaded config, so its AUTO_UPDATE flag is taken
-/// from there rather than parsed off disk a second time.
+/// periodic check to a background thread so nothing blocks the tray. AUTO_UPDATE
+/// is read independently of the rest of the config, so the caller passes it in
+/// already resolved rather than this deciding what "valid" means.
 pub fn startup_cleanup(auto_update: bool) {
     if let Ok(exe) = current_exe() {
         clean_stale(&exe);

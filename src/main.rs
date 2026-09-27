@@ -198,6 +198,14 @@ fn main() {
         Ok(c) => Some(c),
         Err(e) => {
             log(&format!("config error: {e}"));
+            // Still worth knowing whether updates are armed, because that is
+            // decided from AUTO_UPDATE alone and a broken API key does not
+            // revoke it. Otherwise the app runs but never updates itself and
+            // nothing above this line says which way it went.
+            log(&format!(
+                "auto-update is {}",
+                if config::auto_update_enabled() { "armed" } else { "off" }
+            ));
             None
         }
     };
@@ -239,7 +247,13 @@ fn main() {
         let audio_engine = audio::AudioEngine::start();
         // Best-effort housekeeping: drop the leftover .old from a previous
         // update and arm the periodic background check when AUTO_UPDATE=1.
-        update::startup_cleanup(config.as_ref().map(|c| c.auto_update).unwrap_or(false));
+        // The fallback keeps updates armed when the config did not load, which
+        // is when a user is most likely stuck on an outdated build.
+        let auto_update = config
+            .as_ref()
+            .map(|c| c.auto_update)
+            .unwrap_or_else(config::auto_update_enabled);
+        update::startup_cleanup(auto_update);
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
