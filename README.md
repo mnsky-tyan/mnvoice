@@ -388,8 +388,8 @@ Known limits in this release, stated rather than papered over:
 - **Linux typing is X11/XWayland.** Native Wayland windows will not receive
   injected keys until the input-capture portal path is built; the binary
   reports the failure instead of dropping words silently.
-- **macOS typing needs permission.** Grant the binary Input Monitoring under
-  System Settings > Privacy & Security > Input Monitoring; without it the
+- **macOS typing needs permission.** Grant the binary Accessibility under
+  System Settings > Privacy & Security > Accessibility; without it the
   first injection fails with an error naming the exact setting.
 - **No orb, tray, hotkey or self-update yet** on these platforms; capture
   start is a device open rather than Windows' ~4 ms standby trick, because

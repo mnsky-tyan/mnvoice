@@ -53,24 +53,12 @@ pub fn version() -> String {
     env!("MNVOICE_VERSION").to_string()
 }
 
-/// Which release asset this platform's updater should download. The names are
-/// stable and platform-specific so an existing install never has to be told
-/// twice; Windows in particular keeps the exact name it has always used, so the
-/// updater already running on people's machines keeps resolving correctly.
-/// Today only the Windows updater calls this - the Unix updater is not built
-/// yet - but the names are pinned by the release workflow regardless.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Which release asset the Windows updater downloads. The name is stable and
+/// platform-specific so an existing install never has to be told twice, and it
+/// is the exact name this release has always used, so the updater already
+/// running on people's machines keeps resolving correctly. The Unix assets are
+/// named by the release workflow, which is where they are defined.
+#[cfg(windows)]
 pub const fn asset_name() -> &'static str {
-    #[cfg(windows)]
-    {
-        "mnvoice.exe"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "mnvoice-linux-x64"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "mnvoice-macos-arm64"
-    }
+    "mnvoice.exe"
 }

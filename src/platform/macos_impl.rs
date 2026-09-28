@@ -1,15 +1,44 @@
 // The macOS backend.
 //
 // Audio is cpal over CoreAudio. Typing is CoreGraphics event synthesis through
-// enigo, which macOS permits only after the user grants Input Monitoring to
-// the binary (System Settings > Privacy & Security). The first injection
-// attempt without the grant fails; the error names the permission rather than
-// dropping words silently, which is the best a CLI binary can do - an
-// app-bundle build could prompt, and that is the follow-up.
+// enigo, which macOS permits only after the user grants the binary the
+// Accessibility permission (System Settings > Privacy & Security >
+// Accessibility); Input Monitoring governs event taps, which is a different
+// API from the synthetic events this path posts. CGEvent::post returns nothing
+// and enigo discards the result, so without the grant every word would be
+// posted and dropped while type_text still reported success. The grant is
+// therefore probed directly and a commit without it fails with an error naming
+// the setting, which is the best a CLI binary can do - an app-bundle build
+// could prompt, and that is the follow-up.
 
 use crate::platform::input::Injector;
+use enigo::{Enigo, Keyboard, Settings};
+use std::cell::RefCell;
 
-/// Text injection through CoreGraphics events, gated by the Input Monitoring
+// Whether this process may post synthetic keyboard events at all.
+//
+// macOS answers from the Accessibility permission database. It is read before
+// every commit rather than cached, so granting the permission takes effect
+// without a restart.
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+}
+
+thread_local! {
+    /// One event source per typing thread rather than one per commit.
+    ///
+    /// Constructing an `Enigo` creates a `CGEventSource`, reads the main
+    /// display and reads the system's double-click interval, and the streaming
+    /// loop's reader thread calls `type_text` once per batch of words it
+    /// commits, so a per-call rebuild pays that hundreds of times over one
+    /// dictation. The cache is per thread because a `CGEventSource` is a
+    /// CoreFoundation handle that cannot be shared across threads the way the
+    /// Linux connection can.
+    static ENIGO: RefCell<Option<Enigo>> = RefCell::new(None);
+}
+
+/// Text injection through CoreGraphics events, gated by the Accessibility
 /// permission.
 pub fn default_injector() -> &'static dyn Injector {
     use std::sync::OnceLock;
@@ -21,15 +50,39 @@ struct CgInjector;
 
 impl Injector for CgInjector {
     fn type_text(&self, text: &str) -> Result<(), String> {
-        use enigo::{Enigo, Keyboard, Settings};
-        let mut enigo = Enigo::new(&Settings::default())
-            .map_err(|e| format!("cannot initialise input injection ({e})"))?;
-        enigo
-            .text(text)
-            .map_err(|_| {
-                "text injection failed; macOS requires Input Monitoring permission for \
-                 this binary (System Settings > Privacy & Security > Input Monitoring)"
-                    .to_string()
-            })
+        if !unsafe { AXIsProcessTrusted() } {
+            return Err(
+                "macOS requires the Accessibility permission for this binary \
+                 (System Settings > Privacy & Security > Accessibility)"
+                    .to_string(),
+            );
+        }
+        // One event per character, the contract every backend keeps: the
+        // Windows engine sends a KEYEVENTF_UNICODE pair per character with a
+        // 2 ms gap, while enigo's `text` batches up to twenty characters into
+        // a single CGEvent, so each character is handed to it on its own.
+        for c in text.chars() {
+            let outcome = ENIGO.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(
+                        Enigo::new(&Settings::default())
+                            .map_err(|e| format!("cannot initialise input injection ({e})"))?,
+                    );
+                }
+                slot.as_mut()
+                    .expect("populated above")
+                    .text(&c.to_string())
+                    .map_err(|e| format!("text injection failed ({e})"))
+            });
+            if let Err(e) = outcome {
+                // The event source is no longer usable, so it is dropped and
+                // the next commit opens a fresh one instead of failing for the
+                // rest of the session.
+                ENIGO.with(|slot| *slot.borrow_mut() = None);
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }

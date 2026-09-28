@@ -3,7 +3,7 @@
 // mnvoice's defining behaviour is typing into whatever window has focus, as
 // words arrive. The three platforms disagree sharply about what that is allowed
 // to mean: Windows `SendInput` synthesizes keystrokes globally; X11 allows it
-// through XTest; macOS requires the user to grant Input Monitoring; Wayland
+// through XTest; macOS requires the user to grant Accessibility; Wayland
 // forbids it outright unless the compositor's input portal consents. Those are
 // capability differences, not spelling differences, which is why this is a
 // trait rather than a cfg'd function.

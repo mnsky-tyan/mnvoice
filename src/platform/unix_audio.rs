@@ -153,8 +153,8 @@ fn run_session(
             (sum / chunk.len() as f64).sqrt()
         };
 
-        if !chunk.is_empty() {
-            let _ = tx.send(chunk);
+        if !chunk.is_empty() && !hand_off(&tx, chunk) {
+            return Ok(());
         }
 
         if stop.load(Ordering::SeqCst)
@@ -192,6 +192,17 @@ fn run_session(
 /// switching the detector off.
 fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
     since_voice_ms >= vad_silence_ms as u64
+}
+
+/// Hands one chunk to the consumer and reports whether it is still reading.
+///
+/// The streaming loop owns the receiver, so a send that fails means it has
+/// already finished: a provider-side disconnect makes it break out of its send
+/// phase and drop the receiver. The microphone then has nothing left to record
+/// for, so the session ends instead of holding the device open - the same
+/// channel contract the Windows engine keeps.
+fn hand_off(tx: &Sender<Vec<i16>>, chunk: Vec<i16>) -> bool {
+    tx.send(chunk).is_ok()
 }
 
 /// Resamples mono audio to the provider rate by linear interpolation, the same
@@ -261,6 +272,25 @@ mod tests {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
         let out = resample(&input, 8_000.0 / SAMPLE_RATE as f64);
         assert_eq!(out.len(), 16_000);
+    }
+
+    /// A streaming loop that stopped reading has already finished, so the
+    /// capture has to end with it. Discarding the send result instead leaves
+    /// the microphone open: the CLI keeps printing "recording..." until the
+    /// VAD fires or MAX_SECONDS expires, which is the channel contract the
+    /// Windows engine keeps broken on the Unix side.
+    #[test]
+    fn a_consumer_that_stopped_reading_ends_the_session() {
+        let (tx, rx) = channel::<Vec<i16>>();
+        assert!(
+            hand_off(&tx, vec![0i16; 320]),
+            "a live consumer takes the chunk"
+        );
+        drop(rx);
+        assert!(
+            !hand_off(&tx, vec![0i16; 320]),
+            "a consumer that stopped reading must end the session"
+        );
     }
 
     /// The configured value is the threshold itself, the way the Windows
