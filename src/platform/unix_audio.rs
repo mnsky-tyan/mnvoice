@@ -170,7 +170,7 @@ fn run_session(
             // is what VAD_SILENCE_MS documents; waiting that long before the
             // first word would stop a session the user is still thinking in.
             since_voice_ms += 20;
-            if vad_silence_ms > 0 && since_voice_ms >= vad_silence_ms as u64 {
+            if silence_expired(since_voice_ms, vad_silence_ms) {
                 return Ok(());
             }
         } else {
@@ -183,6 +183,15 @@ fn run_session(
         }
     }
     // `stream` drops here, which stops capture and joins the device thread.
+}
+
+/// Whether the silence detector ends a dictation that has heard speech.
+///
+/// The threshold is the configured value itself, the way the Windows engine
+/// reads it, so `VAD_SILENCE_MS=0` stops on the first silent tick instead of
+/// switching the detector off.
+fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
+    since_voice_ms >= vad_silence_ms as u64
 }
 
 /// Resamples mono audio to the provider rate by linear interpolation, the same
@@ -252,5 +261,23 @@ mod tests {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
         let out = resample(&input, 8_000.0 / SAMPLE_RATE as f64);
         assert_eq!(out.len(), 16_000);
+    }
+
+    /// The configured value is the threshold itself, the way the Windows
+    /// engine reads it: `VAD_SILENCE_MS=0` ends the dictation on the first
+    /// silent tick. A guard that treated zero as "detector off" left the
+    /// recording running to MAX_SECONDS while the banner still promised that
+    /// the configured silence would stop it.
+    #[test]
+    fn a_zero_silence_threshold_still_ends_the_dictation() {
+        assert!(
+            silence_expired(20, 0),
+            "one silent tick must stop a dictation configured for 0 ms"
+        );
+        assert!(
+            !silence_expired(20, 3_000),
+            "the default threshold needs three seconds of quiet"
+        );
+        assert!(silence_expired(3_000, 3_000));
     }
 }

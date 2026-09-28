@@ -321,7 +321,8 @@ pub fn run_stream(
 /// it sends pushes the deadline out again - a window measured from the send
 /// alone would cut the final clause off. The wait also ends the moment the
 /// reader thread goes idle, and `cap_seconds` bounds a peer that never stops
-/// sending.
+/// sending - floored at the quiet period itself, so a small `MAX_SECONDS`
+/// cannot shorten the window below the one it replaces.
 fn wait_for_final_result(
     started: Instant,
     closed_at: Instant,
@@ -329,7 +330,7 @@ fn wait_for_final_result(
     reader_done: &AtomicBool,
     cap_seconds: u32,
 ) {
-    let final_deadline = closed_at + Duration::from_secs(cap_seconds as u64);
+    let final_deadline = closed_at + Duration::from_secs(cap_seconds as u64).max(FINAL_QUIET);
     while !reader_done.load(Ordering::SeqCst) {
         let quiet_after_last_frame =
             started + Duration::from_millis(last_frame_ms.load(Ordering::SeqCst)) + FINAL_QUIET;
@@ -423,6 +424,9 @@ mod tests {
 
     /// The cap is what stops a peer that keeps sending from holding the session
     /// open: without it the quiet window would keep moving and never expire.
+    /// The cap never goes below the window it replaces either, so a
+    /// `MAX_SECONDS` smaller than the quiet period cannot cut the final result
+    /// off the way an unfloored cap did.
     #[test]
     fn the_final_wait_is_capped_so_a_chatty_peer_cannot_hold_it_open() {
         let started = Instant::now();
@@ -446,11 +450,11 @@ mod tests {
         provider.join().unwrap();
 
         assert!(
-            waited >= Duration::from_millis(900),
-            "the cap did not hold the wait open: {waited:?}"
+            waited >= Duration::from_millis(1_400),
+            "a cap below the quiet window shortened it: {waited:?}"
         );
         assert!(
-            waited < Duration::from_millis(1_400),
+            waited < Duration::from_millis(1_900),
             "a peer that never stops sending was waited on past the cap: {waited:?}"
         );
     }

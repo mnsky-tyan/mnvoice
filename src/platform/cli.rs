@@ -11,28 +11,7 @@ use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::time::Duration;
-
-/// The chunk size the Windows engine pushes, in samples: 40 ms at the
-/// provider rate. Purely a granularity choice here, nothing depends on it.
-const PACKET_SAMPLES: usize = 640;
-
-/// Queues a recorded clip for the streaming loop.
-///
-/// Every sample is in the channel and the sender is gone before the stream
-/// opens, so the loop's drain phase hands the provider the whole clip. That
-/// ordering is the point: the loop stops sending the moment the provider
-/// reports the end of an utterance, and its drain phase only flushes what is
-/// already queued, so a clip still being fed at that point loses everything
-/// after the first utterance.
-fn queue_clip(samples: &[i16]) -> Receiver<Vec<i16>> {
-    let (tx, rx) = mpsc::channel();
-    for chunk in samples.chunks(PACKET_SAMPLES) {
-        let _ = tx.send(chunk.to_vec());
-    }
-    drop(tx);
-    rx
-}
+use std::time::{Duration, Instant};
 
 pub fn run() -> Result<(), String> {
     let cfg = config::load().map_err(|e| {
@@ -115,6 +94,65 @@ where
     Ok(())
 }
 
+/// Waits for the capture to end, raising `stop` on the "Enter again" control.
+///
+/// The engine owns the device and reports how the session ended on its own
+/// channel, so all this does is watch the two channels that already exist: the
+/// line reader, whose next line is the user asking to stop early, and the
+/// engine's report. Returns that report with how long the microphone was open.
+fn watch_recording(
+    stop: &Arc<AtomicBool>,
+    lines: &Receiver<()>,
+    capture_done: &Receiver<Result<(), String>>,
+) -> (Result<(), String>, Duration) {
+    let opened = Instant::now();
+    loop {
+        // The "Enter again" control: the next line from the single reader
+        // thread raises the same stop signal the VAD would.
+        if lines.try_recv().is_ok() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        match capture_done.try_recv() {
+            Ok(result) => return (result, opened.elapsed()),
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Runs the transcriber and the capture together.
+///
+/// The microphone feeds the loop while the user is still speaking, the way the
+/// Windows engine feeds it from the live microphone: the loop's stop flag is
+/// the capture's own, so the provider reporting the end of an utterance ends
+/// the recording and the loop then flushes what has already been captured.
+/// Buffering the clip first instead types nothing until the user stops
+/// speaking, and it buys no safety either - a clip still being fed when the
+/// loop stops sending loses everything after the first utterance, which is why
+/// the capture and the loop share one stop signal rather than one buffer.
+///
+/// The transcriber runs on its own thread so this one can keep reading stdin:
+/// "Enter again" has to be able to stop a recording that is still happening.
+fn transcribe_while_recording<T, F>(
+    stop: &Arc<AtomicBool>,
+    rx: Receiver<Vec<i16>>,
+    capture_done: &Receiver<Result<(), String>>,
+    lines: &Receiver<()>,
+    transcribe: F,
+) -> (Result<T, String>, Duration)
+where
+    F: FnOnce(&Arc<AtomicBool>, Receiver<Vec<i16>>) -> Result<T, String> + Send,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        let transcriber = scope.spawn(|| transcribe(stop, rx));
+        let (captured, recorded) = watch_recording(stop, lines, capture_done);
+        let transcribed = transcriber
+            .join()
+            .unwrap_or_else(|_| Err("transcription stopped unexpectedly".to_string()));
+        (captured.and(transcribed), recorded)
+    })
+}
+
 fn dictate(
     cfg: &config::Config,
     engine: &dyn audio::Audio,
@@ -122,7 +160,7 @@ fn dictate(
 ) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let done = engine.capture_to_channel(
+    let capture_done = engine.capture_to_channel(
         Arc::clone(&stop),
         cfg.max_seconds,
         cfg.vad_silence_ms,
@@ -132,42 +170,24 @@ fn dictate(
 
     println!("recording... (Enter to stop)");
 
-    let mut samples: Vec<i16> = Vec::new();
-    let mut ended: Option<Result<(), String>> = None;
-    while ended.is_none() {
-        // The "Enter again" control: the next line from the single reader
-        // thread raises the same stop signal the VAD would.
-        if lines.try_recv().is_ok() {
-            stop.store(true, Ordering::SeqCst);
-        }
-        while let Ok(chunk) = rx.try_recv() {
-            samples.extend_from_slice(&chunk);
-        }
-        if let Ok(result) = done.try_recv() {
-            ended = Some(result);
-        } else {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    while let Ok(chunk) = rx.try_recv() {
-        samples.extend_from_slice(&chunk);
-    }
-    if let Some(Err(e)) = ended {
-        return Err(e);
-    }
-
-    println!("stopped ({}s of audio)", samples.len() / 16_000);
-
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
             let cancelled = Arc::new(AtomicBool::new(false));
-            // Capture is already drained, so the clip is queued whole and the
-            // loop types as frames arrive, exactly as on Windows.
-            let rx = queue_clip(&samples);
-            let typed = crate::stream::run_stream(cfg, &stop, &cancelled, rx);
-            typed?
+            let (text, recorded) =
+                transcribe_while_recording(&stop, rx, &capture_done, lines, |stop, rx| {
+                    crate::stream::run_stream(cfg, stop, &cancelled, rx)
+                });
+            println!("stopped ({}s of audio)", recorded.as_secs());
+            text?
         }
         config::Protocol::Rest => {
+            let (captured, _) = watch_recording(&stop, lines, &capture_done);
+            let mut samples: Vec<i16> = Vec::new();
+            while let Ok(chunk) = rx.try_recv() {
+                samples.extend_from_slice(&chunk);
+            }
+            captured?;
+            println!("stopped ({}s of audio)", samples.len() / 16_000);
             let wav = audio::wav_bytes(&samples);
             let raw = crate::rest::transcribe(cfg, &wav)?;
             let (text, trailing) =
@@ -193,47 +213,133 @@ fn dictate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    /// The streaming loop stops sending as soon as the provider reports the end
-    /// of an utterance, and its drain phase only flushes packets that are
-    /// already queued. A clip still being fed at that point loses everything
-    /// after the first utterance - a pause of 1.5 s is enough for the provider
-    /// to end an utterance while the CLI's own silence detector is still
-    /// recording - so the whole clip has to be queued, and the sender dropped,
-    /// before the stream opens.
+    /// The transcriber has to consume the microphone while it is still
+    /// capturing. Handing it a finished clip instead types nothing until the
+    /// user stops speaking, which is the opposite of what the banner and the
+    /// README promise - and it buys no safety, because a clip still being fed
+    /// when the loop stops sending loses everything after the first utterance.
     #[test]
-    fn the_whole_clip_is_queued_before_the_stream_opens() {
-        // Three seconds of audio with a two second pause in the middle: the
-        // shape that truncated.
-        let mut clip: Vec<i16> = Vec::new();
-        clip.extend(std::iter::repeat(2_000).take(16_000));
-        clip.extend(std::iter::repeat(0).take(16_000 * 2));
-        clip.extend(std::iter::repeat(3_000).take(16_000));
+    fn the_transcriber_is_fed_while_the_microphone_is_still_capturing() {
+        // A capture engine that hands over one packet every 20 ms and reports
+        // done once it has sent ten.
+        let (tx, rx) = mpsc::channel::<Vec<i16>>();
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+        let ended_at = Arc::new(Mutex::new(None::<Instant>));
+        let engine_ended = Arc::clone(&ended_at);
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                if tx.send(vec![0i16; 320]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(tx);
+            *engine_ended.lock().unwrap() = Some(Instant::now());
+            let _ = done_tx.send(Ok(()));
+        });
 
-        let rx = queue_clip(&clip);
+        let (line_tx, line_rx) = mpsc::channel::<()>();
+        // Nobody presses Enter: the engine ends the session on its own.
+        drop(line_tx);
+        let stop = Arc::new(AtomicBool::new(false));
 
-        // Nothing may block: the loop's send phase is either skipped or ends on
-        // disconnect, and its drain phase is a non-blocking poll.
-        let mut queued: Vec<i16> = Vec::new();
-        while let Ok(packet) = rx.try_recv() {
-            queued.extend_from_slice(&packet);
-        }
+        let (outcome, _recorded) =
+            transcribe_while_recording(&stop, rx, &done_rx, &line_rx, |_, rx| {
+                let mut packets = 0usize;
+                let mut fed_at: Option<Instant> = None;
+                for _ in rx.iter() {
+                    packets += 1;
+                    fed_at.get_or_insert_with(Instant::now);
+                }
+                Ok((packets, fed_at))
+            });
 
-        assert_eq!(queued, clip);
+        let (packets, fed_at) = outcome.expect("the transcriber ran to completion");
+        assert_eq!(packets, 10, "every captured packet reached the transcriber");
+        let fed_at = fed_at.expect("the transcriber was handed packets");
+        let ended_at = ended_at.lock().unwrap().expect("the capture reported done");
+        assert!(
+            fed_at < ended_at,
+            "the transcriber was handed the clip only after the capture ended"
+        );
     }
 
-    /// The sender must be gone once the clip is queued, or the loop's send
-    /// phase waits out its 250 ms poll timeout per packet instead of ending on
-    /// disconnect.
+    /// "Enter again" has to stop a recording that is still happening, which is
+    /// only possible while the transcriber runs on its own thread.
     #[test]
-    fn queuing_a_clip_leaves_the_channel_disconnected() {
-        let clip: Vec<i16> = (0..PACKET_SAMPLES * 3).map(|i| i as i16).collect();
-        let rx = queue_clip(&clip);
-        while rx.try_recv().is_ok() {}
-        assert!(matches!(
-            rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Disconnected)
-        ));
+    fn enter_stops_a_recording_that_is_still_running() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<Vec<i16>>();
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+        let engine_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            // Captures until something stops it, the way the real engine does.
+            while !engine_stop.load(Ordering::SeqCst) {
+                if tx.send(vec![0i16; 320]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(tx);
+            let _ = done_tx.send(Ok(()));
+        });
+
+        let (line_tx, line_rx) = mpsc::channel::<()>();
+        line_tx.send(()).unwrap();
+
+        let began = Instant::now();
+        let (outcome, _recorded) =
+            transcribe_while_recording(&stop, rx, &done_rx, &line_rx, |_, rx| {
+                let mut packets = 0usize;
+                for _ in rx.iter() {
+                    packets += 1;
+                }
+                Ok(packets)
+            });
+
+        assert!(
+            outcome.is_ok(),
+            "the transcriber saw the session end cleanly"
+        );
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "Enter must raise the capture's stop signal"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "Enter did not stop the recording: {:?}",
+            began.elapsed()
+        );
+    }
+
+    /// A capture that fails still has to surface its error: the transcriber
+    /// finishes with nothing to show for it, and the session reports why
+    /// instead of pretending the dictation was simply empty.
+    #[test]
+    fn a_capture_error_is_reported_alongside_the_transcript() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<Vec<i16>>();
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+        // The engine drops its sender before it reports, exactly as the real
+        // one does.
+        drop(tx);
+        let _ = done_tx.send(Err("no input audio device found".to_string()));
+
+        let (line_tx, line_rx) = mpsc::channel::<()>();
+        drop(line_tx);
+
+        let (outcome, _recorded) =
+            transcribe_while_recording(&stop, rx, &done_rx, &line_rx, |_, rx| {
+                let mut packets = 0usize;
+                for _ in rx.iter() {
+                    packets += 1;
+                }
+                Ok(packets)
+            });
+
+        assert_eq!(outcome, Err("no input audio device found".to_string()));
     }
 
     /// A failed dictation must cost one attempt, not the session. The Windows
