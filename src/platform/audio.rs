@@ -20,10 +20,9 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// A persistent capture engine, armed once at startup.
 ///
 /// On Windows nothing names this trait - the app holds its concrete
-/// `AudioEngine`, and the impl below is the contract the Linux and macOS
-/// engines must satisfy. That asymmetry is deliberate: the trait is the port's
-/// specification, and the portable CLI is what actually calls it through a
-/// trait object.
+/// `AudioEngine` and calls its inherent method. That asymmetry is deliberate:
+/// the trait is the port's specification for the Unix engines, and the portable
+/// CLI is what actually calls it through a trait object.
 #[allow(dead_code)]
 pub trait Audio: Send {
     /// Begin a capture session.

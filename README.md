@@ -353,10 +353,10 @@ Binary at `target\release\mnvoice.exe`. Run tests:
 cargo test
 ```
 
-Linux: needs `libasound2-dev` and `pkg-config` (ALSA headers; PipeWire
-arrives through its ALSA layer). The released binary also links
-`libxkbcommon`, which the injector needs on Linux whichever backend it uses,
-so install `libxkbcommon0` if it is not already present. macOS: nothing extra.
+Linux: needs `libasound2-dev`, `libxkbcommon-dev` and `pkg-config` (ALSA
+headers; PipeWire arrives through its ALSA layer, and the injector links
+xkbcommon whichever backend it uses). The built binary in turn needs
+`libxkbcommon0` at runtime. macOS: nothing extra.
 
 ```bash
 cargo build --release

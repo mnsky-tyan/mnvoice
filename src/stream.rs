@@ -284,7 +284,14 @@ pub fn run_stream(
     // Signal close to Deepgram
     let _ = ws.send_text("{\"type\": \"CloseStream\"}");
 
-    wait_for_final_result(started, &last_frame_ms, &reader_done, cfg.max_seconds);
+    let closed_at = Instant::now();
+    wait_for_final_result(
+        started,
+        closed_at,
+        &last_frame_ms,
+        &reader_done,
+        cfg.max_seconds,
+    );
 
     reader_done.store(true, Ordering::SeqCst);
     ws.close();
@@ -304,27 +311,31 @@ pub fn run_stream(
 /// How long the streaming loop waits for the provider's final result once
 /// CloseStream has been sent.
 ///
-/// The window is anchored to the last frame the provider sent rather than to
-/// the moment CloseStream went out. On Windows the audio had been flowing in
-/// real time, so interim results were already being typed and the provider's
-/// last frame landed about when CloseStream was sent; the Unix CLI hands the
-/// provider a whole clip in one burst, so its transcription of that clip is
-/// still running after CloseStream, and a window measured from the send would
-/// cut the final clause off. It ends early once the reader has finished, and
-/// `cap_seconds` - the longest clip the app will record - bounds a peer that
-/// never stops sending.
+/// The window never runs shorter than it did before the port: the deadline is
+/// the later of CloseStream plus the quiet period and the provider's own last
+/// frame plus that same period. On Windows the audio had been flowing in real
+/// time, so interim results were already being typed and the provider's last
+/// frame landed about when CloseStream was sent, which makes the two the same
+/// instant. The Unix CLI hands the provider a whole clip in one burst, so its
+/// transcription of that clip is still running after CloseStream and each frame
+/// it sends pushes the deadline out again - a window measured from the send
+/// alone would cut the final clause off. The wait also ends the moment the
+/// reader thread goes idle, and `cap_seconds` bounds a peer that never stops
+/// sending.
 fn wait_for_final_result(
     started: Instant,
+    closed_at: Instant,
     last_frame_ms: &AtomicU64,
     reader_done: &AtomicBool,
     cap_seconds: u32,
 ) {
-    let final_deadline = Instant::now() + Duration::from_secs(cap_seconds as u64);
+    let final_deadline = closed_at + Duration::from_secs(cap_seconds as u64);
     while !reader_done.load(Ordering::SeqCst) {
-        let quiet_deadline =
+        let quiet_after_last_frame =
             started + Duration::from_millis(last_frame_ms.load(Ordering::SeqCst)) + FINAL_QUIET;
+        let deadline = (closed_at + FINAL_QUIET).max(quiet_after_last_frame);
         let now = Instant::now();
-        if now >= quiet_deadline || now >= final_deadline {
+        if now >= deadline || now >= final_deadline {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -342,22 +353,28 @@ mod tests {
         assert_eq!(url_encode("mnvoice"), "mnvoice");
     }
 
-    /// The window is anchored to the provider's last frame, so a provider that
-    /// had already gone quiet before CloseStream costs no wait at all - the
-    /// fixed deadline this replaces always ran its full clock.
+    /// A provider that had already gone quiet before CloseStream still gets the
+    /// full window the port inherited, because the deadline is the later of the
+    /// send plus the quiet period and the provider's last frame plus the same
+    /// period. Anchoring to the last frame alone made the wait zero here, and
+    /// the provider's final `is_final` frame - the one carrying the last
+    /// clause - was never read, so the transcript came back truncated.
     #[test]
-    fn the_final_wait_ends_once_the_provider_has_been_quiet() {
+    fn the_final_wait_is_never_shorter_than_the_window_it_replaces() {
         let started = Instant::now() - Duration::from_secs(10);
-        let last_frame = AtomicU64::new(8_000); // two seconds before "now"
+        let closed_at = Instant::now();
+        let last_frame = AtomicU64::new(8_000); // two seconds before the close
         let reader_done = AtomicBool::new(false);
 
         let began = Instant::now();
-        wait_for_final_result(started, &last_frame, &reader_done, 120);
+        wait_for_final_result(started, closed_at, &last_frame, &reader_done, 120);
+        let waited = began.elapsed();
 
         assert!(
-            began.elapsed() < Duration::from_millis(500),
-            "a provider that stopped sending two seconds ago must not be waited on"
+            waited >= Duration::from_millis(1_400),
+            "the window ran short at {waited:?}"
         );
+        assert!(waited < Duration::from_millis(2_500), "waited {waited:?}");
     }
 
     /// A clip handed over in one burst is still being transcribed after
@@ -367,6 +384,7 @@ mod tests {
     #[test]
     fn the_final_wait_outlasts_a_final_frame_that_arrives_late() {
         let started = Instant::now();
+        let closed_at = Instant::now();
         let last_frame = Arc::new(AtomicU64::new(0));
         let reader_done = Arc::new(AtomicBool::new(false));
         let late = Arc::clone(&last_frame);
@@ -377,7 +395,7 @@ mod tests {
         });
 
         let began = Instant::now();
-        wait_for_final_result(started, &last_frame, &reader_done, 120);
+        wait_for_final_result(started, closed_at, &last_frame, &reader_done, 120);
         let waited = began.elapsed();
         provider.join().unwrap();
 
@@ -393,11 +411,12 @@ mod tests {
     #[test]
     fn the_final_wait_ends_when_the_reader_has_finished() {
         let started = Instant::now();
+        let closed_at = Instant::now();
         let last_frame = AtomicU64::new(0);
         let reader_done = AtomicBool::new(true);
 
         let began = Instant::now();
-        wait_for_final_result(started, &last_frame, &reader_done, 120);
+        wait_for_final_result(started, closed_at, &last_frame, &reader_done, 120);
 
         assert!(began.elapsed() < Duration::from_millis(100));
     }
@@ -407,6 +426,7 @@ mod tests {
     #[test]
     fn the_final_wait_is_capped_so_a_chatty_peer_cannot_hold_it_open() {
         let started = Instant::now();
+        let closed_at = Instant::now();
         let last_frame = Arc::new(AtomicU64::new(0));
         let reader_done = Arc::new(AtomicBool::new(false));
         let chatty = Arc::clone(&last_frame);
@@ -421,7 +441,7 @@ mod tests {
         });
 
         let began = Instant::now();
-        wait_for_final_result(started, &last_frame, &reader_done, 1);
+        wait_for_final_result(started, closed_at, &last_frame, &reader_done, 1);
         let waited = began.elapsed();
         provider.join().unwrap();
 

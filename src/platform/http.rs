@@ -102,17 +102,12 @@ pub trait Transport {
 /// client whose TLS stack is chosen per target by Cargo.toml's features and by
 /// `unix_http::ensure_tls_ready` (rustls needs an explicit crypto provider on
 /// Linux, macOS rides the platform's verifier through native-tls).
+///
+/// Each backend pins the redirect contract through this name in its own tests:
+/// Windows in update.rs, where the updater is the caller, and Unix in
+/// unix_http.rs, where the backend lives.
 #[cfg(windows)]
 pub use crate::platform::windows_impl::WinHttpTransport as NativeTransport;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use crate::platform::unix_http::UnixTransport as NativeTransport;
-
-/// A way for the Unix transport tests to exercise the full stack - the trait
-/// object a caller gets - without reaching into a specific backend module.
-/// Windows keeps its test inside update.rs, where the updater calls through
-/// the same name.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn native_transport_for_tests() -> Box<dyn Transport> {
-    Box::new(NativeTransport)
-}

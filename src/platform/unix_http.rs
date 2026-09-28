@@ -420,7 +420,7 @@ mod tests {
             .unwrap();
         });
 
-        let transport = crate::platform::http::native_transport_for_tests();
+        let transport: Box<dyn Transport> = Box::new(UnixTransport);
         let response = transport
             .get(
                 &format!("http://{redirect_addr}/releases/download/v0.1.15/asset"),

@@ -130,6 +130,25 @@ pub fn strip_disfluencies(text: &str) -> String {
         .join(" ")
 }
 
+/// What the REST path types for a transcript, and whether a trailing space
+/// follows it.
+///
+/// FILLER_WORDS=1 keeps the transcript verbatim - the streaming path asks the
+/// provider for that instead, because REST has no such parameter anywhere -
+/// and TRAILING_SPACE only ever appends to text that was actually typed. Both
+/// control surfaces state the rule the same way; it lives here because the
+/// Windows tray and the Unix terminal CLI would otherwise each keep their own
+/// copy and drift.
+pub fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
+    let text = if strip_fillers {
+        strip_disfluencies(raw.trim())
+    } else {
+        raw.trim().to_string()
+    };
+    let space = trailing_space && !text.is_empty();
+    (text, space)
+}
+
 pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> {
     let (scheme, rest) = url
         .split_once("://")
@@ -252,6 +271,44 @@ mod tests {
     #[test]
     fn test_strip_disfluencies_removes_fillers() {
         assert_eq!(strip_disfluencies("so um this is uh the plan"), "so this is the plan");
+    }
+
+    /// FILLER_WORDS=1 keeps the transcript verbatim. The streaming path asks
+    /// the provider for that, but REST has no such parameter anywhere, so the
+    /// local stoplist is the only lever - and the setting has to reach it, or a
+    /// user who asked for verbatim gets filtered text with no way to tell.
+    #[test]
+    fn filler_words_off_keeps_the_rest_transcript_verbatim() {
+        let (text, _) = rest_typing("so um this is uh the plan", false, true);
+        assert_eq!(text, "so um this is uh the plan");
+    }
+
+    /// FILLER_WORDS=0 (the default) strips, on REST exactly as it strips
+    /// everywhere else.
+    #[test]
+    fn filler_words_on_strips_the_rest_transcript() {
+        let (text, _) = rest_typing("so um this is uh the plan", true, true);
+        assert_eq!(text, "so this is the plan");
+    }
+
+    /// TRAILING_SPACE appends after each dictation. The streaming loop and both
+    /// control surfaces do it; without it two consecutive dictations run
+    /// together in the focused window as "hello worldagain".
+    #[test]
+    fn trailing_space_appends_only_after_a_real_transcript() {
+        let (_, space) = rest_typing("hello world", true, true);
+        assert!(space);
+        let (_, space) = rest_typing("hello world", true, false);
+        assert!(!space);
+    }
+
+    /// An empty transcript must not be typed at all, and must not leave a lone
+    /// space behind either.
+    #[test]
+    fn an_empty_rest_transcript_types_nothing() {
+        let (text, space) = rest_typing("   ", true, true);
+        assert!(text.is_empty());
+        assert!(!space);
     }
 
     #[test]

@@ -31,19 +31,6 @@ pub struct AudioEngine {
     request_tx: Sender<CaptureRequest>,
 }
 
-impl crate::platform::audio::Audio for AudioEngine {
-    fn capture_to_channel(
-        &self,
-        stop: Arc<AtomicBool>,
-        max_seconds: u32,
-        vad_silence_ms: u32,
-        vad_rms_threshold: f64,
-        tx: Sender<Vec<i16>>,
-    ) -> Result<Receiver<Result<(), String>>, String> {
-        Self::capture_to_channel(self, stop, max_seconds, vad_silence_ms, vad_rms_threshold, tx)
-    }
-}
-
 impl AudioEngine {
     pub fn start() -> Self {
         let (request_tx, request_rx) = channel::<CaptureRequest>();

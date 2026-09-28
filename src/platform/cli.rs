@@ -17,22 +17,6 @@ use std::time::Duration;
 /// provider rate. Purely a granularity choice here, nothing depends on it.
 const PACKET_SAMPLES: usize = 640;
 
-/// What the REST path types for a transcript, and whether a trailing space
-/// follows it.
-///
-/// FILLER_WORDS=1 keeps the transcript verbatim - the streaming path asks the
-/// provider for that instead, because REST has no such parameter anywhere -
-/// and TRAILING_SPACE only ever appends to text that was actually typed.
-fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
-    let text = if strip_fillers {
-        crate::rest::strip_disfluencies(raw.trim())
-    } else {
-        raw.trim().to_string()
-    };
-    let space = trailing_space && !text.is_empty();
-    (text, space)
-}
-
 /// Queues a recorded clip for the streaming loop.
 ///
 /// Every sample is in the channel and the sender is gone before the stream
@@ -186,7 +170,8 @@ fn dictate(
         config::Protocol::Rest => {
             let wav = audio::wav_bytes(&samples);
             let raw = crate::rest::transcribe(cfg, &wav)?;
-            let (text, trailing) = rest_typing(&raw, cfg.strip_fillers, cfg.trailing_space);
+            let (text, trailing) =
+                crate::rest::rest_typing(&raw, cfg.strip_fillers, cfg.trailing_space);
             if !text.is_empty() {
                 input::type_text(&text);
                 if trailing {
@@ -249,44 +234,6 @@ mod tests {
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)
         ));
-    }
-
-    /// FILLER_WORDS=1 keeps the transcript verbatim. The streaming path asks
-    /// the provider for that, but REST has no such parameter anywhere, so the
-    /// local stoplist is the only lever - and the setting has to reach it, or a
-    /// user who asked for verbatim gets filtered text with no way to tell.
-    #[test]
-    fn filler_words_off_keeps_the_rest_transcript_verbatim() {
-        let (text, _) = rest_typing("so um this is uh the plan", false, true);
-        assert_eq!(text, "so um this is uh the plan");
-    }
-
-    /// FILLER_WORDS=0 (the default) strips, on REST exactly as it strips
-    /// everywhere else.
-    #[test]
-    fn filler_words_on_strips_the_rest_transcript() {
-        let (text, _) = rest_typing("so um this is uh the plan", true, true);
-        assert_eq!(text, "so this is the plan");
-    }
-
-    /// TRAILING_SPACE appends after each dictation. The streaming loop and the
-    /// Windows REST branch both do it; without it two consecutive dictations
-    /// run together in the focused window as "hello worldagain".
-    #[test]
-    fn trailing_space_appends_only_after_a_real_transcript() {
-        let (_, space) = rest_typing("hello world", true, true);
-        assert!(space);
-        let (_, space) = rest_typing("hello world", true, false);
-        assert!(!space);
-    }
-
-    /// An empty transcript must not be typed at all, and must not leave a lone
-    /// space behind either.
-    #[test]
-    fn an_empty_rest_transcript_types_nothing() {
-        let (text, space) = rest_typing("   ", true, true);
-        assert!(text.is_empty());
-        assert!(!space);
     }
 
     /// A failed dictation must cost one attempt, not the session. The Windows

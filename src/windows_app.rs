@@ -647,16 +647,13 @@ fn worker(
                 Ok(text) => {
                     // No provider here exposes a native filler_words parameter, so
                     // disfluencies are removed locally before anything is typed.
-                    let text = if cfg.strip_fillers {
-                        rest::strip_disfluencies(text.trim())
-                    } else {
-                        text.trim().to_string()
-                    };
+                    let (text, trailing) =
+                        rest::rest_typing(&text, cfg.strip_fillers, cfg.trailing_space);
                     if text.is_empty() {
                         (false, "No speech detected".into())
                     } else {
                         let _ = paste::type_text(&text);
-                        if cfg.trailing_space {
+                        if trailing {
                             let _ = paste::type_text(" ");
                         }
                         (true, text)
