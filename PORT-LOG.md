@@ -43,8 +43,13 @@ Reverse-chronological. Every claim links to a check that was run.
   connect, 30 s handshake), TLS by feature flags: rustls+ring+bundled roots on
   Linux, native-tls/Security.framework on macOS. One `UnixTransport` serves
   both Unix backends: the TLS split is already decided by Cargo.toml's
-  per-target features and by `ensure_tls_ready`, so only the audio device and
-  the injector genuinely differ per platform.
+  per-target features - which declare no network dependency for both targets,
+  because Cargo unions the features of every matching entry - plus the setup
+  each side needs (`ensure_tls_ready` installs rustls' crypto provider on
+  Linux, `agent_builder` installs the native-tls connector on macOS, since
+  ureq's `native-tls` feature supplies only the adapter and never the
+  default), so only the audio device and the injector genuinely differ per
+  platform.
 - `linux_impl`/`macos_impl`: cpal audio, enigo injection (x11rb backend - no
   libxdo system dependency).
 - CI iterations to green: 6 rounds, each fixing exactly what rustc on the real

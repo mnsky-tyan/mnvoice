@@ -176,7 +176,7 @@ pub fn load() -> Result<Config, String> {
     };
 
     if api_key.trim().is_empty() {
-        return Err("No API key configured. Set API_KEY in mnvoice.env next to mnvoice.exe.".into());
+        return Err("No API key configured. Set API_KEY in mnvoice.env next to the mnvoice binary.".into());
     }
 
     if model.is_empty() {

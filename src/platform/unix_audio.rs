@@ -121,31 +121,22 @@ fn run_session(
     stream.play().map_err(|e| format!("cannot start capture ({e})"))?;
 
     let started = Instant::now();
-    let mut speech_started = false;
-    let mut since_voice_ms = 0u64;
-    let mut no_speech_ms = 0u64;
+    let mut silence = SilenceWindows::new();
     loop {
         thread::sleep(Duration::from_millis(20));
-
-        let raw: Vec<f32> = buffer
-            .lock()
-            .map(|mut buf| std::mem::take(&mut *buf))
-            .unwrap_or_default();
 
         // Frames arrive interleaved, so the channels are averaged into mono
         // before resampling. Taking every nth sample of a stereo stream
         // instead would alternate left and right, and the provider would be
         // sent an alternating signal rather than the mixed-down voice the
         // Windows engine hands it.
-        let mono: Vec<f32> = raw
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect();
+        let mono = take_frames(&buffer, channels);
 
         let chunk = resample(&mono, resample_step);
 
         // The silence detector reads the same window that goes downstream,
         // so it runs before the hand-off (sending moves the chunk).
+        let chunk_len = chunk.len();
         let rms = if chunk.is_empty() {
             0.0
         } else {
@@ -162,27 +153,65 @@ fn run_session(
         {
             return Ok(());
         }
-        if rms > vad_rms_threshold {
-            speech_started = true;
-            since_voice_ms = 0;
-        } else if speech_started {
-            // Silence only ends a dictation once there has been speech, which
-            // is what VAD_SILENCE_MS documents; waiting that long before the
-            // first word would stop a session the user is still thinking in.
-            since_voice_ms += 20;
-            if silence_expired(since_voice_ms, vad_silence_ms) {
-                return Ok(());
-            }
-        } else {
-            // Nothing said at all: the same no-speech cutoff Windows uses, so a
-            // forgotten open mic cannot hold the device for max_seconds.
-            no_speech_ms += 20;
-            if no_speech_ms >= 10_000 {
-                return Ok(());
-            }
+        if silence.advance(chunk_len, rms, vad_rms_threshold, vad_silence_ms) {
+            return Ok(());
         }
     }
     // `stream` drops here, which stops capture and joins the device thread.
+}
+
+/// How much of the VAD's silence windows one tick's audio covers.
+///
+/// The Windows engine advances its windows by the audio it consumed - 40 ms
+/// per 640-sample chunk - so a tick that ran long still counts the time it
+/// covered. Counting ticks instead under-counts a stalled loop, which leaves
+/// the microphone open until MAX_SECONDS rather than ending on the configured
+/// silence.
+fn audio_ms(samples: usize) -> u64 {
+    samples as u64 * 1000 / SAMPLE_RATE as u64
+}
+
+/// The two silence windows that end a dictation.
+///
+/// Both advance by the audio each tick consumed, which is what keeps them
+/// honest when the capture thread is descheduled and a single tick carries a
+/// second of device audio: the window still counts a second.
+struct SilenceWindows {
+    /// Quiet since the last voice, once there has been any.
+    since_voice_ms: u64,
+    /// Quiet since the session opened.
+    no_speech_ms: u64,
+    heard_voice: bool,
+}
+
+impl SilenceWindows {
+    fn new() -> Self {
+        Self {
+            since_voice_ms: 0,
+            no_speech_ms: 0,
+            heard_voice: false,
+        }
+    }
+
+    /// Feeds one tick's audio, reporting whether the session should end.
+    fn advance(&mut self, samples: usize, rms: f64, threshold: f64, vad_silence_ms: u32) -> bool {
+        if rms > threshold {
+            self.heard_voice = true;
+            self.since_voice_ms = 0;
+            false
+        } else if self.heard_voice {
+            // Silence only ends a dictation once there has been speech, which
+            // is what VAD_SILENCE_MS documents; waiting that long before the
+            // first word would stop a session the user is still thinking in.
+            self.since_voice_ms += audio_ms(samples);
+            silence_expired(self.since_voice_ms, vad_silence_ms)
+        } else {
+            // Nothing said at all: the same no-speech cutoff Windows uses, so a
+            // forgotten open mic cannot hold the device for max_seconds.
+            self.no_speech_ms += audio_ms(samples);
+            self.no_speech_ms >= 10_000
+        }
+    }
 }
 
 /// Whether the silence detector ends a dictation that has heard speech.
@@ -192,6 +221,29 @@ fn run_session(
 /// switching the detector off.
 fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
     since_voice_ms >= vad_silence_ms as u64
+}
+
+/// Mixes the interleaved frames in `buf` down to mono and leaves a partial
+/// frame behind for the next tick.
+///
+/// The device's 20 ms tick boundary almost never lands on a frame boundary on
+/// a stereo device, so dropping the remainder loses a sample or two about
+/// fifty times a second and reads the rest of the next tick one sample out of
+/// phase. The Windows engine instead refuses a partial frame outright, which
+/// is not an option here: the realtime callback appends whatever the device
+/// handed it, so the tail has to be carried.
+fn take_frames(buffer: &Arc<Mutex<Vec<f32>>>, channels: usize) -> Vec<f32> {
+    let Ok(mut buf) = buffer.lock() else {
+        return Vec::new();
+    };
+    // Only whole frames leave the buffer, so what stays is by construction a
+    // partial one.
+    let whole = buf.len() / channels * channels;
+    let taken: Vec<f32> = buf.drain(..whole).collect();
+    taken
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect()
 }
 
 /// Hands one chunk to the consumer and reports whether it is still reading.
@@ -272,6 +324,89 @@ mod tests {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
         let out = resample(&input, 8_000.0 / SAMPLE_RATE as f64);
         assert_eq!(out.len(), 16_000);
+    }
+
+    /// The tick boundary almost never lands on a frame boundary, so a partial
+    /// frame has to survive into the next tick. Dropping it instead loses a
+    /// sample or two about fifty times a second and reads the rest of the
+    /// next tick one sample out of phase.
+    #[test]
+    fn a_partial_frame_is_carried_into_the_next_tick() {
+        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(vec![1.0, 0.0, 0.5, 0.5, 0.25]));
+        let mono = take_frames(&buffer, 2);
+        assert_eq!(
+            mono,
+            vec![0.5, 0.5],
+            "two whole frames should have been mixed down"
+        );
+        assert_eq!(
+            buffer.lock().unwrap().as_slice(),
+            [0.25],
+            "the leftover sample must stay for the next tick"
+        );
+    }
+
+    /// A tick that consumed a second of device audio has to count a second
+    /// of silence, the way the Windows engine counts 40 ms per 640-sample
+    /// chunk. Counting the tick instead reaches the configured silence only
+    /// after fifty such ticks, and in the meantime nothing ends the dictation
+    /// but MAX_SECONDS.
+    #[test]
+    fn a_stalled_tick_still_counts_the_audio_it_covered() {
+        let mut silence = SilenceWindows::new();
+        // Voice first, so the since-voice window is the one in play.
+        assert!(
+            !silence.advance(16_000, 1.0, 0.01, 3_000),
+            "voice is not silence"
+        );
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            if silence.advance(16_000, 0.0, 0.01, 3_000) {
+                break;
+            }
+            assert!(
+                ticks < 100,
+                "three seconds of silence never ended the session"
+            );
+        }
+        assert_eq!(
+            ticks, 3,
+            "one second of audio per tick is one second of silence"
+        );
+    }
+
+    /// The ordinary 20 ms tick still ends on the configured silence, so the
+    /// audio-time accounting did not change the normal case.
+    #[test]
+    fn a_normal_twenty_millisecond_tick_advances_twenty_milliseconds() {
+        let mut silence = SilenceWindows::new();
+        assert!(!silence.advance(320, 1.0, 0.01, 3_000));
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            if silence.advance(320, 0.0, 0.01, 3_000) {
+                break;
+            }
+            assert!(ticks < 1_000);
+        }
+        assert_eq!(ticks, 150, "3000 ms of 20 ms silence");
+    }
+
+    /// Nothing said at all: the same ten-second cutoff Windows uses, also
+    /// counted in audio time.
+    #[test]
+    fn ten_seconds_of_no_speech_ends_the_session() {
+        let mut silence = SilenceWindows::new();
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            if silence.advance(320, 0.0, 0.01, 3_000) {
+                break;
+            }
+            assert!(ticks < 2_000);
+        }
+        assert_eq!(ticks, 500, "10 000 ms of 20 ms silence");
     }
 
     /// A streaming loop that stopped reading has already finished, so the

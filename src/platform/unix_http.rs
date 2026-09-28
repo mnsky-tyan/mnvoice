@@ -11,9 +11,12 @@
 // Cargo.toml features: Linux uses rustls with the ring provider and Mozilla
 // root certificates bundled at build time (Linux has no single trusted root
 // store to query), macOS uses native-tls, which is Security.framework and
-// therefore the platform's own verifier and keychain trust. The one line that
-// differs - installing rustls' crypto provider, which rustls refuses to pick
-// a default for - is `ensure_tls_ready`, empty on macOS.
+// therefore the platform's own verifier and keychain trust. Each side needs
+// one line of setup the other does not: Linux installs rustls' crypto
+// provider, which rustls refuses to pick a default for, and macOS installs
+// the native-tls connector on every agent - ureq's default connector is
+// rustls whenever its `tls` feature is on and nothing at all when it is off,
+// and the `native-tls` feature supplies only the adapter, never the default.
 //
 // Like the Windows transport, every call is stateless: open, complete, close.
 // A failed request cannot poison the next one.
@@ -62,6 +65,28 @@ fn ensure_tls_ready() {
 #[cfg(target_os = "macos")]
 fn ensure_tls_ready() {}
 
+/// The agent each platform starts from, before the timeout split is applied.
+///
+/// ureq's default TLS connector is rustls whenever its `tls` feature is on and
+/// nothing at all when it is off. The macOS manifest turns `tls` off so the
+/// bundled Mozilla roots cannot stand in for Security.framework, which leaves
+/// the connector to be installed here.
+#[cfg(target_os = "macos")]
+fn agent_builder() -> Result<ureq::AgentBuilder, String> {
+    let connector = Arc::new(
+        ureq::native_tls::TlsConnector::new()
+            .map_err(|e| format!("cannot initialise TLS ({e})"))?,
+    );
+    Ok(ureq::AgentBuilder::new().tls_connector(connector))
+}
+
+/// rustls is compiled in here and is ureq's own default connector, so the
+/// agent needs no TLS setup of its own.
+#[cfg(target_os = "linux")]
+fn agent_builder() -> Result<ureq::AgentBuilder, String> {
+    Ok(ureq::AgentBuilder::new())
+}
+
 // ureq treats every 4xx/5xx as an error, but the seam's contract says the
 // status rides as data - the update path wants to say "HTTP 404" in its
 // message and the transcribe path keys off the status itself. So status
@@ -83,33 +108,43 @@ fn finish(resp: ureq::Response) -> Result<Response, String> {
 /// WinHTTP sets none either - an overall clock is what cut a long upload short.
 /// They are built once rather than per call so the connection pool survives,
 /// which is what the global agent behind `ureq::get` would have provided.
-static REST_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-static DOWNLOAD_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+static REST_AGENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
+static DOWNLOAD_AGENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
 
-fn rest_agent() -> &'static ureq::Agent {
-    REST_AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(REST_CONNECT_TIMEOUT)
-            .timeout_read(REST_IO_TIMEOUT)
-            .timeout_write(REST_IO_TIMEOUT)
-            .build()
-    })
+fn rest_agent() -> Result<&'static ureq::Agent, String> {
+    REST_AGENT
+        .get_or_init(|| {
+            agent_builder().map(|builder| {
+                builder
+                    .timeout_connect(REST_CONNECT_TIMEOUT)
+                    .timeout_read(REST_IO_TIMEOUT)
+                    .timeout_write(REST_IO_TIMEOUT)
+                    .build()
+            })
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
 }
 
-fn download_agent() -> &'static ureq::Agent {
-    DOWNLOAD_AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(DOWNLOAD_CONNECT_TIMEOUT)
-            .timeout_read(DOWNLOAD_IO_TIMEOUT)
-            .timeout_write(DOWNLOAD_IO_TIMEOUT)
-            .build()
-    })
+fn download_agent() -> Result<&'static ureq::Agent, String> {
+    DOWNLOAD_AGENT
+        .get_or_init(|| {
+            agent_builder().map(|builder| {
+                builder
+                    .timeout_connect(DOWNLOAD_CONNECT_TIMEOUT)
+                    .timeout_read(DOWNLOAD_IO_TIMEOUT)
+                    .timeout_write(DOWNLOAD_IO_TIMEOUT)
+                    .build()
+            })
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
 }
 
 /// A GET with an `Accept` header. Redirects are followed - the contract.
 pub fn get(url: &str, accept: &str) -> Result<Response, String> {
     ensure_tls_ready();
-    match download_agent().get(url).set("Accept", accept).call() {
+    match download_agent()?.get(url).set("Accept", accept).call() {
         Ok(resp) => finish(resp),
         Err(ureq::Error::Status(_, resp)) => finish(resp),
         Err(e) => Err(format!("{e}")),
@@ -125,7 +160,7 @@ pub fn post(
     body: &[u8],
 ) -> Result<Response, String> {
     ensure_tls_ready();
-    let mut req = rest_agent().post(url).set("Content-Type", content_type);
+    let mut req = rest_agent()?.post(url).set("Content-Type", content_type);
     if let Some(auth) = auth {
         req = req.set("Authorization", auth);
     }
@@ -253,9 +288,9 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
 /// The transport for both Unix backends.
 ///
 /// Linux and macOS differ only in their TLS stack, and that difference is
-/// already decided by Cargo.toml's per-target features plus `ensure_tls_ready`,
-/// so one type serves both. What genuinely differs per platform - the audio
-/// device and the injector - stays in `linux_impl` and `macos_impl`.
+/// already decided by Cargo.toml's per-target features plus the setup each
+/// side needs, so one type serves both. What genuinely differs per platform -
+/// the audio device and the injector - stays in `linux_impl` and `macos_impl`.
 pub struct UnixTransport;
 
 impl Transport for UnixTransport {

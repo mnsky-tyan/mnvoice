@@ -99,9 +99,10 @@ pub trait Transport {
 /// The transport for this build.
 ///
 /// Windows has its own WinHTTP client; Linux and macOS share one pure-Rust
-/// client whose TLS stack is chosen per target by Cargo.toml's features and by
-/// `unix_http::ensure_tls_ready` (rustls needs an explicit crypto provider on
-/// Linux, macOS rides the platform's verifier through native-tls).
+/// client whose TLS stack is chosen per target by Cargo.toml's features. Linux
+/// installs rustls' crypto provider through `unix_http::ensure_tls_ready`;
+/// macOS gets Security.framework through native-tls, whose connector
+/// `unix_http::agent_builder` installs on each agent.
 ///
 /// Each backend pins the redirect contract through this name in its own tests:
 /// Windows in update.rs, where the updater is the caller, and Unix in
