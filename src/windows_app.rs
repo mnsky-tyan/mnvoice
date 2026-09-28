@@ -8,6 +8,7 @@ use crate::config;
 use crate::orb;
 use crate::paste;
 use crate::platform;
+use crate::platform::windows_impl::wide;
 use crate::rest;
 use crate::stream;
 use crate::update;
@@ -142,10 +143,6 @@ pub(crate) fn log(msg: &str) {
             .unwrap_or(0);
         let _ = writeln!(f, "[{secs}] {msg}");
     }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Terminate any other running mnvoice.exe instances so they release the global

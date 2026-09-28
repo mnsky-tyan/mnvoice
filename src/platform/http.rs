@@ -112,7 +112,7 @@ pub use crate::platform::unix_http::UnixTransport as NativeTransport;
 /// object a caller gets - without reaching into a specific backend module.
 /// Windows keeps its test inside update.rs, where the updater calls through
 /// the same name.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn native_transport_for_tests() -> Box<dyn Transport> {
     Box::new(NativeTransport)
 }

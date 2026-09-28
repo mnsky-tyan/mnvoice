@@ -25,7 +25,9 @@ const WINHTTP_QUERY_STATUS: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
 /// Build a NUL-terminated UTF-16 buffer for the wide-string Win32 APIs.
-fn wide(s: &str) -> Vec<u16> {
+/// Shared with the tray app, which needs the same conversion for its own
+/// window and tooltip text.
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 

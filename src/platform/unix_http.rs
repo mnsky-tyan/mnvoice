@@ -21,7 +21,7 @@
 use crate::platform::http::{Response, Transport, WebSocket};
 use std::io::Read as _;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
@@ -31,14 +31,18 @@ use tungstenite::Message;
 use tungstenite::http as http;
 use tungstenite::WebSocket as WsRaw;
 
-/// Overall bound on a REST request. ureq's own defaults put no limit on the
-/// socket reads at all, so a proxy or captive portal that completes the TCP
-/// handshake and then goes silent would hold the CLI forever; the Windows
-/// backend this replaces bounds the same call through WinHttpSetTimeouts.
-const REST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-phase bounds on a REST request, mirroring the WinHTTP session this
+/// replaces: `WinHttpSetTimeouts` bounds connect, send and receive separately,
+/// and a max-length clip has to clear the upload and the provider's transcode
+/// as two budgets rather than sharing one clock. One overall timeout covered
+/// both, so a slow uplink plus a slow transcode failed where the Windows build
+/// succeeded.
+const REST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REST_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Overall bound on an updater download, matching the Windows GET's budget.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
+/// Per-phase bounds on an updater download, same shape as the Windows GET.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DOWNLOAD_IO_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Bound on the TCP connect and on the WebSocket handshake that follows it.
 /// Windows bounds the same steps; std's and ureq's defaults are either looser
@@ -73,14 +77,39 @@ fn finish(resp: ureq::Response) -> Result<Response, String> {
     Ok(Response { status, body })
 }
 
+/// One agent per request shape, so each mirrors a WinHTTP session's timeout
+/// split. ureq's `timeout_connect`/`timeout_read`/`timeout_write` map onto
+/// WinHTTP's connect/send/receive, and no overall timeout is set because
+/// WinHTTP sets none either - an overall clock is what cut a long upload short.
+/// They are built once rather than per call so the connection pool survives,
+/// which is what the global agent behind `ureq::get` would have provided.
+static REST_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+static DOWNLOAD_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn rest_agent() -> &'static ureq::Agent {
+    REST_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(REST_CONNECT_TIMEOUT)
+            .timeout_read(REST_IO_TIMEOUT)
+            .timeout_write(REST_IO_TIMEOUT)
+            .build()
+    })
+}
+
+fn download_agent() -> &'static ureq::Agent {
+    DOWNLOAD_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(DOWNLOAD_CONNECT_TIMEOUT)
+            .timeout_read(DOWNLOAD_IO_TIMEOUT)
+            .timeout_write(DOWNLOAD_IO_TIMEOUT)
+            .build()
+    })
+}
+
 /// A GET with an `Accept` header. Redirects are followed - the contract.
 pub fn get(url: &str, accept: &str) -> Result<Response, String> {
     ensure_tls_ready();
-    match ureq::get(url)
-        .set("Accept", accept)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .call()
-    {
+    match download_agent().get(url).set("Accept", accept).call() {
         Ok(resp) => finish(resp),
         Err(ureq::Error::Status(_, resp)) => finish(resp),
         Err(e) => Err(format!("{e}")),
@@ -96,11 +125,11 @@ pub fn post(
     body: &[u8],
 ) -> Result<Response, String> {
     ensure_tls_ready();
-    let mut req = ureq::post(url).set("Content-Type", content_type);
+    let mut req = rest_agent().post(url).set("Content-Type", content_type);
     if let Some(auth) = auth {
         req = req.set("Authorization", auth);
     }
-    match req.timeout(REST_TIMEOUT).send(body) {
+    match req.send(body) {
         Ok(resp) => finish(resp),
         Err(ureq::Error::Status(_, resp)) => finish(resp),
         Err(e) => Err(format!("{e}")),
@@ -344,10 +373,11 @@ impl WebSocket for UnixSocket {
 // timeout therefore bounds only how long the mutex can be held, which is what
 // keeps a send on the main thread moving while the provider is quiet.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    // `Read` comes in through `super::*`; only `Write` is new here.
+    use std::io::Write as _;
 
     /// The Windows backend has this exact test in update.rs, because the
     /// updater lives there. The contract belongs to the transport, not the
