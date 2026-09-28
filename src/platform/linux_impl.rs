@@ -4,18 +4,18 @@
 // layer, so both the raw-ALSA and PipeWire worlds arrive through the same
 // Audio impl.
 //
-// Typing is X11 XTest via enigo. On Wayland this reaches only XWayland
-// clients; native Wayland windows need the input portal, which is not built
-// yet. That limitation is stated here rather than papered over: type_text
-// surfaces the failure instead of dropping words, and the release notes say
-// the same thing.
+// Typing is X11 XTest via enigo, so injected keys reach X11 and XWayland
+// windows only. A native Wayland window receives nothing and nothing on this
+// path can detect that, so the limitation is stated here rather than papered
+// over: a missing X display is the only failure the binary reports, and the
+// guard is to use an X session or wait for the input portal.
 
 use crate::platform::input::Injector;
 use enigo::{Enigo, Keyboard, Settings};
 use std::sync::Mutex;
 
-/// Text injection through XTest. XWayland sessions work; native Wayland
-/// windows will refuse injection until the portal path exists.
+/// Text injection through XTest. X11 and XWayland windows receive the keys; a
+/// native Wayland window receives nothing, and nothing here can detect that.
 pub fn default_injector() -> &'static dyn Injector {
     use std::sync::OnceLock;
     static INJECTOR: OnceLock<X11Injector> = OnceLock::new();

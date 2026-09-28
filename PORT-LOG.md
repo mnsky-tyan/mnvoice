@@ -56,8 +56,9 @@ Reverse-chronological. Every claim links to a check that was run.
 
 ## Deferred, on purpose
 
-- Wayland-native input (portal): X11/XWayland ships; the failure is surfaced,
-  not silent.
+- Wayland-native input (portal): X11/XWayland ships; a native Wayland window receives
+  nothing and nothing on this path can detect that, so the limit is stated in
+  the README rather than papered over.
 - Orb, tray, hotkeys, single-instance, autostart, self-update on Unix: all
   Windows-native surfaces; the updater especially (running-image swap) is
   per-platform work. README documents all of it.

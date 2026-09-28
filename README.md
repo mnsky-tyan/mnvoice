@@ -385,9 +385,10 @@ rather than a tray icon:
 
 Known limits in this release, stated rather than papered over:
 
-- **Linux typing is X11/XWayland.** Native Wayland windows will not receive
-  injected keys until the input-capture portal path is built; the binary
-  reports the failure instead of dropping words silently.
+- **Linux typing is X11/XWayland.** Typed keys reach X11 and XWayland
+  windows; a native Wayland window receives nothing, and nothing on this path
+  can detect that. A missing X display is the only failure the binary reports,
+  so the guard is to use an X session or wait for the input-capture portal path.
 - **macOS typing needs permission.** Grant the binary Accessibility under
   System Settings > Privacy & Security > Accessibility; without it the
   first injection fails with an error naming the exact setting.
