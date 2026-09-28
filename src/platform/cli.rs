@@ -117,6 +117,11 @@ where
         if lines.recv().is_err() {
             break;
         }
+        // Every line already queued is stale: it arrived while the previous
+        // dictation was transcribing, so it belongs to no recording. The
+        // recording loop's "Enter again" control would otherwise take one and
+        // stop the next dictation before it had captured any audio at all.
+        while lines.try_recv().is_ok() {}
         if let Err(e) = dictate() {
             println!("dictation failed: {e}");
         }
@@ -292,21 +297,26 @@ mod tests {
     fn a_failed_dictation_does_not_end_the_session() {
         let (tx, rx) = mpsc::channel::<()>();
         tx.send(()).unwrap();
-        tx.send(()).unwrap();
-        drop(tx);
+        // The sender is kept, not dropped: the next Enter is pressed once the
+        // failed dictation is over, and the channel has to close with that
+        // press or the loop never sees stdin end.
+        let mut next_press = Some(tx);
 
         let mut attempts = 0usize;
         let result = dictation_loop(&rx, || {
             attempts += 1;
             if attempts == 1 {
+                if let Some(tx) = next_press.take() {
+                    tx.send(()).unwrap();
+                }
                 Err("streaming error: handshake failed".to_string())
             } else {
                 Ok(())
             }
         });
 
-        // The loop only ever ends on a closed stdin, and every line the user
-        // pressed Enter for still gets a dictation.
+        // The loop only ever ends on a closed stdin, and a failure costs one
+        // attempt rather than the session.
         assert_eq!(result, Ok(()));
         assert_eq!(attempts, 2);
     }
@@ -325,5 +335,39 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(attempts, 0);
+    }
+
+    /// A line that arrives while a dictation is transcribing is stale by the
+    /// time the next one starts. The recording loop reads the same channel as
+    /// its "Enter again" control, so a queued line reaches it and stops the
+    /// next dictation before it captured any audio - a double-tap during the
+    /// streaming wait silently burns the following attempt.
+    #[test]
+    fn stale_lines_do_not_stop_the_next_dictation() {
+        let (tx, rx) = mpsc::channel::<()>();
+        // One line starts the dictation; two more arrive while it transcribes,
+        // which is what a double-tap during the streaming wait produces.
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        drop(tx);
+
+        let mut attempts = 0usize;
+        let mut stale = 0usize;
+        let result = dictation_loop(&rx, || {
+            attempts += 1;
+            // What the recording loop's "Enter again" control would see.
+            if rx.try_recv().is_ok() {
+                stale += 1;
+            }
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            attempts, 1,
+            "only the line that started it may begin a dictation"
+        );
+        assert_eq!(stale, 0, "no stale line may reach the recording loop");
     }
 }
