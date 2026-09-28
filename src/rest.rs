@@ -37,18 +37,22 @@ pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
 /// A `BASE_URL` that already carries a path is the whole endpoint: that is how
 /// a custom endpoint or a reverse proxy is configured, so the default path is
 /// appended only when the base URL has none. Appending it anyway would ask the
-/// provider for `/deepgram/deepgram`.
+/// provider for `/deepgram/deepgram`. The base URL is used exactly as written
+/// rather than trimmed, because a trailing slash in it is part of the
+/// configured endpoint - the Windows release this port must not change posts
+/// to that path verbatim, and trimming it would send the request somewhere
+/// else (an empty path, for a base URL whose path is just `/`).
 fn endpoint_url(base_url: &str) -> Result<String, String> {
     let (host, _port, _secure, base_path) = parse_base_url(base_url)?;
     if !base_path.is_empty() {
-        return Ok(base_url.trim_end_matches('/').to_string());
+        return Ok(base_url.to_string());
     }
     let endpoint_path = if host.contains("groq.com") {
         "/openai/v1/audio/transcriptions"
     } else {
         "/v1/audio/transcriptions"
     };
-    Ok(format!("{}{endpoint_path}", base_url.trim_end_matches('/')))
+    Ok(format!("{base_url}{endpoint_path}"))
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -246,10 +250,16 @@ mod tests {
             endpoint_url("https://stt.corp:8443/listen").unwrap(),
             "https://stt.corp:8443/listen"
         );
+        // A trailing slash is part of the configured endpoint, so it is kept.
+        // Trimming it changed where the request went: the Windows release this
+        // port must not change posts to that path verbatim.
         assert_eq!(
             endpoint_url("https://stt.corp/deepgram/").unwrap(),
-            "https://stt.corp/deepgram"
+            "https://stt.corp/deepgram/"
         );
+        // The sharpest case: a base URL whose path is just "/". Trimming it
+        // left an empty path, which is not a request the transport can make.
+        assert_eq!(endpoint_url("https://host/").unwrap(), "https://host/");
     }
 
     #[test]
