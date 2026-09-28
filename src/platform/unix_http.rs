@@ -20,7 +20,7 @@
 
 use crate::platform::http::{Response, Transport, WebSocket};
 use std::io::Read as _;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -115,7 +115,13 @@ pub fn post(
 /// only serializes the library calls, and neither call holds it across a
 /// network wait that the other side did not ask for - the socket carries a
 /// short read timeout, so a quiet provider releases the lock between polls.
-pub struct UnixSocket(Arc<Mutex<WsRaw<MaybeTlsStream<TcpStream>>>>);
+pub struct UnixSocket {
+    socket: Arc<Mutex<WsRaw<MaybeTlsStream<TcpStream>>>>,
+    /// The handle `close` terminates the connection through. The stream itself
+    /// moves into the TLS wrapper, so shutting the socket down needs a second
+    /// descriptor on it.
+    shutdown: TcpStream,
+}
 
 /// How long the reader waits for a frame before releasing the lock, and how
 /// long it stands off before trying again. Both are the same number because
@@ -187,7 +193,10 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
         .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))
         .map_err(|e| format!("websocket socket setup failed ({e})"))?;
 
-    Ok(UnixSocket(Arc::new(Mutex::new(socket))))
+    Ok(UnixSocket {
+        socket: Arc::new(Mutex::new(socket)),
+        shutdown: options,
+    })
 }
 
 /// Connects to `host:port`, trying every address it resolves to with `timeout`
@@ -246,7 +255,7 @@ impl Transport for UnixTransport {
 
 impl WebSocket for UnixSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
-        self.0
+        self.socket
             .lock()
             .map_err(|_| "websocket lock poisoned".to_string())?
             .send(Message::Binary(data.to_vec().into()))
@@ -254,7 +263,7 @@ impl WebSocket for UnixSocket {
     }
 
     fn send_text(&self, text: &str) -> Result<(), String> {
-        self.0
+        self.socket
             .lock()
             .map_err(|_| "websocket lock poisoned".to_string())?
             .send(Message::Text(text.to_owned().into()))
@@ -262,20 +271,25 @@ impl WebSocket for UnixSocket {
     }
 
     fn close(&self) {
-        if let Ok(mut ws) = self.0.lock() {
+        if let Ok(mut ws) = self.socket.lock() {
             // A close frame asks the server to shut down; the reply arrives on
             // whichever thread reads next. We do not wait for it - the caller
             // means "stop now".
             let _ = ws.send(Message::Close(None));
             let _ = ws.flush();
         }
+        // The frame alone does not end the connection, and a peer that has
+        // stopped answering never replies to one. Terminating the socket is
+        // what lets a reader parked in `read` return, so the caller's join
+        // over its reader thread stays bounded.
+        let _ = self.shutdown.shutdown(Shutdown::Both);
     }
 
     fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
         let _ = timeout_ms; // see the note below
         loop {
             let mut ws = self
-                .0
+                .socket
                 .lock()
                 .map_err(|_| "websocket lock poisoned".to_string())?;
             match ws.read() {
@@ -388,5 +402,67 @@ mod tests {
         assert_eq!(response.body, final_body.to_vec());
         redirect_thread.join().unwrap();
         final_thread.join().unwrap();
+    }
+
+    /// `close` is the last thing the streaming loop does before it joins its
+    /// reader thread, and the trait promises it shuts the connection down. A
+    /// peer that completes the handshake and then goes silent leaves that
+    /// reader parked in `read`, so unless the socket itself is terminated the
+    /// join never returns - the same thing WinHTTP's close does.
+    #[test]
+    fn close_unblocks_a_reader_waiting_on_a_silent_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let len = conn.read(&mut buf).unwrap();
+            let key = String::from_utf8_lossy(&buf[..len])
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap()
+                .trim()
+                .to_string();
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            // The provider has answered the handshake and now says nothing
+            // more: the connection stays open until the client goes away.
+            let mut sink = [0u8; 512];
+            while let Ok(n) = conn.read(&mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let socket = Arc::new(websocket(&format!("ws://{addr}/"), &[]).unwrap());
+        let reader_socket = Arc::clone(&socket);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = outcome_tx.send(reader_socket.read(1000));
+        });
+
+        // Let the reader park inside `read` before asking the socket to stop.
+        thread::sleep(Duration::from_millis(200));
+        socket.close();
+
+        match outcome_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(outcome) => assert!(
+                !matches!(outcome, Ok(Some(_))),
+                "a peer that never sent a frame must not produce one"
+            ),
+            Err(_) => panic!("close left a reader waiting for a frame from a silent peer"),
+        }
+        reader.join().unwrap();
+        server.join().unwrap();
     }
 }

@@ -354,7 +354,9 @@ cargo test
 ```
 
 Linux: needs `libasound2-dev` and `pkg-config` (ALSA headers; PipeWire
-arrives through its ALSA layer). macOS: nothing extra.
+arrives through its ALSA layer). The released binary also links
+`libxkbcommon`, which the injector needs on Linux whichever backend it uses,
+so install `libxkbcommon0` if it is not already present. macOS: nothing extra.
 
 ```bash
 cargo build --release
