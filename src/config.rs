@@ -25,9 +25,14 @@ pub struct Config {
     pub orb_color: (f32, f32, f32),
     #[cfg_attr(not(windows), allow(dead_code))]
     pub orb_fluid_level: f32,
+    // Windows-only settings; they ride along for the same round-trip reason.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub hotkey: (u32, u32),
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub hotkey_str: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub cancel_key: (u32, u32),
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub cancel_key_str: String,
     pub vad_silence_ms: u32,
     pub vad_rms_threshold: f64,
@@ -35,6 +40,7 @@ pub struct Config {
     /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
     pub strip_fillers: bool,
     /// Install a newer published release automatically when one appears.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub auto_update: bool,
 }
 

@@ -29,7 +29,6 @@ pub mod audio;
 pub mod cli;
 pub mod http;
 pub mod input;
-pub mod native;
 
 #[cfg(windows)]
 pub mod windows_impl;

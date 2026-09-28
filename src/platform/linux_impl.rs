@@ -10,13 +10,7 @@
 // surfaces the failure instead of dropping words, and the release notes say
 // the same thing.
 
-use crate::platform::audio::Audio;
 use crate::platform::input::Injector;
-
-/// Audio capture through ALSA / PipeWire (via its ALSA layer).
-pub fn audio() -> Result<impl Audio, String> {
-    crate::platform::unix_audio::CpalAudio::new()
-}
 
 /// Text injection through XTest. XWayland sessions work; native Wayland
 /// windows will refuse injection until the portal path exists.

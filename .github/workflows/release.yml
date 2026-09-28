@@ -106,8 +106,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install ALSA headers (cpal needs libasound at build time)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Install build dependencies (ALSA and xkbcommon headers)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

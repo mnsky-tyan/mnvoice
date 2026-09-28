@@ -7,13 +7,7 @@
 // dropping words silently, which is the best a CLI binary can do - an
 // app-bundle build could prompt, and that is the follow-up.
 
-use crate::platform::audio::Audio;
 use crate::platform::input::Injector;
-
-/// Audio capture through CoreAudio.
-pub fn audio() -> Result<impl Audio, String> {
-    crate::platform::unix_audio::CpalAudio::new()
-}
 
 /// Text injection through CoreGraphics events, gated by the Input Monitoring
 /// permission.

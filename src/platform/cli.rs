@@ -6,7 +6,7 @@
 // Windows uses. Enter starts, the voice-activity detector or Enter stops.
 
 use crate::config;
-use crate::platform::{audio, input};
+use crate::platform::{audio, input, unix_audio};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -42,7 +42,7 @@ pub fn run() -> Result<(), String> {
         )
     })?;
 
-    let engine = crate::platform::native::audio()?;
+    let engine = unix_audio::CpalAudio::new()?;
 
     println!("mnvoice v{}", crate::platform::version());
     println!(
