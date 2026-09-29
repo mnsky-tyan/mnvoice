@@ -6,7 +6,8 @@ Reverse-chronological. Every claim links to a check that was run.
 
 - `update.rs` http_get, `rest.rs` transcribe, `stream.rs` handshake+read loop
   all go through `platform::http::{Transport, WebSocket}` now.
-- Check: `git grep "Win32::Networking::WinHttp" -- ':!src/platform'` -> empty.
+- Check: no WinHTTP import survives outside the seam module (the grep command
+  in the goal contract returns empty).
 - Windows tests stayed green throughout (47 -> 48 by the end).
 
 ## Stage: Audio and Injector traits
