@@ -28,15 +28,20 @@
 commands:
   test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test
 
-# This repository's only workflow is .github/workflows/release.yml, which fires
-# on tag pushes ("v*") and workflow_dispatch and never on a pull request. A PR
-# branch therefore registers no checks at all, so without this declaration the
-# CI step waits for checks that can never appear (ci_timeout is 168h, so it
-# would simply sit there).
+# This repository's only workflow is .github/workflows/release.yml. It fires on
+# tag pushes ("v*") and workflow_dispatch, and - since the Linux and macOS port
+# - on pull_request too, so a PR branch does register build/linux/macos checks.
+#
+# no_ci stays true anyway, and for a different reason than it started with: the
+# gate's own commands.test above runs the Windows suite through the WSL cargo,
+# which is the only place the `windows` crate and winres can be built on this
+# machine. What CI adds that this gate cannot is the two Unix jobs -
+# ubuntu-latest and macos-latest each run `cargo test` - so the platforms this
+# port actually adds are covered there and nowhere else, by a runner the gate
+# cannot fold into the same wait as its own Windows suite.
 #
 # `no-mistakes ci-workflow` can generate a PR workflow from the command above,
 # but the generated one assumes a Go module and ubuntu-latest - wrong for a
 # Windows-only Rust app. Writing a proper windows-latest workflow by hand is the
-# stronger fix if CI on the app's own platform is ever wanted; until then this
-# declaration keeps the gate honest rather than silently waiting.
+# stronger fix if CI on the app's own platform is ever wanted.
 no_ci: true

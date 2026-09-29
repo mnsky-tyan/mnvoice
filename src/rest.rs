@@ -1,133 +1,58 @@
-// Generic WinHTTP-based REST client for OpenAI-compatible speech-to-text endpoints.
+// REST client for OpenAI-compatible speech-to-text endpoints.
 // Compatible with any standard audio/transcriptions endpoint (self-hosted Whisper, Groq, OpenAI, etc.).
-// Native TLS, system cert store, respects Windows system proxy settings.
-
-use windows::Win32::Networking::WinHttp::*;
-use windows::core::{w, PCWSTR};
+// Requests go through the platform transport seam: WinHTTP with the system cert store and
+// proxy settings on Windows, ureq with rustls (bundled roots) or native-tls elsewhere.
 
 use crate::config::Config;
+use crate::platform::http::Transport;
 
 const BOUNDARY: &str = "mnvoiceboundary9f2a";
-const WINHTTP_ADDREQUEST_HEADER_FLAG: u32 = 0x2000_0000; // add or replace
-// The windows crate does not export these two, and both WinHTTP clients here
-// need the same pair.
-pub(crate) const WINHTTP_QUERY_STATUS: u32 = 19;
-pub(crate) const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn wptr(v: &[u16]) -> PCWSTR {
-    PCWSTR(v.as_ptr())
-}
 
 /// Transcribe a WAV clip using an OpenAI-compatible REST endpoint. Returns plain text.
 pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
-    unsafe {
-        let session = WinHttpOpen(
-            w!("mnvoice/0.1"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("cannot create HTTP session".into());
-        }
-        WinHttpSetTimeouts(session, 0, 10_000, 30_000, 30_000)
-            .map_err(|e| format!("set timeouts ({e})"))?;
+    let url = endpoint_url(&cfg.base_url)?;
+    let body = multipart_body(cfg, wav);
+    let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
 
-        let (host, port, secure, base_path) = parse_base_url(&cfg.base_url)?;
-        let host_w = wide(&host);
-        let connect = WinHttpConnect(session, wptr(&host_w), port, 0);
-        if connect.is_null() {
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("cannot connect to {host}"));
-        }
+    let response = crate::platform::http::NativeTransport
+        .post(&url, Some(&format!("Bearer {}", cfg.api_key)), &content_type, &body)?;
 
-        let endpoint_path = if !base_path.is_empty() {
-            base_path
-        } else if host.contains("groq.com") {
-            "/openai/v1/audio/transcriptions".to_string()
-        } else {
-            "/v1/audio/transcriptions".to_string()
-        };
-
-        let headers_str = format!(
-            "Authorization: Bearer {}\r\nContent-Type: multipart/form-data; boundary={}\r\n",
-            cfg.api_key, BOUNDARY
-        );
-        let body = multipart_body(cfg, wav);
-
-        let path_w = wide(&endpoint_path);
-        let request = WinHttpOpenRequest(
-            connect,
-            w!("POST"),
-            wptr(&path_w),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            if secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) },
-        );
-        if request.is_null() {
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err("cannot create HTTP request".into());
-        }
-
-        let headers_w = wide(&headers_str);
-
-        let result = (|| {
-            WinHttpAddRequestHeaders(
-                request,
-                &headers_w[..headers_w.len() - 1],
-                WINHTTP_ADDREQUEST_HEADER_FLAG,
-            )?;
-            WinHttpSendRequest(
-                request,
-                None,
-                Some(body.as_ptr() as *const std::ffi::c_void),
-                body.len() as u32,
-                body.len() as u32,
-                0,
-            )?;
-            WinHttpReceiveResponse(request, std::ptr::null_mut())?;
-            Ok::<(), windows::core::Error>(())
-        })();
-        if let Err(e) = result {
-            let _ = WinHttpCloseHandle(request);
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("request failed ({e})"));
-        }
-
-        let mut status: u32 = 0;
-        let mut len = std::mem::size_of::<u32>() as u32;
-        let mut index = 0u32;
-        let _ = WinHttpQueryHeaders(
-            request,
-            WINHTTP_QUERY_STATUS | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status as *mut u32 as *mut std::ffi::c_void),
-            &mut len,
-            &mut index,
-        );
-
-        let response = read_all(request);
-        let _ = WinHttpCloseHandle(request);
-        let _ = WinHttpCloseHandle(connect);
-        let _ = WinHttpCloseHandle(session);
-
-        if status != 200 {
-            let preview: String = String::from_utf8_lossy(&response).chars().take(200).collect();
-            return Err(format!("ASR endpoint returned HTTP {status}: {preview}"));
-        }
-
-        let raw_text = String::from_utf8_lossy(&response);
-        let parsed = parse_json_transcript(&raw_text).unwrap_or_else(|| raw_text.trim().to_string());
-        Ok(parsed.trim().to_string())
+    if response.status != 200 {
+        let preview: String =
+            String::from_utf8_lossy(&response.body).chars().take(200).collect();
+        return Err(format!(
+            "ASR endpoint returned HTTP {}: {preview}",
+            response.status
+        ));
     }
+
+    let raw_text = String::from_utf8_lossy(&response.body);
+    let parsed =
+        parse_json_transcript(&raw_text).unwrap_or_else(|| raw_text.trim().to_string());
+    Ok(parsed.trim().to_string())
+}
+
+/// The URL a transcription POST goes to.
+///
+/// A `BASE_URL` that already carries a path is the whole endpoint: that is how
+/// a custom endpoint or a reverse proxy is configured, so the default path is
+/// appended only when the base URL has none. Appending it anyway would ask the
+/// provider for `/deepgram/deepgram`. The base URL is used exactly as written
+/// rather than trimmed, because a trailing slash in it is part of the
+/// configured endpoint - the Windows release this port must not change posts
+/// to that path verbatim, and trimming it would send the request somewhere
+/// else (an empty path, for a base URL whose path is just `/`).
+fn endpoint_url(base_url: &str) -> Result<String, String> {
+    let (host, _port, _secure, base_path) = parse_base_url(base_url)?;
+    if !base_path.is_empty() {
+        return Ok(base_url.to_string());
+    }
+    let endpoint_path = if host.contains("groq.com") {
+        "/openai/v1/audio/transcriptions"
+    } else {
+        "/v1/audio/transcriptions"
+    };
+    Ok(format!("{base_url}{endpoint_path}"))
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -177,27 +102,6 @@ pub fn parse_json_transcript(json: &str) -> Option<String> {
     None
 }
 
-fn read_all(request: *mut std::ffi::c_void) -> Vec<u8> {
-    unsafe {
-        let mut out = Vec::new();
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            let mut read = 0u32;
-            let ok = WinHttpReadData(
-                request,
-                chunk.as_mut_ptr() as *mut std::ffi::c_void,
-                chunk.len() as u32,
-                &mut read,
-            );
-            if ok.is_err() || read == 0 {
-                break;
-            }
-            out.extend_from_slice(&chunk[..read as usize]);
-        }
-        out
-    }
-}
-
 /// Disfluency tokens. These are vocal stumbles that carry no meaning in
 /// dictation, so dropping them cannot change what was said.
 ///
@@ -219,13 +123,34 @@ pub fn is_disfluency(word: &str) -> bool {
 }
 
 /// Remove disfluency tokens from a transcript and normalise whitespace.
-/// Used on the REST path, where no provider has a native filler_words parameter,
-/// and on the streaming path as a safety net for providers that ignore it.
+/// Used on the REST path, where no provider has a native filler_words
+/// parameter, so the local stoplist is the only filter. The streaming path
+/// filters word-by-word as commits arrive (see stream.rs), which is why this
+/// does not appear there.
 pub fn strip_disfluencies(text: &str) -> String {
     text.split_whitespace()
         .filter(|w| !is_disfluency(w))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// What the REST path types for a transcript, and whether a trailing space
+/// follows it.
+///
+/// FILLER_WORDS=1 keeps the transcript verbatim - the streaming path asks the
+/// provider for that instead, because REST has no such parameter anywhere -
+/// and TRAILING_SPACE only ever appends to text that was actually typed. Both
+/// control surfaces state the rule the same way; it lives here because the
+/// Windows tray and the Unix terminal CLI would otherwise each keep their own
+/// copy and drift.
+pub fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
+    let text = if strip_fillers {
+        strip_disfluencies(raw.trim())
+    } else {
+        raw.trim().to_string()
+    };
+    let space = trailing_space && !text.is_empty();
+    (text, space)
 }
 
 pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> {
@@ -313,8 +238,87 @@ mod tests {
     }
 
     #[test]
+    fn test_endpoint_url_uses_a_configured_path_verbatim() {
+        // A custom endpoint or reverse proxy is configured as a BASE_URL that
+        // already carries the path, so the default path must not be appended
+        // to it a second time.
+        assert_eq!(
+            endpoint_url("https://stt.corp/deepgram").unwrap(),
+            "https://stt.corp/deepgram"
+        );
+        assert_eq!(
+            endpoint_url("https://stt.corp:8443/listen").unwrap(),
+            "https://stt.corp:8443/listen"
+        );
+        // A trailing slash is part of the configured endpoint, so it is kept.
+        // Trimming it changed where the request went: the Windows release this
+        // port must not change posts to that path verbatim.
+        assert_eq!(
+            endpoint_url("https://stt.corp/deepgram/").unwrap(),
+            "https://stt.corp/deepgram/"
+        );
+        // The sharpest case: a base URL whose path is just "/". Trimming it
+        // left an empty path, which is not a request the transport can make.
+        assert_eq!(endpoint_url("https://host/").unwrap(), "https://host/");
+    }
+
+    #[test]
+    fn test_endpoint_url_appends_the_default_path_only_when_absent() {
+        assert_eq!(
+            endpoint_url("https://api.deepgram.com").unwrap(),
+            "https://api.deepgram.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            endpoint_url("https://api.groq.com").unwrap(),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            endpoint_url("http://localhost:8000").unwrap(),
+            "http://localhost:8000/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
     fn test_strip_disfluencies_removes_fillers() {
         assert_eq!(strip_disfluencies("so um this is uh the plan"), "so this is the plan");
+    }
+
+    /// FILLER_WORDS=1 keeps the transcript verbatim. The streaming path asks
+    /// the provider for that, but REST has no such parameter anywhere, so the
+    /// local stoplist is the only lever - and the setting has to reach it, or a
+    /// user who asked for verbatim gets filtered text with no way to tell.
+    #[test]
+    fn filler_words_off_keeps_the_rest_transcript_verbatim() {
+        let (text, _) = rest_typing("so um this is uh the plan", false, true);
+        assert_eq!(text, "so um this is uh the plan");
+    }
+
+    /// FILLER_WORDS=0 (the default) strips, on REST exactly as it strips
+    /// everywhere else.
+    #[test]
+    fn filler_words_on_strips_the_rest_transcript() {
+        let (text, _) = rest_typing("so um this is uh the plan", true, true);
+        assert_eq!(text, "so this is the plan");
+    }
+
+    /// TRAILING_SPACE appends after each dictation. The streaming loop and both
+    /// control surfaces do it; without it two consecutive dictations run
+    /// together in the focused window as "hello worldagain".
+    #[test]
+    fn trailing_space_appends_only_after_a_real_transcript() {
+        let (_, space) = rest_typing("hello world", true, true);
+        assert!(space);
+        let (_, space) = rest_typing("hello world", true, false);
+        assert!(!space);
+    }
+
+    /// An empty transcript must not be typed at all, and must not leave a lone
+    /// space behind either.
+    #[test]
+    fn an_empty_rest_transcript_types_nothing() {
+        let (text, space) = rest_typing("   ", true, true);
+        assert!(text.is_empty());
+        assert!(!space);
     }
 
     #[test]

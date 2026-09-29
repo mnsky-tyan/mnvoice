@@ -1,9 +1,9 @@
 # mnvoice
 
-Ultra-low-latency, hands-free push-to-talk dictation for Windows.  
-Press a hotkey, speak naturally - words type directly into whatever window you are using, in real time, with zero clipboard interference.
+Ultra-low-latency, hands-free push-to-talk dictation.  
+Press a hotkey (or a key on Linux and macOS), speak naturally - words type directly into whatever window you are using, in real time, with zero clipboard interference.
 
-Built in native Rust using pure Win32, WASAPI, and WinHTTP. No Electron, no Python, no async runtimes.
+Windows is the flagship: built in native Rust using pure Win32, WASAPI, and WinHTTP, with the tray, the orb and self-update. Linux and macOS run the same engine - same capture path, same streaming protocol, same word-typing - driven from a terminal instead of the tray. No Electron, no Python, no async runtimes.
 
 ```
 mnvoice.exe (~417 KB)
@@ -34,7 +34,11 @@ mnvoice.exe (~417 KB)
 
 ### 1. Download
 
-Grab the latest `mnvoice-windows-x64.zip` from the [Releases](../../releases/latest) page.  
+Releases are per platform, each on its own tag - `vX.Y.Z-win` for Windows,
+`vX.Y.Z-linux` for Linux, `vX.Y.Z-macos` for macOS - and all of them are
+listed on the [Releases](../../releases) page.
+
+Grab `mnvoice-windows-x64.zip` from the latest `-win` release.  
 Extract it - you get three files:
 
 ```
@@ -286,6 +290,12 @@ mnvoice can update itself. There is no installer and no package manager, so an
 update means: download the new `mnvoice.exe`, move the old one aside, put the new
 one in its place, relaunch.
 
+**Which release.** Releases are per platform, so the feed can list three
+releases carrying the same version. The updater reads the feed and takes the
+newest entry *of its own platform* - a `vX.Y.Z-win` tag, or a bare `vX.Y.Z`
+tag from before the split - and downloads that tag's asset. Another platform's
+entry is never mistaken for one.
+
 **Automatic.** Set `AUTO_UPDATE=1` in `mnvoice.env`. mnvoice then checks
 the release feed at most once per day, and only installs when it is idle - it will
 never swap the binary out from under a transcript in flight.
@@ -310,13 +320,16 @@ preferences carry across every version.
 
 ### Verifying a download
 
-Every release publishes three files:
+Every Windows release publishes three files:
 
 | File | For |
 |---|---|
 | `mnvoice.exe` | Direct download, and what the updater fetches |
 | `mnvoice-windows-x64.zip` | `mnvoice.exe` + `mnvoice.env.example` + `keywords.txt.example` |
 | `SHA256SUMS` | The SHA-256 hash of each of the two files above |
+
+The Linux and macOS releases each publish one binary plus a `.sha256` line
+you check the same way (`sha256sum -c mnvoice-linux-x64.sha256`).
 
 Windows will show a SmartScreen prompt on the first run of any newly downloaded
 copy. That is a reputation check on an unsigned binary, not a virus detection -
@@ -337,7 +350,9 @@ same release asset, so a copy it installed passes the same check.
 
 ## Building from Source
 
-Requires Rust stable with the `x86_64-pc-windows-msvc` target:
+Requires Rust stable.
+
+Windows (the full tray application):
 
 ```cmd
 git clone https://github.com/mnsky-tyan/mnvoice.git
@@ -350,6 +365,57 @@ Binary at `target\release\mnvoice.exe`. Run tests:
 ```cmd
 cargo test
 ```
+
+Linux: needs `libasound2-dev`, `libxkbcommon-dev` and `pkg-config` (ALSA
+headers; PipeWire arrives through its ALSA layer, and the injector links
+xkbcommon whichever backend it uses). The built binary in turn needs
+`libxkbcommon0` at runtime. macOS: nothing extra.
+
+```bash
+cargo build --release
+cargo test
+```
+
+Both produce `target/release/mnvoice`, the terminal-driven dictation tool
+described in the Linux and macOS section below.
+
+## Linux and macOS
+
+The engine is identical - same capture pipeline, same streaming protocol,
+same typing into the focused window - but the control surface is a terminal
+rather than a tray icon:
+
+```bash
+./mnvoice
+```
+
+- Download `mnvoice-linux-x64` (or `mnvoice-macos-arm64`) from the matching
+  `-linux` / `-macos` release, `chmod +x` it, and put the two example files
+  beside it.
+- Put a `mnvoice.env` next to the binary (same format as the Windows one,
+  `API_KEY=...` is all you need) and a `keywords.txt` if you use keyterms.
+- Press **Enter** to start a dictation. Press **Enter** again to stop early;
+  3 s of silence (`VAD_SILENCE_MS`) or the max duration also stops it. Words
+  type into the focused window as they are recognized and echo to stdout.
+  Ctrl+C quits.
+
+Known limits in this release, stated rather than papered over:
+
+- **Linux typing is X11/XWayland.** Typed keys reach X11 and XWayland
+  windows; a native Wayland window receives nothing, and nothing on this path
+  can detect that. A missing X display is the only failure the binary reports,
+  so the guard is to use an X session or wait for the input-capture portal path.
+- **macOS typing needs permission.** Grant the binary Accessibility under
+  System Settings > Privacy & Security > Accessibility; without it the
+  first injection fails with an error naming the exact setting.
+- **No orb, tray, hotkey or self-update yet** on these platforms; capture
+  start is a device open rather than Windows' ~4 ms standby trick, because
+  the audio library has no equivalent.
+- **No proxy support.** Windows resolves a proxy from the system, but the
+  Unix transport dials the provider directly, so `HTTP_PROXY` / `HTTPS_PROXY`
+  / `ALL_PROXY` are ignored on both the REST and the streaming path. A network
+  that only reaches `api.deepgram.com` through a proxy needs a direct route.
+- The updater is Windows-only; check the releases page by hand for now.
 
 ---
 

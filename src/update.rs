@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Networking::WinHttp::*;
-
-use crate::rest::{self, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS};
+use crate::platform::http::Transport;
 
 /// Repository that publishes mnvoice releases.
 const REPO: &str = "mnsky-tyan/mnvoice";
@@ -23,11 +20,9 @@ const REPO: &str = "mnsky-tyan/mnvoice";
 /// version.
 const RELEASES_FEED: &str = "https://github.com/mnsky-tyan/mnvoice/releases.atom";
 
-/// Name of the standalone executable asset published alongside the zip.
-const EXE_ASSET: &str = "mnvoice.exe";
-
 /// What a published release offers: the version to compare against and the
-/// raw exe asset to download.
+/// platform's asset to download. The asset name comes from the platform seam,
+/// so every platform resolves its own artifact from the same release.
 #[derive(Debug)]
 pub struct Release {
     pub version: String,
@@ -68,147 +63,118 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     false
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn wptr(v: &[u16]) -> PCWSTR {
-    PCWSTR(v.as_ptr())
-}
-
 /// Minimal GET against an https URL, returning the whole body.
+///
+/// Routed through the platform seam so the Windows build and the Linux and
+/// macOS ports share one redirect contract. A non-200 is an error here rather
+/// than a `Response`, because a 404 or 403 body must not be mistaken for a
+/// release that names no version, or for an executable missing its MZ header.
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
-    unsafe {
-        let (host, port, secure, path) = rest::parse_base_url(url)?;
-        let session = WinHttpOpen(
-            w!("mnvoice-update"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("cannot create HTTP session".into());
-        }
-        WinHttpSetTimeouts(session, 0, 15_000, 45_000, 45_000)
-            .map_err(|e| format!("set timeouts ({e})"))?;
-
-        let host_w = wide(&host);
-        let connect = WinHttpConnect(session, wptr(&host_w), port, 0);
-        if connect.is_null() {
-            let _ = WinHttpCloseHandle(session);
-            return Err(format!("cannot connect to {host}"));
-        }
-
-        let path_w = wide(&path);
-        let request = WinHttpOpenRequest(
-            connect,
-            w!("GET"),
-            wptr(&path_w),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            if secure {
-                WINHTTP_FLAG_SECURE
-            } else {
-                WINHTTP_OPEN_REQUEST_FLAGS(0)
-            },
-        );
-        if request.is_null() {
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
-            return Err("cannot create HTTP request".into());
-        }
-
-        // Headers must be attached before the send: anything added afterwards is
-        // never put on the wire. Mirrors the REST client's ordering.
-        let headers = wide(&format!(
-            "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
+    let response = crate::platform::http::NativeTransport.get(url, accept)?;
+    if response.status != 200 {
+        let preview: String = String::from_utf8_lossy(&response.body).chars().take(200).collect();
+        return Err(format!(
+            "update request returned HTTP {}: {preview}",
+            response.status
         ));
-        let mut body = Vec::new();
-        let result = (|| {
-            WinHttpAddRequestHeaders(
-                request,
-                &headers[..headers.len() - 1],
-                WINHTTP_ADDREQ_FLAG_ADD,
-            )?;
-            WinHttpSendRequest(request, None, None, 0, 0, 0)?;
-            WinHttpReceiveResponse(request, std::ptr::null_mut())?;
-            // The status line is only readable while the response is still open,
-            // so it is collected here next to the body it describes.
-            let mut status: u32 = 0;
-            let mut len = std::mem::size_of::<u32>() as u32;
-            let mut index = 0u32;
-            let _ = WinHttpQueryHeaders(
-                request,
-                WINHTTP_QUERY_STATUS | WINHTTP_QUERY_FLAG_NUMBER,
-                PCWSTR::null(),
-                Some(&mut status as *mut u32 as *mut std::ffi::c_void),
-                &mut len,
-                &mut index,
-            );
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                let mut read = 0u32;
-                let ok = WinHttpReadData(
-                    request,
-                    chunk.as_mut_ptr() as *mut std::ffi::c_void,
-                    chunk.len() as u32,
-                    &mut read,
-                );
-                if ok.is_err() || read == 0 {
-                    break;
-                }
-                body.extend_from_slice(&chunk[..read as usize]);
-            }
-            Ok::<(u32, Vec<u8>), windows::core::Error>((status, body))
-        })();
-        let _ = WinHttpCloseHandle(request);
-        let _ = WinHttpCloseHandle(connect);
-        let _ = WinHttpCloseHandle(session);
-        let (status, body) = result.map_err(|e| format!("request failed ({e})"))?;
-
-        // A 404 or 403 body must not be mistaken for a release that names no
-        // version, or for an executable missing its MZ header.
-        if status != 200 {
-            let preview: String = String::from_utf8_lossy(&body).chars().take(200).collect();
-            return Err(format!("update request returned HTTP {status}: {preview}"));
-        }
-
-        Ok(body)
     }
+    Ok(response.body)
 }
 
-/// Version named by the newest entry of the release feed, e.g. the "0.1.10"
-/// inside ".../releases/tag/v0.1.10". Tolerates a tag written without the `v`.
-pub fn parse_version_from_feed(feed: &str) -> Option<String> {
+/// Every `/releases/tag/<tag>` the feed names, in feed order (newest first).
+///
+/// Each entry contributes exactly one such link - the entry `<id>` is written
+/// as `.../Repository/<n>/<tag>`, which does not match - and the list is what
+/// makes the three-way release split safe. There are up to three releases per
+/// version now, one per platform, so "the newest entry" no longer identifies
+/// this platform's release: a Windows install that resolved the newest one
+/// could derive a URL from the Linux or macOS release's tag, whose repository
+/// carries no `mnvoice.exe`. A hyphen is part of a tag, so `v0.1.15-linux`
+/// survives intact, while the `&#39;` entities the real feed escapes still end
+/// it and a bare `/releases/tag/` link is dropped for naming no version.
+fn feed_tags(feed: &str) -> Vec<String> {
     let needle = "releases/tag/";
+    let mut tags = Vec::new();
     let mut from = 0;
     while let Some(i) = feed[from..].find(needle) {
-        let mut start = from + i + needle.len();
-        // Tags are normally written with a leading v, sometimes without.
-        if feed[start..].starts_with('v') || feed[start..].starts_with('V') {
-            start += 1;
-        }
-        // A version is digits and dots; stop at the first character that is not.
+        let start = from + i + needle.len();
+        // A tag is alphanumerics with dots and hyphens; anything else ends it.
+        let stop = |c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-';
         let end = feed[start..]
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .find(stop)
             .map(|e| start + e)
             .unwrap_or(feed.len());
-        let version = &feed[start..end];
-        if !version.is_empty() && version.contains('.') {
-            return Some(version.to_string());
+        let tag = &feed[start..end];
+        if tag.contains('.') {
+            tags.push(tag.to_string());
         }
         from = start;
     }
-    None
+    tags
 }
 
-/// Download URL for the standalone exe of a specific tag. GitHub serves release
-/// assets from a predictable path, so the URL can be derived rather than parsed
-/// out of a listing.
+/// The version a tag names, with the leading `v` and the platform suffix
+/// removed: "v0.1.15-win" -> "0.1.15". This is what the binary compares
+/// against the version baked in at compile time.
+fn version_of_tag(tag: &str) -> String {
+    let bare = tag.strip_prefix('v').unwrap_or(tag);
+    bare.split('-').next().unwrap_or(bare).to_string()
+}
+
+/// The suffix this platform's release tags carry.
+#[cfg(windows)]
+const fn platform_release_suffix() -> &'static str {
+    "win"
+}
+
+#[cfg(target_os = "linux")]
+const fn platform_release_suffix() -> &'static str {
+    "linux"
+}
+
+#[cfg(target_os = "macos")]
+const fn platform_release_suffix() -> &'static str {
+    "macos"
+}
+
+/// True when `tag` names this platform's release.
+///
+/// A bare `vX.Y.Z` tag is accepted on Windows only, because every release
+/// published before the three-way split was Windows and those installs must
+/// keep updating.
+fn tag_is_ours(tag: &str) -> bool {
+    let bare = tag.strip_prefix('v').unwrap_or(tag);
+    match bare.split_once('-') {
+        Some((_, suffix)) => suffix == platform_release_suffix(),
+        None => cfg!(windows),
+    }
+}
+
+/// The newest release tag in the feed that belongs to this platform.
+fn newest_tag_for_this_platform(feed: &str) -> Option<String> {
+    feed_tags(feed).into_iter().find(|t| tag_is_ours(t))
+}
+
+/// Version named by the newest entry of the release feed that belongs to this
+/// platform, e.g. the "0.1.10" inside ".../releases/tag/v0.1.10". Tolerates a
+/// tag written without the `v`, and one carrying a platform suffix.
+///
+/// The production path needs the tag, not just the version - it is what the
+/// asset URL is derived from - so this is the test-time spelling of
+/// `newest_tag_for_this_platform`.
+#[cfg(test)]
+pub fn parse_version_from_feed(feed: &str) -> Option<String> {
+    newest_tag_for_this_platform(feed).map(|t| version_of_tag(&t))
+}
+
+/// Download URL for the standalone exe of a specific tag, platform suffix
+/// included. GitHub serves release assets from a predictable path, so the URL
+/// can be derived rather than parsed out of a listing.
 fn asset_url(tag: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/{tag}/{EXE_ASSET}")
+    format!(
+        "https://github.com/{REPO}/releases/download/{tag}/{}",
+        crate::platform::asset_name()
+    )
 }
 
 /// Ask GitHub what the latest published version is, and where its exe lives.
@@ -221,11 +187,13 @@ pub fn check_latest() -> Result<Release, String> {
 fn check_latest_from(feed_url: &str) -> Result<Release, String> {
     let body = http_get(feed_url, "application/atom+xml")?;
     let feed = String::from_utf8_lossy(&body);
-    let version =
-        parse_version_from_feed(&feed).ok_or("release feed does not name a version")?;
-    let tag = format!("v{version}");
+    // The tag is resolved, not rebuilt from the version: since the split a
+    // version alone does not name a release, only a tag does, and the entry it
+    // belongs to decides which platform the asset lives under.
+    let tag = newest_tag_for_this_platform(&feed)
+        .ok_or("release feed names no release for this platform")?;
     Ok(Release {
-        version,
+        version: version_of_tag(&tag),
         exe_url: asset_url(&tag),
     })
 }
@@ -295,7 +263,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
         reap_helpers();
         return Err(format!("cannot start the new exe ({e})"));
     }
-    crate::log(&format!("updated to v{version}, relaunching"));
+    crate::windows_app::log(&format!("updated to v{version}, relaunching"));
     let _ = helper.kill();
     reap_helpers();
     std::process::exit(0);
@@ -366,23 +334,23 @@ pub fn finish_install(install: Option<&Path>) {
     let _ = std::io::copy(&mut pipe, &mut drain);
 
     let Some(exe) = install else {
-        crate::log("update helper: no install to repair");
+        crate::windows_app::log("update helper: no install to repair");
         return;
     };
     if !swap_interrupted(exe) {
         return;
     }
     if let Err(e) = finish_swap(exe) {
-        crate::log(&format!("update helper: {e}"));
+        crate::windows_app::log(&format!("update helper: {e}"));
         return;
     }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
     if let Err(e) = Command::new(exe).arg("--restart").spawn() {
-        crate::log(&format!("update helper: cannot start the new exe ({e})"));
+        crate::windows_app::log(&format!("update helper: cannot start the new exe ({e})"));
         return;
     }
-    crate::log("update helper: finished the interrupted install");
+    crate::windows_app::log("update helper: finished the interrupted install");
 }
 
 /// The state an interrupted swap leaves behind: nothing at the exe path, with
@@ -517,7 +485,7 @@ pub fn background_check_auto() {
     }
     mark_checked();
     // quiet: an automatic run reports only problems, never balloons.
-    crate::check_for_updates_async(true);
+    crate::windows_app::check_for_updates_async(true);
 }
 
 /// Called once at startup: tidy up after the previous update, then hand the
@@ -642,6 +610,112 @@ mod tests {
         // scan has to keep looking.
         let feed = r#"<a href="/releases/tag/">all tags</a><a href="/mnsky-tyan/mnvoice/releases/tag/v0.1.9">v"#;
         assert_eq!(parse_version_from_feed(feed).as_deref(), Some("0.1.9"));
+    }
+
+    /// The feed as it looks since the three-way split: three releases carrying
+    /// the same version, newest first, only one of them this platform's.
+    fn per_platform_feed() -> String {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en-US">
+          <entry>
+            <id>tag:github.com,2008:Repository/1/v0.1.15-macos</id>
+            <link rel="alternate" type="text/html" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-macos"/>
+            <title>v0.1.15-macos</title>
+          </entry>
+          <entry>
+            <id>tag:github.com,2008:Repository/2/v0.1.15-linux</id>
+            <link rel="alternate" type="text/html" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-linux"/>
+            <title>v0.1.15-linux</title>
+          </entry>
+          <entry>
+            <id>tag:github.com,2008:Repository/3/v0.1.15-win</id>
+            <link rel="alternate" type="text/html" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-win"/>
+            <title>v0.1.15-win</title>
+          </entry>
+          <entry>
+            <link rel="alternate" type="text/html" href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.14"/>
+          </entry>
+        </feed>"#
+            .to_string()
+    }
+
+    #[test]
+    fn the_suffix_is_removed_from_the_version_it_compares_against() {
+        assert_eq!(version_of_tag("v0.1.15-win"), "0.1.15");
+        assert_eq!(version_of_tag("v0.1.14"), "0.1.14");
+        assert_eq!(version_of_tag("0.1.15-linux"), "0.1.15");
+    }
+
+    #[test]
+    fn the_split_resolves_this_platforms_release_and_derives_its_url() {
+        // The newest entry is another platform's release. Resolving by tag
+        // rather than by newest entry is what keeps the derived URL pointing at
+        // a repository that actually carries mnvoice.exe.
+        let feed = per_platform_feed();
+        assert_eq!(
+            feed_tags(&feed),
+            vec![
+                "v0.1.15-macos".to_string(),
+                "v0.1.15-linux".to_string(),
+                "v0.1.15-win".to_string(),
+                "v0.1.14".to_string(),
+            ]
+        );
+        let tag = newest_tag_for_this_platform(&feed).unwrap();
+        let bare = tag.strip_prefix('v').unwrap_or(tag.as_str());
+        let suffix = bare.split_once('-').map(|(_, s)| s);
+        if cfg!(windows) {
+            assert_eq!(suffix, Some("win"));
+        } else {
+            assert_eq!(suffix, Some(platform_release_suffix()));
+        }
+        assert_eq!(parse_version_from_feed(&feed).as_deref(), Some("0.1.15"));
+        assert_eq!(
+            asset_url(tag.as_str()),
+            format!("https://github.com/mnsky-tyan/mnvoice/releases/download/{tag}/mnvoice.exe")
+        );
+    }
+
+    #[test]
+    fn a_feed_of_other_platforms_only_names_no_release_of_ours() {
+        // A Windows install reading a feed whose newest releases all belong to
+        // other platforms must report no update, not invent one from a tag
+        // whose assets are absent.
+        let feed = r#"<feed>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-macos"/></entry>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-linux"/></entry>
+        </feed>"#;
+        assert_eq!(feed_tags(feed).len(), 2);
+        if cfg!(windows) {
+            assert!(newest_tag_for_this_platform(feed).is_none());
+            assert!(parse_version_from_feed(feed).is_none());
+        }
+    }
+
+    #[test]
+    fn a_bare_tag_after_the_split_still_updates_windows() {
+        // The legacy shape, and the shape the current Windows installs run:
+        // a bare tag is Windows' own release, however new the feed is.
+        let feed = r#"<feed>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-linux"/></entry>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-win"/></entry>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.14"/></entry>
+        </feed>"#;
+        let tag = newest_tag_for_this_platform(feed).unwrap();
+        assert_eq!(tag, "v0.1.15-win");
+        assert!(is_newer(&version_of_tag(&tag), "0.1.14"));
+    }
+
+    #[test]
+    fn the_newest_release_of_our_platform_wins_over_older_entries() {
+        // Suffixed tags of the same platform: the newest entry is the one taken,
+        // exactly as before the split, and it beats the installed version.
+        let feed = r#"<feed>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.16-win"/></entry>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-win"/></entry>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.14"/></entry>
+        </feed>"#;
+        assert_eq!(parse_version_from_feed(feed).as_deref(), Some("0.1.16"));
     }
 
     // --- fetching over the wire -------------------------------------------
