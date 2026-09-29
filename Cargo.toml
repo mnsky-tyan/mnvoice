@@ -1,6 +1,6 @@
 [package]
 name = "mnvoice"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 description = "Ultra-low-latency, hands-free push-to-talk dictation utility for Windows with real-time streaming and zero-clipboard typing"
 license = "MIT"
