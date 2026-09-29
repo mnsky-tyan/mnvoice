@@ -74,3 +74,24 @@ Reverse-chronological. Every claim links to a check that was run.
   hands a raw TCP stream to tungstenite, which has no CONNECT tunnel). A
   CONNECT tunnel for the socket would be new machinery the port does not need
   yet, so the limit is stated in the README instead.
+
+## Release shape: three separate releases
+
+The first gate run validated the port itself; the release shape was then
+changed from "one tag, three assets" to three separate releases, one per
+platform, on the captain's instruction - a single release mixing binaries is
+not what a user of one platform should be handed.
+
+- Tags `v0.1.15-win` / `v0.1.15-linux` / `v0.1.15-macos`, one release each,
+  carrying only that platform's artifacts. The Windows release keeps exactly
+  the file set v0.1.14 shipped (exe + zip + SHA256SUMS).
+- The atom feed lists up to three releases per version now, so "newest entry"
+  no longer identifies this platform's release. `feed_tags` +
+  `newest_tag_for_this_platform` resolve the newest entry of this platform:
+  the `win` suffix, or a bare tag from before the split (Windows only, since
+  every pre-split release was Windows). Without that a Windows install derives
+  a URL from the Linux or macOS release's tag and gets a 404.
+- release.yml: each job publishes the release for the tag it was triggered by;
+  a pull_request still builds and tests all three jobs, which is where the
+  other platforms are verified because nothing on the captain's machine can
+  compile them.
