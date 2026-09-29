@@ -95,3 +95,21 @@ not what a user of one platform should be handed.
   a pull_request still builds and tests all three jobs, which is where the
   other platforms are verified because nothing on the captain's machine can
   compile them.
+
+## Release: v0.1.15-win / -linux / -macos (2026-09-29)
+
+Three releases published, one per platform, each carrying only its own
+artifacts (Windows keeps the v0.1.14 file set: exe + zip + SHA256SUMS).
+
+- CI green on the tagged commits: one job per tag, plus the full three-job
+  matrix on the PR head (windows/linux/macos all success).
+- Published hashes verified by downloading the asset and comparing it to
+  SHA256SUMS: exe b9f138f9..., zip a7e48c89....
+- The captain's install was moved from v0.1.14 to v0.1.15 by hand, because a
+  pre-v0.1.15 updater derives its URL from a bare tag and there is no bare
+  v0.1.15 release any more: it would 404 forever and never leave v0.1.14.
+  The swap was the same rename the updater uses (running image aside as
+  mnvoice.exe.old, new image takes the name); the running process keeps
+  v0.1.14 until relaunch, and its next startup deletes the .old. From this
+  version the updater resolves its own platform's release from the feed, so
+  the hop happens exactly once per machine.
