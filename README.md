@@ -424,9 +424,9 @@ Known limits in this release, stated rather than papered over:
 See [SECURITY.md](SECURITY.md) for full details:
 
 - Zero audio written to disk - buffers live in RAM only and are dropped immediately after transmission.
-- Point-to-point TLS (WinHTTP `WINHTTP_FLAG_SECURE`) directly to your configured endpoint. Zero third-party calls.
-- Zero clipboard reads or writes - dictation uses `SendInput` with `KEYEVENTF_UNICODE` only.
-- No global keyboard hooks - only the two registered hotkeys (`RegisterHotKey`) are intercepted.
+- Point-to-point TLS directly to your configured endpoint. Zero third-party calls.
+- Zero clipboard reads or writes - words are injected as keystrokes at the cursor, never through the clipboard.
+- No global keyboard hooks - on Windows only the two registered hotkeys are intercepted; Linux and macOS register none.
 
 ---
 

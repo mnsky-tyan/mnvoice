@@ -13,9 +13,9 @@
 // surfaces and have no cross-platform equivalent yet; the capture, transport
 // and typing paths are the seam modules, shared with Windows.
 
-mod config;
 #[cfg(windows)]
 mod audio;
+mod config;
 #[cfg(windows)]
 mod orb;
 #[cfg(windows)]

@@ -1,9 +1,10 @@
 # Per-repo no-mistakes overrides for mnvoice.
 
-# mnvoice is a Windows-only Rust project: the test suite links the `windows`
-# crate and winres needs rc.exe, so on this machine the only usable cargo is the
-# Windows one reached through the WSL drive mount. (WSL's own `cargo` is not
-# installed and Windows PATH integration is deliberately off.)
+# mnvoice builds on three platforms, but on this machine only its Windows
+# target compiles: the test suite links the `windows` crate and winres needs
+# rc.exe, so the only usable cargo is the Windows one reached through the WSL
+# drive mount. (WSL's own `cargo` is not installed and Windows PATH integration
+# is deliberately off.)
 #
 # Three WSL/Windows facts this command has to work around, each of which cost
 # real debugging time:
@@ -30,12 +31,12 @@ commands:
 
 # This repository's only workflow is .github/workflows/release.yml. It fires on
 # tag pushes ("v*") and workflow_dispatch, and - since the Linux and macOS port
-# - on pull_request too, so a PR branch does register build/linux/macos checks.
+# - on pull_request too, so a PR branch does register windows/linux/macos checks.
 #
 # no_ci stays true anyway, and for a different reason than it started with: the
-# gate's own commands.test above runs the Windows suite through the WSL cargo,
-# which is the only place the `windows` crate and winres can be built on this
-# machine. What CI adds that this gate cannot is the two Unix jobs -
+# gate's own commands.test above runs the Windows suite through the Windows cargo
+# reached from WSL, which is the only place the `windows` crate and winres can be
+# built on this machine. What CI adds that this gate cannot is the two Unix jobs -
 # ubuntu-latest and macos-latest each run `cargo test` - so the platforms this
 # port actually adds are covered there and nowhere else, by a runner the gate
 # cannot fold into the same wait as its own Windows suite.

@@ -51,8 +51,8 @@ Reverse-chronological. Every claim links to a check that was run.
   ureq's `native-tls` feature supplies only the adapter and never the
   default), so only the audio device and the injector genuinely differ per
   platform.
-- `linux_impl`/`macos_impl`: cpal audio, enigo injection (x11rb backend - no
-  libxdo system dependency).
+- `linux_impl`/`macos_impl`: cpal audio, enigo injection - x11rb on Linux (no
+  libxdo system dependency), CoreGraphics event synthesis on macOS.
 - CI iterations to green: 6 rounds, each fixing exactly what rustc on the real
   platform said (duplicate mod decls, tungstenite Bytes/Utf8Bytes, cpal
   traits in scope, non-exhaustive Message match, moved chunk, ureq unsized
