@@ -114,3 +114,47 @@ artifacts (Windows keeps the v0.1.14 file set: exe + zip + SHA256SUMS).
   v0.1.14 until relaunch, and its next startup deletes the .old. From this
   version the updater resolves its own platform's release from the feed, so
   the hop happens exactly once per machine.
+
+## Full no-mistakes pass on the released tree (2026-09-30)
+
+Run 01M3STNKRMPE8H85Y2SRHKP6MP on branch gate/v0.1.15, model
+stepfun-intl-2/step-5-preview (the earlier runs used stepfun-intl): nine steps,
+none skipped - intent, rebase, review, test, document, lint, push, pr
+(#3), ci (windows/linux/macos all green on the pushed head). Outcome
+passed-with-override: the one untested scenario is the Windows tray GUI update
+surface, which cannot be driven here without taking the captain's
+single-instance mutex.
+
+Running the gate over work that is already merged: main was reset to v0.1.14
+and a branch cut at the shipped tree (f20a35b), so the whole v0.1.15 state is
+one gateable diff; the original tip was kept on origin/backup/pre-gate-main
+and the release tags never moved. Merging the PR restored main to the same
+tree plus the fixes below.
+
+What the pass actually found and fixed (shipped code contained all of it):
+
+- build.rs baked the per-platform suffix into MNVOICE_VERSION, so all three
+  shipped binaries report "mnvoice v0.1.15-win" instead of "v0.1.15" and
+  disagree with update.rs::version_of_tag. Fixed by cutting the suffix in
+  build.rs::version(); verified live by building under each tag name.
+  build.rs unit tests are never executed by cargo test (verified in a scratch
+  crate), so the rule's spec is version_of_tag's tests, not a test in build.rs.
+- The injector error latch (src/platform/input.rs) reported once per process,
+  and the Unix injector recovers from a dropped connection on the next
+  commit, so a later failure was silent forever. Now a rising-edge latch:
+  report when a failure starts and again after a recovery. Verified live on
+  Linux: fail -> exactly one line, recover -> silent, fail again -> prints.
+- The Unix injectors did not pace characters (Linux handed the whole commit
+  to one Enigo::text call, macOS posted per character with no gap), so the
+  contract in input.rs was honoured only on Windows. Both now sleep 2 ms
+  between characters. Verified live: 123-character commit arrived as 123
+  KeyPress events with a 2.0 ms median gap on X-server timestamps.
+- Docs: Cargo.toml still said "for Windows"; README's ~2.2 s VAD figure
+  contradicted its own 3 s default; update.rs's comment about the feed's
+  first entry went stale with per-platform releases.
+- Lint housekeeping ran on the files this port touches: the `let _ =` on
+  calls the seam made infallible, plus import/format reflows in the new
+  platform modules. No untouched Windows file was reformatted.
+
+These fixes are on main but NOT in the published v0.1.15-* releases (which
+were cut before the pass). See the release decision in the final report.

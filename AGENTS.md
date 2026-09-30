@@ -44,3 +44,28 @@
   - one release each. A bare `vX.Y.Z` tag from before the split still updates
   Windows. The updater resolves its own platform's entry from the feed; a
   Windows install must never derive a URL from another platform's tag.
+
+## Gating this repository through no-mistakes
+
+- The pipeline agent model lives in `~/.no-mistakes/config.yaml`
+  (`agent_config.pi.model`), currently `stepfun-intl-2/step-5-preview`; a run
+  can pin it explicitly with `axi run --model <provider/model>`. Verify a new
+  model with a one-line `pi --model <id> -p ...` before starting a run, because
+  a rejected pin wastes a whole review round.
+- Gating work that is already merged: reset origin/main to the pre-change
+  commit, keep the old tip on a backup branch, cut the run branch at the old
+  tip, run the pipeline, merge the PR. Tags and releases never move. A pipeline
+  with an empty diff against its base skips its own steps, so the branch must
+  actually contain the history.
+- The test step drives the Linux product for real (podman container, Xvfb,
+  mock provider, X key monitor), so it takes about 1.5 h; budget `--wait`
+  cycles or status polling accordingly. A Windows-GUI scenario is honestly
+  `untested` - approving the step with `--reason` is the correct outcome, and
+  the analyzer rejects `pass` with `live=false`.
+- Build scripts (`build.rs`) are never unit-tested by `cargo test`; put
+  build-time rules in the crate where tests can reach them, or point the spec
+  at the tests that do exercise the same rule.
+- The document step also runs lint housekeeping (`auto_fix.lint: 3`) on the
+  files the change touches, so the pushed head can differ from the reviewed
+  head: CI runs on the pushed head, local `cargo test` should be re-run after
+  the run finishes.
