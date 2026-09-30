@@ -1,5 +1,5 @@
 # mnvoice custom vocabulary / keyterm hints
-# Copy to keywords.txt next to mnvoice.exe and add your own words.
+# Copy to keywords.txt next to the mnvoice binary and add your own words.
 #
 # These words bias the speech model toward recognizing them correctly.
 # Use this for technical jargon, project names, acronyms, or names the

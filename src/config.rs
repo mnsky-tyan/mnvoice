@@ -18,11 +18,21 @@ pub struct Config {
     pub max_seconds: u32,
     pub trailing_space: bool,
     pub keywords: Vec<String>,
+    // Orb appearance. Read by the Windows orb renderer; on Linux and macOS
+    // the orb is not ported yet, so the fields ride along unparsed-but-stored
+    // to keep config files and their round-trip identical everywhere.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub orb_color: (f32, f32, f32),
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub orb_fluid_level: f32,
+    // Windows-only settings; they ride along for the same round-trip reason.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub hotkey: (u32, u32),
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub hotkey_str: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub cancel_key: (u32, u32),
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub cancel_key_str: String,
     pub vad_silence_ms: u32,
     pub vad_rms_threshold: f64,
@@ -30,6 +40,7 @@ pub struct Config {
     /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
     pub strip_fillers: bool,
     /// Install a newer published release automatically when one appears.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub auto_update: bool,
 }
 
@@ -165,7 +176,7 @@ pub fn load() -> Result<Config, String> {
     };
 
     if api_key.trim().is_empty() {
-        return Err("No API key configured. Set API_KEY in mnvoice.env next to mnvoice.exe.".into());
+        return Err("No API key configured. Set API_KEY in mnvoice.env next to the mnvoice binary.".into());
     }
 
     if model.is_empty() {

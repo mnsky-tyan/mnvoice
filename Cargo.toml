@@ -1,8 +1,8 @@
 [package]
 name = "mnvoice"
-version = "0.1.10"
+version = "0.1.15"
 edition = "2021"
-description = "Ultra-low-latency, hands-free push-to-talk dictation utility for Windows with real-time streaming and zero-clipboard typing"
+description = "Ultra-low-latency, hands-free push-to-talk dictation utility with real-time streaming and zero-clipboard typing"
 license = "MIT"
 
 [build-dependencies]
@@ -25,6 +25,47 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# The Linux and macOS ports: audio capture, text injection, and network
+# transport. All are cfg-gated by target rather than optional features so a
+# plain `cargo build` on those platforms produces a working binary.
+[target.'cfg(not(windows))'.dependencies]
+cpal = "0.15"
+# The x11 feature is x11rb, pure Rust, so no builder needs libxdo. It does
+# not remove every system library: enigo links xkbcommon on Linux whichever
+# backend is picked, so the released binary needs libxkbcommon at runtime
+# (documented in the README's Linux section).
+enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
+
+# TLS is split per target, and no network dependency is declared for both
+# targets: Cargo unions the features of every matching [target] entry, so a
+# shared `ureq = "2"` keeps its default rustls + webpki-roots stack on macOS
+# and the bundled Mozilla roots outrank Security.framework there. Linux gets
+# rustls + ring with Mozilla root certificates compiled in (Linux has no single
+# trusted root store to query); macOS gets native-tls, which is
+# Security.framework and therefore the platform's own verifier and keychain
+# trust. See unix_http.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+# The rustls dependency is for the crypto provider only (see unix_http.rs);
+# the stack itself is behind ureq and tungstenite's rustls feature.
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "ring",
+    "std",
+    "tls12",
+] }
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+ureq = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# default-features = false is what drops ureq's default `tls` (rustls +
+# webpki-roots). tungstenite's `handshake` is not a TLS feature - it is the
+# HTTP upgrade machinery, needed on both.
+tungstenite = { version = "0.26", default-features = false, features = [
+    "handshake",
+    "native-tls",
+] }
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
 
 [profile.release]
 opt-level = "z"

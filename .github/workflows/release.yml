@@ -1,16 +1,29 @@
 name: Release
 
+# Releases are per platform: one tag per platform (v0.1.15-win / -linux /
+# -macos), one release per tag, each carrying only that platform's artifacts.
+# A pull_request still builds and tests all three jobs - that is where the port
+# is verified on real Linux and macOS runners, since the gate on this machine
+# can only drive Windows.
 on:
   push:
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  windows:
+    # A bare vX.Y.Z tag is the legacy Windows shape - every release before the
+    # split - and vX.Y.Z-win is the current one, so both belong to this job.
+    # On a pull_request there is no tag to interpret, so all jobs build.
+    if: >-
+      github.event_name == 'pull_request' ||
+      endsWith(github.ref_name, '-win') ||
+      !contains(github.ref_name, '-')
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -20,6 +33,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      # The release must not ship a suite that fails on the runner that built
+      # it, so the Windows job runs the same suite the gate runs locally.
+      - name: Test
+        run: cargo test --locked
 
       - name: Build release
         run: cargo build --release --locked
@@ -66,6 +84,7 @@ jobs:
 
       # Belt and braces: an empty release must never ship unnoticed again.
       - name: Verify asset attached
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,3 +104,109 @@ jobs:
             }
           }
           Write-Host "confirmed assets on $tag"
+
+  linux:
+    if: >-
+      github.event_name == 'pull_request' ||
+      endsWith(github.ref_name, '-linux')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system libraries
+        # cpal needs the ALSA headers (PipeWire arrives through its ALSA layer)
+        # and enigo's injector links xkbcommon whichever X11 backend it uses.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package artifact
+        run: |
+          cp target/release/mnvoice mnvoice-linux-x64
+          sha256sum mnvoice-linux-x64 | awk '{print $1"  "$2}' > mnvoice-linux-x64.sha256
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" mnvoice-linux-x64 mnvoice-linux-x64.sha256 --clobber
+          else
+            gh release create "$tag" --title "$tag" --verify-tag mnvoice-linux-x64 mnvoice-linux-x64.sha256
+          fi
+
+      - name: Verify asset attached
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          names=$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/${{ github.ref_name }}" \
+            | jq -r '.assets[].name')
+          echo "$names" | grep -qx 'mnvoice-linux-x64'
+
+  macos:
+    if: >-
+      github.event_name == 'pull_request' ||
+      endsWith(github.ref_name, '-macos')
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Test
+        run: cargo test --locked --target aarch64-apple-darwin
+
+      - name: Build release
+        # The target is named explicitly rather than taken from the runner:
+        # the release asset is published under the arm64 name, so an
+        # Intel-armed image switching under us must not silently change it.
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Package artifact
+        run: |
+          cp target/aarch64-apple-darwin/release/mnvoice mnvoice-macos-arm64
+          shasum -a 256 mnvoice-macos-arm64 | awk '{print $1"  "$2}' > mnvoice-macos-arm64.sha256
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" mnvoice-macos-arm64 mnvoice-macos-arm64.sha256 --clobber
+          else
+            gh release create "$tag" --title "$tag" --verify-tag mnvoice-macos-arm64 mnvoice-macos-arm64.sha256
+          fi
+
+      - name: Verify asset attached
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          names=$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/${{ github.ref_name }}" \
+            | jq -r '.assets[].name')
+          echo "$names" | grep -qx 'mnvoice-macos-arm64'
