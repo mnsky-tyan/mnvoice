@@ -53,10 +53,12 @@ impl Injector for X11Injector {
                 format!("cannot initialise input injection ({e}); is an X display available?")
             })?);
         }
-        // One character per call is the pacing half of the injector
-        // contract: enigo's `text` batches the whole commit into a single
-        // burst, and a burst can outpace a target window's message queue, so
-        // the characters are handed to it one at a time with a gap.
+        // enigo already posts one event per character here: its x11rb backend
+        // has no fast text entry, so `text` falls back to one key event per
+        // character. What it cannot be asked for is the gap, so the characters
+        // are handed to it one at a time to add the pacing the injector
+        // contract in `crate::platform::input` requires - the 2 ms the Windows
+        // engine sleeps in `crate::paste` is the reference value.
         for c in text.chars() {
             let outcome = slot.as_mut().expect("populated above").text(&c.to_string());
             if let Err(e) = outcome {

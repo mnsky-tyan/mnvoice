@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
-static REPORTED: AtomicBool = AtomicBool::new(false);
+static FAILING: AtomicBool = AtomicBool::new(false);
 
 /// The platform's injector, installing the default on first use.
 ///
@@ -53,16 +53,25 @@ pub fn global() -> &'static dyn Injector {
 
 /// Convenience matching the pre-seam call sites: type, and report a failure
 /// instead of dropping words silently. The streaming loop calls this once per
-/// commit, so only the first error of a session is printed - a refused
-/// permission or a Wayland session without XWayland fails every keystroke, and
-/// a transcript's worth of identical lines would bury the reason.
+/// commit, and every one of those call sites discards the result, so this is
+/// the only signal a typed-away transcript ever produces.
+///
+/// The rule is a rising edge, not one report per process: a failure is printed
+/// when it starts and again after any recovery, so a streak of failing commits
+/// is announced once while a backend that recovers between commits is never
+/// silently mute for the rest of the process.
 pub fn type_text(text: &str) {
-    if let Err(e) = global().type_text(text) {
-        if !REPORTED.swap(true, Ordering::SeqCst) {
-            // Written through `writeln!` with the result dropped, not
-            // `eprintln!`: the Windows tray build has no stderr to write to,
-            // and a failed print there panics instead of staying silent.
-            let _ = writeln!(std::io::stderr(), "mnvoice: {e}");
+    match global().type_text(text) {
+        Ok(()) => {
+            FAILING.store(false, Ordering::SeqCst);
+        }
+        Err(e) => {
+            if !FAILING.swap(true, Ordering::SeqCst) {
+                // Written through `writeln!` with the result dropped, not
+                // `eprintln!`: the Windows tray build has no stderr to write to,
+                // and a failed print there panics instead of staying silent.
+                let _ = writeln!(std::io::stderr(), "mnvoice: {e}");
+            }
         }
     }
 }
