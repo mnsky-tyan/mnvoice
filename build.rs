@@ -30,7 +30,13 @@ fn version() -> String {
     // GITHUB_REF_NAME is exactly "v0.1.9" on a tag push.
     if let Ok(v) = std::env::var("GITHUB_REF_NAME") {
         if let Some(rest) = v.strip_prefix('v') {
-            return rest.to_string();
+            // Since the three-way split a release tag carries the platform as a
+            // suffix ("v0.1.15-win"), but the suffix is not part of the version:
+            // update.rs::version_of_tag is the definition of what a tag's version
+            // is, and the updater compares what it resolves out of the feed
+            // against this value, so both must cut at the same hyphen.
+            let cut = rest.find('-').unwrap_or(rest.len());
+            return rest[..cut].to_string();
         }
     }
     env!("CARGO_PKG_VERSION").to_string()

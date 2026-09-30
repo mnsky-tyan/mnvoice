@@ -13,6 +13,16 @@
 use crate::platform::input::Injector;
 use enigo::{Enigo, Keyboard, Settings};
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+/// Pause between two synthesized characters.
+///
+/// The injector contract in `crate::platform::input` is one event per character
+/// with a small gap; the reference is the Windows engine's 2 ms inter-keystroke
+/// sleep in `crate::paste`. A burst delivered back to back can outpace the
+/// target window's message queue and drop characters.
+const KEY_GAP: Duration = Duration::from_millis(2);
 
 /// Text injection through XTest. X11 and XWayland windows receive the keys; a
 /// native Wayland window receives nothing, and nothing here can detect that.
@@ -43,16 +53,21 @@ impl Injector for X11Injector {
                 format!("cannot initialise input injection ({e}); is an X display available?")
             })?);
         }
-        let outcome = slot.as_mut().expect("populated above").text(text);
-        match outcome {
-            Ok(()) => Ok(()),
-            Err(e) => {
+        // One character per call is the pacing half of the injector
+        // contract: enigo's `text` batches the whole commit into a single
+        // burst, and a burst can outpace a target window's message queue, so
+        // the characters are handed to it one at a time with a gap.
+        for c in text.chars() {
+            let outcome = slot.as_mut().expect("populated above").text(&c.to_string());
+            if let Err(e) = outcome {
                 // The connection is no longer usable, so it is dropped and the
                 // next commit opens a fresh one instead of failing for the rest
                 // of the session.
                 *slot = None;
-                Err(format!("text injection failed ({e})"))
+                return Err(format!("text injection failed ({e})"));
             }
+            thread::sleep(KEY_GAP);
         }
+        Ok(())
     }
 }
