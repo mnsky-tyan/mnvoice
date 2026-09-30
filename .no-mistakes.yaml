@@ -42,7 +42,8 @@ commands:
 # cannot fold into the same wait as its own Windows suite.
 #
 # `no-mistakes ci-workflow` can generate a PR workflow from the command above,
-# but the generated one assumes a Go module and ubuntu-latest - wrong for a
-# Windows-only Rust app. Writing a proper windows-latest workflow by hand is the
+# but the generated one assumes a Go module and ubuntu-latest - wrong for this
+# Rust repo, whose suite needs a Windows runner (it links the `windows` crate
+# and winres). Writing a proper windows-latest workflow by hand is the
 # stronger fix if CI on the app's own platform is ever wanted.
 no_ci: true

@@ -16,8 +16,9 @@ const REPO: &str = "mnsky-tyan/mnvoice";
 /// and every check would fail with HTTP 403 - exactly the failure observed
 /// during verification. The feed is served from the web endpoint: no per-IP
 /// quota, no token, and a small machine-readable document instead of a 200 KB
-/// page. Releases are listed newest first, so the first entry names the current
-/// version.
+/// page. Releases are listed newest first, but since the three-way split the
+/// first entry belongs to whichever platform published last, not necessarily
+/// this one - `newest_tag_for_this_platform` picks this platform's entry.
 const RELEASES_FEED: &str = "https://github.com/mnsky-tyan/mnvoice/releases.atom";
 
 /// What a published release offers: the version to compare against and the

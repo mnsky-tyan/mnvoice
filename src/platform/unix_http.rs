@@ -31,7 +31,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
 // tungstenite re-exports the http types its handshake needs.
-use tungstenite::http as http;
+use tungstenite::http;
 use tungstenite::WebSocket as WsRaw;
 
 /// Per-phase bounds on a REST request, mirroring the WinHTTP session this
@@ -308,11 +308,7 @@ impl Transport for UnixTransport {
         post(url, auth, content_type, body)
     }
 
-    fn websocket(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<Box<dyn WebSocket>, String> {
+    fn websocket(&self, url: &str, headers: &[(&str, &str)]) -> Result<Box<dyn WebSocket>, String> {
         Ok(Box::new(websocket(url, headers)?))
     }
 }
@@ -358,9 +354,7 @@ impl WebSocket for UnixSocket {
                 .map_err(|_| "websocket lock poisoned".to_string())?;
             match ws.read() {
                 Ok(Message::Binary(data)) => return Ok(Some(data.to_vec())),
-                Ok(Message::Text(text)) => {
-                    return Ok(Some(text.as_str().as_bytes().to_vec()))
-                }
+                Ok(Message::Text(text)) => return Ok(Some(text.as_str().as_bytes().to_vec())),
                 Ok(Message::Close(_)) => return Ok(None),
                 // Protocol-level pings must be answered for the server to keep
                 // the connection; the pong goes out on the next write, and

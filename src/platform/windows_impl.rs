@@ -50,8 +50,15 @@ impl WinHttpTransport {
         method: &str,
         url: &str,
         timeout_ms: (i32, i32, i32),
-    ) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void, bool), String>
-    {
+    ) -> Result<
+        (
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            bool,
+        ),
+        String,
+    > {
         let (host, port, secure, path) = parse_base_url(url)?;
 
         let session = WinHttpOpen(
@@ -64,7 +71,13 @@ impl WinHttpTransport {
         if session.is_null() {
             return Err("cannot create HTTP session".into());
         }
-        if let Err(e) = WinHttpSetTimeouts(session, timeout_ms.0, timeout_ms.1, timeout_ms.2, timeout_ms.2) {
+        if let Err(e) = WinHttpSetTimeouts(
+            session,
+            timeout_ms.0,
+            timeout_ms.1,
+            timeout_ms.2,
+            timeout_ms.2,
+        ) {
             let _ = WinHttpCloseHandle(session);
             return Err(format!("set timeouts ({e})"));
         }
@@ -147,8 +160,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
-            let (request, connect, session, _) =
-                Self::open("GET", url, (0, 15_000, 45_000))?;
+            let (request, connect, session, _) = Self::open("GET", url, (0, 15_000, 45_000))?;
 
             let headers = wide(&format!(
                 "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
@@ -186,8 +198,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // Uploads carry audio, so the read timeout is longer than the
             // feed's: a slow provider transcoding a long clip is not an error.
-            let (request, connect, session, _) =
-                Self::open("POST", url, (0, 10_000, 60_000))?;
+            let (request, connect, session, _) = Self::open("POST", url, (0, 10_000, 60_000))?;
 
             let auth_line = auth
                 .map(|v| format!("Authorization: {v}\r\n"))
@@ -226,18 +237,15 @@ impl Transport for WinHttpTransport {
         }
     }
 
-    fn websocket(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<Box<dyn WebSocket>, String> {
+    fn websocket(&self, url: &str, headers: &[(&str, &str)]) -> Result<Box<dyn WebSocket>, String> {
         unsafe {
             // A streaming session is held open for the length of a dictation,
             // so there is no overall timeout - only the per-read timeout that
             // `WebSocket::read` passes in.
             let (request, connect, session, _) = Self::open("GET", url, (0, 10_000, 0))?;
 
-            let opt_ok = WinHttpSetOption(Some(request), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, None);
+            let opt_ok =
+                WinHttpSetOption(Some(request), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, None);
             if opt_ok.is_err() {
                 let _ = WinHttpCloseHandle(request);
                 let _ = WinHttpCloseHandle(connect);

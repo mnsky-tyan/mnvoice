@@ -22,7 +22,7 @@ mnvoice.exe (~417 KB)
 - **~15 ms activation** - persistent standby WASAPI engine pre-initializes at launch; Alt+Space starts capture in ~4 ms, first audio in ~15 ms.
 - **Zero clipboard pollution** - words are injected directly at the cursor via `SendInput` with `KEYEVENTF_UNICODE`.
 - **Real-time word streaming** - 40 ms audio slices over native WinHTTP WebSockets; words appear as you speak.
-- **Hands-free auto-stop** - dual VAD (local RMS + server endpointing) detects ~2.2 s of silence and finalizes automatically.
+- **Hands-free auto-stop** - dual VAD (local RMS + server endpointing) detects the configured silence window (default 3 s) and finalizes automatically.
 - **Fully configurable** - hotkey, cancel key, orb color, fluid level, filler words, STT provider, model, language, and vocabulary. All in one plain text file, none of it required.
 - **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, check for updates, config, keywords, and restart.
 - **Privacy focused** - zero audio written to disk, point-to-point TLS, zero telemetry. See [SECURITY.md](SECURITY.md).
@@ -390,8 +390,9 @@ rather than a tray icon:
 ```
 
 - Download `mnvoice-linux-x64` (or `mnvoice-macos-arm64`) from the matching
-  `-linux` / `-macos` release, `chmod +x` it, and put the two example files
-  beside it.
+  `-linux` / `-macos` release and `chmod +x` it. The release carries only the
+  binary; grab `mnvoice.env.example` and `keywords.txt.example` from the repo
+  to sit beside it.
 - Put a `mnvoice.env` next to the binary (same format as the Windows one,
   `API_KEY=...` is all you need) and a `keywords.txt` if you use keyterms.
 - Press **Enter** to start a dictation. Press **Enter** again to stop early;

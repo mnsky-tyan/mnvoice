@@ -89,11 +89,7 @@ pub trait Transport {
     ///
     /// `url` is a `ws://` or `wss://` endpoint. TLS is handled inside each
     /// backend so the caller never has to think about certificate stores.
-    fn websocket(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<Box<dyn WebSocket>, String>;
+    fn websocket(&self, url: &str, headers: &[(&str, &str)]) -> Result<Box<dyn WebSocket>, String>;
 }
 
 /// The transport for this build.

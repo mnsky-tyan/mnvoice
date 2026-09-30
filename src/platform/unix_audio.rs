@@ -105,7 +105,12 @@ fn run_session(
         cpal::SampleFormat::I16 => device.build_input_stream(
             &supported.into(),
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                push(&data.iter().map(|s| *s as f32 / i16::MAX as f32).collect::<Vec<f32>>())
+                push(
+                    &data
+                        .iter()
+                        .map(|s| *s as f32 / i16::MAX as f32)
+                        .collect::<Vec<f32>>(),
+                )
             },
             err_fn,
             None,
@@ -118,7 +123,9 @@ fn run_session(
     }
     .map_err(|e| format!("cannot open input stream ({e})"))?;
 
-    stream.play().map_err(|e| format!("cannot start capture ({e})"))?;
+    stream
+        .play()
+        .map_err(|e| format!("cannot start capture ({e})"))?;
 
     let started = Instant::now();
     let mut silence = SilenceWindows::new();

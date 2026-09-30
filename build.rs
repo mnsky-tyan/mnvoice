@@ -17,8 +17,8 @@ fn main() {
     }
 
     // The release tag is the single source of truth for the app version.
-    // CI pushes tags as refs/tags/vX.Y.Z, so read that when present and fall
-    // back to the Cargo version for local builds where no tag exists.
+    // CI pushes tags as refs/tags/vX.Y.Z[-platform], so read that when present
+    // and fall back to the Cargo version for local builds where no tag exists.
     println!("cargo:rustc-env=MNVOICE_VERSION={}", version());
     // Without this, a rebuild in the same target directory keeps the version
     // baked by an earlier build with a different tag, and the updater compares
@@ -27,7 +27,8 @@ fn main() {
 }
 
 fn version() -> String {
-    // GITHUB_REF_NAME is exactly "v0.1.9" on a tag push.
+    // GITHUB_REF_NAME is the tag name on a tag push: "v0.1.9", or with a
+    // platform suffix since the three-way split, "v0.1.15-win".
     if let Ok(v) = std::env::var("GITHUB_REF_NAME") {
         if let Some(rest) = v.strip_prefix('v') {
             // Since the three-way split a release tag carries the platform as a
