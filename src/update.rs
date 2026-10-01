@@ -1100,9 +1100,9 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // A producer that writes the file with a BOM would put three non-hex
         // bytes in front of the first line's hash, and the asset it names would
         // then read as unlisted - which for the current layout is the exe.
-        let with_bom = format!(
+        let with_bom =
             "\u{feff}b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  mnvoice.exe\n"
-        );
+                .to_string();
         assert_eq!(
             super::expected_hash(&with_bom, "mnvoice.exe").unwrap(),
             "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70",
