@@ -1165,6 +1165,111 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         );
     }
 
+    /// The file the real v0.1.16-win release publishes beside its assets, byte
+    /// for byte: one SHA-256 per released file, in the two-space GNU spelling.
+    /// Real data, so the check is exercised against the shape and the digests a
+    /// real release serves rather than a convenient fiction.
+    const PUBLISHED_SUMS: &str = concat!(
+        "d154b6145425e8e2886dc57ba4374b2b22aea61958ec140ee401b8194a82450d  mnvoice.exe\n",
+        "bf2675cff36f62d220034356839e957c616455ea9b848d87b602162ac715b73f  mnvoice-windows-x64.zip\n",
+    );
+
+    /// The digest an independent sha256sum gives of the image below, the bytes
+    /// somebody else's build would put on the wire in place of a published one.
+    const SUBSTITUTED_IMAGE_DIGEST: &str =
+        "d57007075a967423381dfe84ecfc472b4f487b02e1616ef23ffb02c1a2ce5e91";
+
+    #[test]
+    fn a_download_that_does_not_match_its_published_checksum_never_reaches_the_staged_file() {
+        // The installer's own entry point, driven the way the product drives it:
+        // a release resolves, its image is requested over the same wire a real
+        // asset arrives on, and what comes back is a plausible Windows
+        // executable the release never published. It is exactly the payload the
+        // installer would otherwise move over the running exe, so the only thing
+        // standing between it and the exe path is the check that runs first.
+        let mut substituted = exe_image(2);
+        substituted[8192] = 0xff;
+        let asset = MockFeed::once(
+            &substituted,
+            "mnsky-tyan/mnvoice/releases/download/v0.1.16-win/mnvoice.exe",
+            "200 OK",
+        );
+        let sums = MockFeed::once(
+            PUBLISHED_SUMS.as_bytes(),
+            "mnsky-tyan/mnvoice/releases/download/v0.1.16-win/SHA256SUMS",
+            "200 OK",
+        );
+        let rel = Release {
+            version: "0.1.16".into(),
+            exe_url: asset.url.clone(),
+            sha256_url: sums.url.clone(),
+        };
+        let exe = current_exe().unwrap();
+        let running = fs::read(&exe).unwrap();
+
+        let err = install_and_relaunch(&rel, || false).unwrap_err();
+
+        // A failed check has to be legible: both hashes, and the refusal.
+        assert!(err.contains("does not match"), "unexpected error: {err}");
+        assert!(
+            err.contains("d154b6145425e8e2886dc57ba4374b2b22aea61958ec140ee401b8194a82450d"),
+            "the published hash belongs in the message: {err}"
+        );
+        assert!(
+            err.contains(SUBSTITUTED_IMAGE_DIGEST),
+            "the hash of what actually arrived belongs in the message: {err}"
+        );
+        // And nothing on disk moved, which is what checking before the swap
+        // buys: no staged download, no image moved aside, and the exe this
+        // process is running is still the one it was.
+        assert!(
+            !staged_path(&exe).exists(),
+            "a rejected download reached the staged file"
+        );
+        let mut old = exe.clone().into_os_string();
+        old.push(".old");
+        assert!(!PathBuf::from(old).exists(), "the running image was moved aside");
+        assert_eq!(fs::read(&exe).unwrap(), running, "the running image changed");
+        let _ = asset.request();
+        let _ = sums.request();
+    }
+
+    #[test]
+    fn the_line_read_is_the_one_the_exe_url_names_never_an_assumed_asset() {
+        // A release publishes the zip beside the exe, and a build whose asset
+        // is the zip has to be checked against the zip's line. The name comes
+        // from the URL that was downloaded, so the same sums file answers both
+        // requests correctly - and a request the file does not list is a
+        // refusal rather than a fall back to some other line.
+        let bytes = b"mnvoice zip asset payload";
+        let sums = "d227de818b4a898fc363f853d2946240b30965881941f53d1813104b66eee2b3  mnvoice-windows-x64.zip\n";
+        let base = "mnsky-tyan/mnvoice/releases/download/v0.1.16-win";
+
+        let zip = MockFeed::once(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK");
+        super::verify_download(
+            &format!("{}/mnvoice-windows-x64.zip", zip.url.trim_end_matches("/SHA256SUMS")),
+            &zip.url,
+            bytes,
+        )
+        .unwrap();
+        let asked = zip.request();
+        assert!(asked.contains("/SHA256SUMS"), "request was: {asked}");
+
+        // The same file, asked for the exe it never lists.
+        let exe = MockFeed::once(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK");
+        let err = super::verify_download(
+            &format!("{}/mnvoice.exe", exe.url.trim_end_matches("/SHA256SUMS")),
+            &exe.url,
+            b"mnvoice fake exe payload",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("mnvoice.exe is not listed"),
+            "the asset that was asked for is the one that has to be listed: {err}"
+        );
+        let _ = exe.request();
+    }
+
     #[test]
     fn an_asset_download_follows_the_redirect_to_the_host_the_asset_lives_on() {
         // GitHub answers a request for a release asset with a 302 naming the
