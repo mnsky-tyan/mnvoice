@@ -158,3 +158,23 @@ What the pass actually found and fixed (shipped code contained all of it):
 
 These fixes are on main but NOT in the published v0.1.15-* releases (which
 were cut before the pass). See the release decision in the final report.
+
+## Release: v0.1.16-win / -linux / -macos (2026-09-30)
+
+The gate pass above finished after the v0.1.15 tags were cut, so the three
+defects it fixed were on main but in no release. 0.1.16 exists to ship them
+and nothing else: the platform-suffix version bake, the once-per-process
+injector error latch (now a rising edge), and per-character pacing on the Unix
+injectors.
+
+- Tags annotated from ee5aa07 (chore: release 0.1.16); one release job per tag,
+  all three green, no other job touched the tree.
+- Hashes re-verified by download: exe d154b614..., linux and macOS .sha256
+  lines both MATCH their assets, SHA256SUMS lists the same exe hash.
+- The build.rs fix confirmed in the shipped bytes: the exe contains the bare
+  "0.1.16" and no "0.1.16-win" string.
+- The captain's install was moved to 0.1.16 by the same rename swap (its
+  running image, the 0.1.15 binary he relaunched after the previous swap, stays
+  mapped as mnvoice.exe.prev until that process exits). No manual hop was
+  needed: 0.1.15's updater resolves v0.1.16-win from the feed by itself, which
+  is the first end-to-end proof of the new resolver on live hardware.
