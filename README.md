@@ -300,6 +300,17 @@ entry is never mistaken for one.
 the release feed at most once per day, and only installs when it is idle - it will
 never swap the binary out from under a transcript in flight.
 
+**Checked.** Windows releases since v0.1.13 publish a `SHA256SUMS` file
+beside their assets (the earlier bare Windows tags and the Linux/macOS
+releases carry no such file, and only the Windows path ever asks for one).
+Before an automatic install, mnvoice downloads that file, reads the line for the
+asset it just downloaded, and hashes the bytes it got: a checksum that does not
+match, a file that does not list the asset, or a missing file all mean no
+install. A download is never swapped in unless the release's own published sum
+says it is the file that release published. A Windows release that cannot be
+checked is simply not installed - the check fails closed, which is what makes an
+unverifiable release a no-op rather than an unchecked install.
+
 It is off by default on purpose. Replacing a running binary is a decision you
 should make, not one that happens silently because a default pointed that way.
 Absence, an empty value, or a typo all mean off, so a misspelling cannot quietly
@@ -320,13 +331,19 @@ preferences carry across every version.
 
 ### Verifying a download
 
-Every Windows release publishes three files:
+Every Windows release since v0.1.13 publishes three files:
 
 | File | For |
 |---|---|
 | `mnvoice.exe` | Direct download, and what the updater fetches |
 | `mnvoice-windows-x64.zip` | `mnvoice.exe` + `mnvoice.env.example` + `keywords.txt.example` |
 | `SHA256SUMS` | The SHA-256 hash of each of the two files above |
+
+The bare Windows tags from before the per-platform split (v0.1.10-v0.1.12)
+shipped no `SHA256SUMS`, so the Windows updater's checksum check cannot be
+satisfied by those tags - which matters only if one of them is ever the newest
+release, since the updater refuses an uncheckable release rather than installing
+unchecked.
 
 The Linux and macOS releases each publish one binary plus a `.sha256` line
 you check the same way (`sha256sum -c mnvoice-linux-x64.sha256`).
