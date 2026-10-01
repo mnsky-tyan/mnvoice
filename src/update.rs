@@ -23,11 +23,14 @@ const RELEASES_FEED: &str = "https://github.com/mnsky-tyan/mnvoice/releases.atom
 
 /// What a published release offers: the version to compare against and the
 /// platform's asset to download. The asset name comes from the platform seam,
-/// so every platform resolves its own artifact from the same release.
+/// so every platform resolves its own artifact from the same release. The checksum
+/// URL names the published `SHA256SUMS` file of the same tag, which is what the
+/// download is verified against before anything is installed.
 #[derive(Debug)]
 pub struct Release {
     pub version: String,
     pub exe_url: String,
+    pub sha256_url: String,
 }
 
 /// Version baked in at compile time from the release tag.
@@ -80,6 +83,162 @@ fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(response.body)
+}
+
+/// A downloaded release image is installed only if the release's own published
+/// checksum for it verifies: the `SHA256SUMS` file of the same tag is fetched,
+/// the line for the asset actually downloaded is read out of it, and the bytes
+/// are hashed and compared. Every failure - a missing file, an unlisted asset,
+/// a hash that disagrees - is a refusal, so the only outcome of a tampered or
+/// truncated download is that nothing installs.
+///
+/// Called before anything is moved on disk, which is what makes that true: a
+/// rejected download never reaches the staged file, let alone the exe path.
+fn verify_download(exe_url: &str, sums_url: &str, bytes: &[u8]) -> Result<(), String> {
+    let asset = asset_name_from_url(exe_url)?;
+    let body = http_get(sums_url, "text/plain")?;
+    let expected = expected_hash(&String::from_utf8_lossy(&body), &asset)?;
+    let actual = sha256::hex_digest(bytes);
+    if actual != expected {
+        return Err(format!(
+            "downloaded {asset} does not match its published checksum 
+             (expected {expected}, got {actual}); refusing to install"
+        ));
+    }
+    Ok(())
+}
+
+/// The asset name a URL asks for - its last path segment. Taken from the URL
+/// rather than assumed, so the sums lookup and the download can never disagree
+/// about what was fetched.
+fn asset_name_from_url(url: &str) -> Result<String, String> {
+    let name = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("cannot name the asset in {url}"))?;
+    Ok(name.trim().to_string())
+}
+
+/// The published sums line for `asset`.
+///
+/// The format is what `sha256sum` writes: `<64 hex><whitespace><name>` per line,
+/// with every released file listed, so the line for this asset has to be picked
+/// out. Two spaces are the GNU spelling and one space plus an asterisk is the
+/// `-b` spelling; both name the same file, and uppercase hex is accepted because
+/// so is it. A file that does not list the asset is a refusal, not a skip: an
+/// absent line is how a release that carries no sums would announce itself, and
+/// guessing past it would install unchecked.
+fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
+    for line in sums.lines() {
+        let Some((hash, rest)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let hash = hash.trim().to_ascii_lowercase();
+        let is_hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !is_hex {
+            continue;
+        }
+        let name = rest.trim().trim_start_matches('*').trim();
+        if name == asset {
+            return Ok(hash);
+        }
+    }
+    Err(format!(
+        "{asset} is not listed in the published checksums"
+    ))
+}
+
+/// SHA-256 (FIPS 180-4).
+///
+/// Hand-rolled on purpose: the update path needs one 32-byte digest of one file
+/// once a day, and a hashing crate with its feature tree would cost more than
+/// the check is worth. The published FIPS vectors pin the behaviour, so this is
+/// thirty-odd lines of well-tested arithmetic rather than a dependency.
+mod sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    /// Lowercase hex of the SHA-256 digest of `data`.
+    pub fn hex_digest(data: &[u8]) -> String {
+        let mut h = H0;
+
+        // Padding: a single 1 bit, zeros, then the length in bits as a 64-bit
+        // big-endian word, all rounded up to a whole number of 64-byte blocks.
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut msg = Vec::with_capacity(data.len() + 72);
+        msg.extend_from_slice(data);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        for block in msg.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for (i, word) in block.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+
+            let (mut a, mut b, mut c, mut d) = (h[0], h[1], h[2], h[3]);
+            let (mut e, mut f, mut g, mut hh) = (h[4], h[5], h[6], h[7]);
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            for (slot, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+                *slot = slot.wrapping_add(v);
+            }
+        }
+
+        let mut out = String::with_capacity(64);
+        for word in h {
+            for byte in word.to_be_bytes() {
+                out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+                out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+            }
+        }
+        out
+    }
 }
 
 /// Every `/releases/tag/<tag>` the feed names, in feed order (newest first).
@@ -178,6 +337,17 @@ fn asset_url(tag: &str) -> String {
     )
 }
 
+/// Asset holding the published checksums of a release, one SHA-256 per released
+/// file. The release workflow writes it for every Windows release next to the
+/// exe and the zip.
+const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+
+/// URL of a tag's checksum file, derived from the same tag as the exe, so a
+/// download is checked against the sums of the release it came from.
+fn checksum_url(tag: &str) -> String {
+    format!("https://github.com/{REPO}/releases/download/{tag}/{CHECKSUMS_ASSET}")
+}
+
 /// Ask GitHub what the latest published version is, and where its exe lives.
 pub fn check_latest() -> Result<Release, String> {
     check_latest_from(RELEASES_FEED)
@@ -196,6 +366,7 @@ fn check_latest_from(feed_url: &str) -> Result<Release, String> {
     Ok(Release {
         version: version_of_tag(&tag),
         exe_url: asset_url(&tag),
+        sha256_url: checksum_url(&tag),
     })
 }
 
@@ -238,6 +409,10 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     let exe = current_exe()?;
 
     let bytes = http_get(url, "application/octet-stream")?;
+
+    // Checked against the release's own published checksum before anything
+    // moves: a download that cannot be verified never reaches the staged file.
+    verify_download(url, &rel.sha256_url, &bytes)?;
 
     // The helper waits on the other end of this pipe, so keeping the handle open
     // is how it learns this process is still the one installing: exiting, or being
@@ -569,6 +744,10 @@ mod tests {
             asset_url(&format!("v{version}")),
             "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe"
         );
+        assert_eq!(
+            checksum_url(&format!("v{version}")),
+            "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/SHA256SUMS"
+        );
     }
 
     #[test]
@@ -809,6 +988,11 @@ mod tests {
             rel.exe_url,
             "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe"
         );
+        assert_eq!(
+            rel.sha256_url,
+            "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.11/SHA256SUMS",
+            "the sums come from the same tag the exe came from"
+        );
 
         // Headers only take effect while the request is still being composed, so
         // the Accept and User-Agent headers have to be on the wire.
@@ -850,6 +1034,135 @@ mod tests {
         ))
         .unwrap_err();
         assert!(!err.is_empty(), "an unreachable feed must produce a message");
+    }
+
+    // --- the checksum the download is verified against ---------------------
+
+    #[test]
+    fn sha256_reproduces_the_published_vectors() {
+        use super::sha256;
+        // FIPS 180-4 A.1-A.3: the empty string, "abc" and the 56-byte case that
+        // straddles a block boundary, plus the million-'a' case that needs the
+        // length field past one block.
+        assert_eq!(
+            sha256::hex_digest(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256::hex_digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256::hex_digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            sha256::hex_digest(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn the_sums_line_of_the_asset_that_was_asked_for_is_the_one_read() {
+        // Real sums files list every released file, in the GNU two-space
+        // spelling, and sha256sum -b writes one space and an asterisk instead.
+        let sums = "\
+b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  other.exe\n\
+B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n";
+        assert_eq!(
+            super::expected_hash(sums, "mnvoice.exe").unwrap(),
+            "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70",
+            "the line naming the requested asset decides, not the first one"
+        );
+    }
+
+    #[test]
+    fn a_sums_file_that_does_not_list_the_asset_is_a_refusal() {
+        // A release without a sums entry for this asset must not be installed
+        // through: absent line is how a release with no sums would announce
+        // itself, and skipping past it would install unchecked.
+        let sums = "deadbeef  some-other-file\n";
+        let err = super::expected_hash(sums, "mnvoice.exe").unwrap_err();
+        assert!(err.contains("mnvoice.exe"), "error should name the asset: {err}");
+    }
+
+    #[test]
+    fn a_download_that_matches_its_published_checksum_is_accepted() {
+        // The digest below is an independent sha256sum of these exact bytes, so
+        // the check is pinned against a real tool rather than the code under test.
+        let bytes = b"mnvoice fake exe payload";
+        let sums =
+            "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  mnvoice.exe\n";
+        let served = MockFeed::once(
+            sums.as_bytes(),
+            "mnsky-tyan/mnvoice/releases/download/v0.1.17-win/SHA256SUMS",
+            "200 OK",
+        );
+        super::verify_download(
+            &format!("{}/mnvoice.exe", served.url.trim_end_matches("/SHA256SUMS")),
+            &served.url,
+            bytes,
+        )
+        .unwrap();
+        let asked = served.request();
+        assert!(
+            asked.contains("/SHA256SUMS"),
+            "the sums of the same tag are what must be fetched: {asked}"
+        );
+    }
+
+    #[test]
+    fn a_download_whose_bytes_do_not_match_is_refused() {
+        let sums =
+            "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  mnvoice.exe\n";
+        let served = MockFeed::once(
+            sums.as_bytes(),
+            "mnsky-tyan/mnvoice/releases/download/v0.1.17-win/SHA256SUMS",
+            "200 OK",
+        );
+        let err = super::verify_download(
+            &format!("{}/mnvoice.exe", served.url.trim_end_matches("/SHA256SUMS")),
+            &served.url,
+            b"something else entirely",
+        )
+        .unwrap_err();
+        assert!(err.contains("does not match"), "unexpected error: {err}");
+        assert!(
+            err.contains("b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70"),
+            "the expected hash belongs in the message: {err}"
+        );
+        assert!(err.contains("refusing to install"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_missing_checksums_file_is_a_refusal() {
+        // A 404 on the sums asset is the honest signal that this release cannot
+        // be checked. That is a refusal, not a reason to install unverified.
+        let served = MockFeed::once(
+            b"Not Found",
+            "mnsky-tyan/mnvoice/releases/download/v0.1.17-win/SHA256SUMS",
+            "404 Not Found",
+        );
+        let err = super::verify_download(
+            &format!("{}/mnvoice.exe", served.url.trim_end_matches("/SHA256SUMS")),
+            &served.url,
+            b"mnvoice fake exe payload",
+        )
+        .unwrap_err();
+        assert!(err.contains("404"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn an_asset_with_no_name_in_its_url_is_a_refusal() {
+        // A URL that names no asset cannot be looked up in the sums file, and
+        // guessing a name would check the wrong line.
+        let err = super::asset_name_from_url("https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.17-win/")
+            .unwrap_err();
+        assert!(err.contains("asset"), "unexpected error: {err}");
+        assert_eq!(
+            super::asset_name_from_url("https://host/tag/mnvoice.exe").unwrap(),
+            "mnvoice.exe"
+        );
     }
 
     #[test]

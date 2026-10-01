@@ -300,6 +300,13 @@ entry is never mistaken for one.
 the release feed at most once per day, and only installs when it is idle - it will
 never swap the binary out from under a transcript in flight.
 
+**Checked.** Every release publishes a `SHA256SUMS` file beside its assets.
+Before an automatic install, mnvoice downloads that file, reads the line for the
+asset it just downloaded, and hashes the bytes it got: a checksum that does not
+match, a file that does not list the asset, or a missing file all mean no
+install. A download is never swapped in unless the release's own published sum
+says it is the file that release published.
+
 It is off by default on purpose. Replacing a running binary is a decision you
 should make, not one that happens silently because a default pointed that way.
 Absence, an empty value, or a typo all mean off, so a misspelling cannot quietly
