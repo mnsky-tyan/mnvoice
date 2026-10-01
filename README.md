@@ -89,21 +89,26 @@ no terminal       - no command needed after install
 
 One click, no commands. Right-click the tray icon and check **Start with Windows**:
 
-- **Checked** - mnvoice is added to the current user's startup list
+- **Checked** - a logon task is created for the current user
 - **Unchecked** - it is removed again
 
-The entry is visible and reversible in Windows Task Manager under **Startup apps**, and it needs no admin rights.
+The task is added through the Task Scheduler rather than the registry Run key
+on purpose: Windows starts Run-key apps one at a time, spread over the minutes
+after you log in, while a task with a logon trigger fires at logon itself -
+so mnvoice is listening by the time you sit down. It runs as you, with no
+elevation, and no admin rights are needed either way.
 
-If you prefer a terminal, the same change is one command (swap in your own path):
+If you prefer a terminal, the same change is one command (swap in your own
+path):
 
 ```cmd
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v mnvoice /t REG_SZ /d "C:\Users\you\mnvoice.exe" /f
+schtasks /create /tn "\mnvoice" /tr "C:\Users\you\mnvoice.exe" /sc onlogon /rl limited /f
 ```
 
 To remove it:
 
 ```cmd
-reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v mnvoice /f
+schtasks /delete /tn "\mnvoice" /f
 ```
 
 ---

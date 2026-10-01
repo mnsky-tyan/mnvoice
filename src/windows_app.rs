@@ -251,6 +251,9 @@ pub fn main() {
             .map(|c| c.auto_update)
             .unwrap_or_else(config::auto_update_enabled);
         update::startup_cleanup(auto_update);
+        // One-time move off the Run key onto a logon task. Idempotent and
+        // silent: after it has run once, task_exists() short-circuits it.
+        migrate_autostart();
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -703,53 +706,152 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 }
 
+const AUTOSTART_TASK: &str = r"\mnvoice";
 const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE: &str = "mnvoice";
 
-/// reg.exe with CREATE_NO_WINDOW, so toggling autostart never flashes a console.
 fn reg_cmd() -> std::process::Command {
     let mut c = std::process::Command::new("C:\\Windows\\System32\\reg.exe");
     c.creation_flags(0x0800_0000);
     c
 }
 
-/// True when a mnvoice autostart entry exists for the current user.
+fn schtasks_cmd() -> std::process::Command {
+    let mut c = std::process::Command::new("C:\\Windows\\System32\\schtasks.exe");
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+/// True when the at-logon autostart task exists for the current user.
+///
+/// The Run key is still consulted, so an install that has not been relaunched
+/// since the migration still reports an accurate tray checkmark instead of
+/// offering to enable something that is already on.
 fn autostart_enabled() -> bool {
-    let Ok(out) = reg_cmd()
+    if task_exists() {
+        return true;
+    }
+    run_key_set()
+}
+
+fn run_key_set() -> bool {
+    reg_cmd()
         .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Remove the pre-migration Run key entry. Best-effort: a value that is not
+/// there any more is not a failure worth surfacing to the user.
+fn clear_run_key() {
+    let _ = reg_cmd()
+        .args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
+        .output();
+}
+
+/// Whether a `schtasks /Query /FO CSV` listing names this task.
+///
+/// The listing's first column is the task path, so a hit is any line whose
+/// first field matches ignoring the leading backslash and letter case. The
+/// error text for a task that does not exist ("ERROR: The system cannot find
+/// the file specified.") parses as no match, which is the answer it deserves.
+fn csv_lists_task(csv: &str, task: &str) -> bool {
+    let want = task.trim_start_matches('\\').to_ascii_lowercase();
+    csv.lines().any(|line| {
+        let first = line.split(',').next().unwrap_or_default();
+        first
+            .trim()
+            .trim_matches('"')
+            .trim_start_matches('\\')
+            .to_ascii_lowercase()
+            == want
+    })
+}
+
+fn task_exists() -> bool {
+    let Ok(out) = schtasks_cmd()
+        .args(["query", "/tn", AUTOSTART_TASK, "/fo", "csv"])
         .output()
     else {
         return false;
     };
-    out.status.success()
+    csv_lists_task(&String::from_utf8_lossy(&out.stdout), AUTOSTART_TASK)
 }
 
-/// Register or remove the current-user autostart entry. Reversible, no admin
-/// rights needed, and visible in Task Manager's Startup tab.
+/// The schtasks arguments that create the autostart task.
+///
+/// ONLOGON is what makes this worth doing: the shell starts Run-key apps one
+/// at a time and spread over minutes on a busy boot, while the Task Scheduler
+/// runs logon-triggered tasks at logon itself. LIMITED keeps the task running
+/// as the current user with no elevation prompt, which is also what keeps the
+/// tray icon in the user's own session.
+fn schtasks_create_args(exe: &str) -> Vec<String> {
+    [
+        "/create",
+        "/tn",
+        AUTOSTART_TASK,
+        "/tr",
+        exe,
+        "/sc",
+        "onlogon",
+        "/rl",
+        "limited",
+        "/f",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Move an older Run-key install onto the Task Scheduler, once, silently.
+///
+/// Called at startup so the fix happens by relaunching rather than by asking
+/// the user to do anything. Both mechanisms firing for one boot is harmless -
+/// the single-instance mutex makes the loser exit - and the task is left in
+/// place, so the swap only ever runs in this direction.
+pub fn migrate_autostart() {
+    if task_exists() || !run_key_set() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.display().to_string();
+    let ok = schtasks_cmd()
+        .args(schtasks_create_args(&exe))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        clear_run_key();
+        log("autostart moved from the Run key to a logon task");
+    } else {
+        // Leave the Run key alone: a machine whose task creation failed keeps
+        // starting through it next boot rather than not starting at all.
+        log("autostart migration to a logon task failed, keeping the Run key");
+    }
+}
+
+/// Register or remove the at-logon autostart task. Reversible, no admin rights
+/// needed, and the Run key is cleared in both directions so an older entry can
+/// never double-start the app.
 fn set_autostart(enable: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut cmd = reg_cmd();
+    let exe = exe.display().to_string();
+    let mut cmd = schtasks_cmd();
     if enable {
-        cmd.args([
-            "add",
-            AUTOSTART_RUN_KEY,
-            "/v",
-            AUTOSTART_VALUE,
-            "/t",
-            "REG_SZ",
-            "/d",
-            exe.display().to_string().as_str(),
-            "/f",
-        ]);
+        cmd.args(schtasks_create_args(&exe));
     } else {
-        cmd.args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"]);
+        cmd.args(["delete", "/tn", AUTOSTART_TASK, "/f"]);
     }
     let status = cmd.status().map_err(|e| e.to_string())?;
+    clear_run_key();
     if status.success() {
         log(if enable { "autostart enabled" } else { "autostart disabled" });
         Ok(())
     } else {
-        Err("reg.exe exited non-zero".into())
+        Err("schtasks.exe exited non-zero".into())
     }
 }
 
@@ -874,4 +976,53 @@ fn relaunch_for_restart() {
         let _ = std::process::Command::new(&exe).arg("--restart").spawn();
     }
     unsafe { PostQuitMessage(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped listing shape: a CSV header row plus one row per task, the
+    /// first field being the task path.
+    const LISTING: &str = "\"TaskName\",\"Next Run Time\",\"Status\",\"Logon Mode\"\n\"\\mnvoice\",N/A,\"Ready\",\"Interactive/Background\"\n";
+
+    #[test]
+    fn a_listing_that_names_the_task_matches() {
+        assert!(csv_lists_task(LISTING, AUTOSTART_TASK));
+    }
+
+    #[test]
+    fn a_missing_task_is_not_a_match() {
+        // What schtasks prints for a task that does not exist.
+        assert!(!csv_lists_task(
+            "ERROR: The system cannot find the file specified.",
+            AUTOSTART_TASK
+        ));
+        assert!(!csv_lists_task("", AUTOSTART_TASK));
+    }
+
+    #[test]
+    fn a_other_tasks_listing_is_not_a_match() {
+        let other = "\"TaskName\",\"Next Run Time\",\"Status\",\"Logon Mode\"\n\\someoneelse\",N/A,\"Ready\",\"Interactive/Background\"\n";
+        assert!(!csv_lists_task(other, AUTOSTART_TASK));
+    }
+
+    #[test]
+    fn the_create_arguments_pin_the_latency_fix() {
+        // The flags are the entire point of the change: a logon trigger (the
+        // Run key is started late and one-at-a-time), run as the current user
+        // without elevation (keeps the tray in the user's session), and /f so
+        // re-enabling over an existing task is not an error.
+        let args = schtasks_create_args(r"C:\Users\someone\bin\mnvoice.exe");
+        for flag in ["/create", "/sc", "onlogon", "/rl", "limited", "/f"] {
+            assert!(
+                args.iter().any(|a| a == flag),
+                "expected {flag} in {args:?}"
+            );
+        }
+        assert_eq!(
+            args.iter().position(|a| a == "/tr").and_then(|i| args.get(i + 1)),
+            Some(&r"C:\Users\someone\bin\mnvoice.exe".to_string())
+        );
+    }
 }
