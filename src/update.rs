@@ -129,7 +129,14 @@ fn asset_name_from_url(url: &str) -> Result<String, String> {
 /// so is it. A file that does not list the asset is a refusal, not a skip: an
 /// absent line is how a release that carries no sums would announce itself, and
 /// guessing past it would install unchecked.
+///
+/// A byte-order mark is skipped if one is there: a producer that writes the file
+/// with a BOM would otherwise hide the first line behind three bytes that are
+/// not hex, and the asset it names - the exe, in the current layout - would read
+/// as unlisted. The producer this reads does not emit one, so this is about the
+/// format being total rather than about any release that exists.
 fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
+    let sums = sums.strip_prefix('\u{feff}').unwrap_or(sums);
     for line in sums.lines() {
         let Some((hash, rest)) = line.trim().split_once(char::is_whitespace) else {
             continue;
@@ -1085,6 +1092,25 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         assert!(
             err.contains("mnvoice.exe"),
             "error should name the asset: {err}"
+        );
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_does_not_hide_the_first_line() {
+        // A producer that writes the file with a BOM would put three non-hex
+        // bytes in front of the first line's hash, and the asset it names would
+        // then read as unlisted - which for the current layout is the exe.
+        let with_bom = format!(
+            "\u{feff}b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  mnvoice.exe\n"
+        );
+        assert_eq!(
+            super::expected_hash(&with_bom, "mnvoice.exe").unwrap(),
+            "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70",
+            "the first line stays readable behind a byte-order mark"
+        );
+        assert!(
+            super::expected_hash(&with_bom, "other.exe").is_err(),
+            "a BOM must not turn a different asset's absence into an install"
         );
     }
 
