@@ -178,3 +178,26 @@ injectors.
   mapped as mnvoice.exe.prev until that process exits). No manual hop was
   needed: 0.1.15's updater resolves v0.1.16-win from the feed by itself, which
   is the first end-to-end proof of the new resolver on live hardware.
+
+## 0.1.17 - the download actually gets checked (2026-10-01)
+
+The updater downloaded the release exe over TLS and swapped it in on the feed's
+word - nothing ever compared the bytes to the release's published SHA256SUMS.
+`src/update.rs` now fetches that file from the same tag as the exe, picks the
+line naming the asset it downloaded (name read off the exe URL's last path
+segment, never assumed), hashes the bytes, and refuses on a mismatch, an
+unlisted asset, or a missing file. Refusal means nothing staged and nothing
+swapped; the recovery path only ever moves already-verified bytes. SHA-256 is
+hand-rolled and pinned to the FIPS 180-4 vectors (empty, "abc", 56 bytes, a
+million "a"s) plus the GNU two-space and `sha256sum -b` asterisk line formats.
+
+- PR #4 (outcome: passed, nine steps, no override) and PR #5 (the BOM
+  robustness follow-up the #4 reviewer deliberately left unreported: a file
+  written with a byte-order mark hides its first line, which names the exe).
+  68 tests on Windows, clippy clean for the file.
+- The test step drove the real compiled update code as a real Windows process
+  against disposable loopback endpoints for every scenario, and accepted the
+  REAL published v0.1.16-win asset against its REAL published SHA256SUMS.
+- v0.1.17 released as three parallel tags, all three jobs green; hashes
+  re-verified by download against the published sums (Windows assets both OK,
+  Linux and macOS assets MATCH). The exe carries the bare 0.1.17.

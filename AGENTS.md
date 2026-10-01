@@ -62,6 +62,7 @@
   cycles or status polling accordingly. A Windows-GUI scenario is honestly
   `untested` - approving the step with `--reason` is the correct outcome, and
   the analyzer rejects `pass` with `live=false`.
+- Never live-drive the update path with the real install's file name: both install ends relaunch with `--restart`, and `--restart` runs `kill_running_instances()` (`taskkill /F /IM mnvoice.exe`), so a disposable install named `mnvoice.exe` terminates the operator's running instance. Name a disposable install differently (the update helper's `mnvoice-updater-` prefix exists for exactly this reason) and expect the relaunch to restore whatever was killed. This happened during the 0.1.17 pass: the drive killed and immediately relaunched the operator's app.
 - Build scripts (`build.rs`) are never unit-tested by `cargo test`; put
   build-time rules in the crate where tests can reach them, or point the spec
   at the tests that do exercise the same rule.
