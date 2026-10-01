@@ -144,9 +144,7 @@ fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
             return Ok(hash);
         }
     }
-    Err(format!(
-        "{asset} is not listed in the published checksums"
-    ))
+    Err(format!("{asset} is not listed in the published checksums"))
 }
 
 /// SHA-256 (FIPS 180-4).
@@ -338,8 +336,8 @@ fn asset_url(tag: &str) -> String {
 }
 
 /// Asset holding the published checksums of a release, one SHA-256 per released
-/// file. The release workflow writes it for every Windows release next to the
-/// exe and the zip.
+/// file. The release workflow writes it for every Windows release it publishes,
+/// next to the exe and the zip.
 const CHECKSUMS_ASSET: &str = "SHA256SUMS";
 
 /// URL of a tag's checksum file, derived from the same tag as the exe, so a
@@ -348,7 +346,8 @@ fn checksum_url(tag: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/{tag}/{CHECKSUMS_ASSET}")
 }
 
-/// Ask GitHub what the latest published version is, and where its exe lives.
+/// Ask GitHub what the latest published version is, and where its exe and the
+/// release's published checksums live.
 pub fn check_latest() -> Result<Release, String> {
     check_latest_from(RELEASES_FEED)
 }
@@ -1083,7 +1082,10 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // itself, and skipping past it would install unchecked.
         let sums = "deadbeef  some-other-file\n";
         let err = super::expected_hash(sums, "mnvoice.exe").unwrap_err();
-        assert!(err.contains("mnvoice.exe"), "error should name the asset: {err}");
+        assert!(
+            err.contains("mnvoice.exe"),
+            "error should name the asset: {err}"
+        );
     }
 
     #[test]
@@ -1131,7 +1133,10 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
             err.contains("b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70"),
             "the expected hash belongs in the message: {err}"
         );
-        assert!(err.contains("refusing to install"), "unexpected error: {err}");
+        assert!(
+            err.contains("refusing to install"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1156,8 +1161,10 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     fn an_asset_with_no_name_in_its_url_is_a_refusal() {
         // A URL that names no asset cannot be looked up in the sums file, and
         // guessing a name would check the wrong line.
-        let err = super::asset_name_from_url("https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.17-win/")
-            .unwrap_err();
+        let err = super::asset_name_from_url(
+            "https://github.com/mnsky-tyan/mnvoice/releases/download/v0.1.17-win/",
+        )
+        .unwrap_err();
         assert!(err.contains("asset"), "unexpected error: {err}");
         assert_eq!(
             super::asset_name_from_url("https://host/tag/mnvoice.exe").unwrap(),
@@ -1228,8 +1235,15 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         );
         let mut old = exe.clone().into_os_string();
         old.push(".old");
-        assert!(!PathBuf::from(old).exists(), "the running image was moved aside");
-        assert_eq!(fs::read(&exe).unwrap(), running, "the running image changed");
+        assert!(
+            !PathBuf::from(old).exists(),
+            "the running image was moved aside"
+        );
+        assert_eq!(
+            fs::read(&exe).unwrap(),
+            running,
+            "the running image changed"
+        );
         let _ = asset.request();
         let _ = sums.request();
     }
@@ -1247,7 +1261,10 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
 
         let zip = MockFeed::once(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK");
         super::verify_download(
-            &format!("{}/mnvoice-windows-x64.zip", zip.url.trim_end_matches("/SHA256SUMS")),
+            &format!(
+                "{}/mnvoice-windows-x64.zip",
+                zip.url.trim_end_matches("/SHA256SUMS")
+            ),
             &zip.url,
             bytes,
         )
