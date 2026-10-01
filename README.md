@@ -331,13 +331,19 @@ preferences carry across every version.
 
 ### Verifying a download
 
-Every Windows release publishes three files:
+Every Windows release since v0.1.13 publishes three files:
 
 | File | For |
 |---|---|
 | `mnvoice.exe` | Direct download, and what the updater fetches |
 | `mnvoice-windows-x64.zip` | `mnvoice.exe` + `mnvoice.env.example` + `keywords.txt.example` |
 | `SHA256SUMS` | The SHA-256 hash of each of the two files above |
+
+The bare Windows tags from before the per-platform split (v0.1.10-v0.1.12)
+shipped no `SHA256SUMS`, so the Windows updater's checksum check cannot be
+satisfied by those tags - which matters only if one of them is ever the newest
+release, since the updater refuses an uncheckable release rather than installing
+unchecked.
 
 The Linux and macOS releases each publish one binary plus a `.sha256` line
 you check the same way (`sha256sum -c mnvoice-linux-x64.sha256`).
