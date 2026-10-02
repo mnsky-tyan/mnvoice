@@ -897,12 +897,13 @@ fn task_exists() -> bool {
 /// as the current user with no elevation prompt, which is also what keeps the
 /// tray icon in the user's own session.
 fn schtasks_create_args(exe: &str) -> Vec<String> {
+    let quoted = quoted_exe(exe);
     [
         "/create",
         "/tn",
         AUTOSTART_TASK,
         "/tr",
-        exe,
+        quoted.as_str(),
         "/sc",
         "onlogon",
         "/rl",
@@ -912,6 +913,21 @@ fn schtasks_create_args(exe: &str) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// The exe as the task action's command line.
+///
+/// The scheduler stores the /tr string as the action's command line without
+/// re-quoting it, and an unquoted path that contains a space does not launch:
+/// it is split at the space and resolves to the wrong program. A path that
+/// already carries its quotes is passed through, because wrapping it twice
+/// would break it the same way.
+fn quoted_exe(exe: &str) -> String {
+    if exe.len() >= 2 && exe.starts_with('"') && exe.ends_with('"') {
+        exe.to_string()
+    } else {
+        format!("\"{exe}\"")
+    }
 }
 
 /// Move an older Run-key install onto the Task Scheduler, once, silently.
@@ -988,13 +1004,15 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         status.success() || delete_left_task_gone(status.success(), task_state())
     };
     if !in_place {
-        // The Run key carries the autostart until the scheduler holds the
-        // one that was asked for, so it stays and the toggle reports that it
-        // did not do what the user wanted.
+        // Whatever carries the autostart until the scheduler holds the one
+        // that was asked for stays as it is, and the toggle reports what did
+        // not take rather than naming a fallback that is not there.
         return Err(if enable {
             "schtasks.exe could not create the logon task, keeping the Run key".into()
-        } else {
+        } else if run_key_set() {
             "schtasks.exe could not remove the logon task, keeping the Run key".into()
+        } else {
+            "the logon task could not be confirmed removed".into()
         });
     }
     if !clear_run_key() {
@@ -1167,17 +1185,36 @@ mod tests {
         // The flags are the entire point of the change: a logon trigger (the
         // Run key is started late and one-at-a-time), run as the current user
         // without elevation (keeps the tray in the user's session), and /f so
-        // re-enabling over an existing task is not an error.
-        let args = schtasks_create_args(r"C:\Users\someone\bin\mnvoice.exe");
+        // re-enabling over an existing task is not an error. The action's
+        // command line carries the path in quotes, because the scheduler
+        // stores the /tr value verbatim and a spaced path that is not quoted
+        // resolves to the wrong program at logon.
+        let spaced = r"C:\Users\Some User\bin\mnvoice.exe";
+        let args = schtasks_create_args(spaced);
         for flag in ["/create", "/sc", "onlogon", "/rl", "limited", "/f"] {
             assert!(
                 args.iter().any(|a| a == flag),
                 "expected {flag} in {args:?}"
             );
         }
+        let action = args
+            .iter()
+            .position(|a| a == "/tr")
+            .and_then(|i| args.get(i + 1))
+            .expect("the action follows /tr");
         assert_eq!(
-            args.iter().position(|a| a == "/tr").and_then(|i| args.get(i + 1)),
-            Some(&r"C:\Users\someone\bin\mnvoice.exe".to_string())
+            action,
+            &format!("\"{spaced}\""),
+            "the action is the path wrapped in quotes"
+        );
+        let already = schtasks_create_args(&format!("\"{spaced}\""));
+        assert_eq!(
+            already
+                .iter()
+                .position(|a| a == "/tr")
+                .and_then(|i| already.get(i + 1)),
+            Some(&format!("\"{spaced}\"")),
+            "an already-quoted path is not quoted twice"
         );
     }
 
