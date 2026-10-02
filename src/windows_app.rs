@@ -251,9 +251,10 @@ pub fn main() {
             .map(|c| c.auto_update)
             .unwrap_or_else(config::auto_update_enabled);
         update::startup_cleanup(auto_update);
-        // One-time move off the Run key onto a logon task. Idempotent and
-        // silent: after it has run once, task_exists() short-circuits it.
-        migrate_autostart();
+        // One-time move off the Run key onto a logon task. On its own
+        // thread: it only decides whether the NEXT logon starts the app,
+        // so the window, the hotkey and the tray never wait on its spawns.
+        thread::spawn(migrate_autostart);
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),

@@ -102,7 +102,7 @@ If you prefer a terminal, the same change is one command (swap in your own
 path):
 
 ```cmd
-schtasks /create /tn "\mnvoice" /tr "C:\Users\you\mnvoice.exe" /sc onlogon /rl limited /f
+schtasks /create /tn "\mnvoice" /tr "\"C:\Users\you\mnvoice.exe\"" /sc onlogon /rl limited /f
 ```
 
 To remove it:
