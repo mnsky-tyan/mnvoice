@@ -636,7 +636,7 @@ fn worker(
     );
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
-    let result = match cfg.protocol {
+    let mut result = match cfg.protocol {
         config::Protocol::Streaming => {
             match stream::run_stream(&cfg, &stop, &cancelled, rx) {
                 Ok(text) => {
@@ -681,7 +681,9 @@ fn worker(
     };
 
     if let Ok(rx) = capture_done_rx {
-        let _ = rx.recv();
+        if let Ok(Err(e)) = rx.recv() {
+            result = (false, e);
+        }
     }
     *outcome.lock().unwrap() = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
