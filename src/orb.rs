@@ -1,4 +1,4 @@
-// Ethereal floating gas-fluid orb (36px) for mnvoice.
+// Ethereal floating gas-fluid orb (48px) for mnvoice.
 // Simulates a supercritical fluid / zero-gravity luminescent gas nebula inside a translucent glass sphere.
 // Rendered via Win32 layered window (UpdateLayeredWindow) with 32-bit premultiplied ARGB.
 // Sits unobtrusively right at the bottom edge of the screen, 2px above the taskbar.
@@ -33,6 +33,9 @@ pub struct Orb {
     visible: bool,
     color: (f32, f32, f32),
     fluid_level: f32,
+    /// Cached bottom-center position; refreshed by `reposition`, read per
+    /// frame so painting does not call SystemParametersInfoW 30+ times a second.
+    pos: (i32, i32),
 }
 
 unsafe extern "system" fn orb_wndproc(
@@ -139,6 +142,7 @@ impl Orb {
                 visible: false,
                 color,
                 fluid_level,
+                pos: (pos_x, pos_y),
             })
         }
     }
@@ -178,8 +182,11 @@ impl Orb {
         self.render_frame();
     }
 
-    fn reposition(&self) {
-        let (pos_x, pos_y) = calc_position();
+    fn reposition(&mut self) {
+        // Re-read the work area here (each session start), not per frame:
+        // render_frame paints in place, so its position is whatever this set.
+        self.pos = calc_position();
+        let (pos_x, pos_y) = self.pos;
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -206,7 +213,7 @@ impl Orb {
         }
 
         unsafe {
-            let (pos_x, pos_y) = calc_position();
+            let (pos_x, pos_y) = self.pos;
             let pt_dst = POINT { x: pos_x, y: pos_y };
             let size = SIZE {
                 cx: ORB_WIDTH,
@@ -268,32 +275,43 @@ fn calc_position() -> (i32, i32) {
     (x, y)
 }
 
+/// Linear-light accumulator for one pixel: lights are summed here and packed
+/// once at the end, so `add_light` adds to a struct instead of four separate
+/// `&mut f32` slots.
+#[derive(Clone, Copy, Default)]
+struct Rgba {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
+
 #[inline]
-fn add_light(r_acc: &mut f32, g_acc: &mut f32, b_acc: &mut f32, a_acc: &mut f32, r: f32, g: f32, b: f32, intensity: f32) {
+fn add_light(acc: &mut Rgba, r: f32, g: f32, b: f32, intensity: f32) {
     if intensity <= 0.002 {
         return;
     }
     let int_c = intensity.clamp(0.0, 1.0);
-    *r_acc += r * int_c;
-    *g_acc += g * int_c;
-    *b_acc += b * int_c;
-    *a_acc += int_c;
+    acc.r += r * int_c;
+    acc.g += g * int_c;
+    acc.b += b * int_c;
+    acc.a += int_c;
 }
 
 #[inline]
-fn pack_premul(r: f32, g: f32, b: f32, a: f32) -> u32 {
-    let a_c = a.clamp(0.0, 1.0);
+fn pack_premul(c: Rgba) -> u32 {
+    let a_c = c.a.clamp(0.0, 1.0);
     if a_c <= 0.002 {
         return 0;
     }
     let a_byte = (a_c * 255.0 + 0.5) as u32;
-    let r_byte = (r.clamp(0.0, 1.0) * a_c * 255.0 + 0.5) as u32;
-    let g_byte = (g.clamp(0.0, 1.0) * a_c * 255.0 + 0.5) as u32;
-    let b_byte = (b.clamp(0.0, 1.0) * a_c * 255.0 + 0.5) as u32;
+    let r_byte = (c.r.clamp(0.0, 1.0) * a_c * 255.0 + 0.5) as u32;
+    let g_byte = (c.g.clamp(0.0, 1.0) * a_c * 255.0 + 0.5) as u32;
+    let b_byte = (c.b.clamp(0.0, 1.0) * a_c * 255.0 + 0.5) as u32;
     (a_byte << 24) | (r_byte << 16) | (g_byte << 8) | b_byte
 }
 
-/// Render 36px translucent glass sphere with floating zero-gravity gas-fluid nebula inside.
+/// Render the 48px translucent glass sphere with its floating zero-gravity gas-fluid nebula inside.
 fn render_gas_fluid(
     frame: u32,
     buf: &mut [u32],
@@ -323,14 +341,11 @@ fn render_gas_fluid(
             }
 
             let d = d_sq.sqrt();
-            let mut r = 0.0f32;
-            let mut g = 0.0f32;
-            let mut b = 0.0f32;
-            let mut a = 0.0f32;
+            let mut px = Rgba::default();
 
             // 1. Ambient soft aura
             let aura = (-d_sq / 260.0).exp() * 0.26 * fluid_mult.max(0.4);
-            add_light(&mut r, &mut g, &mut b, &mut a, base_r, base_g, base_b, aura);
+            add_light(&mut px, base_r, base_g, base_b, aura);
 
             if d <= r_sphere + 1.2 {
                 let sphere_edge = ((r_sphere + 1.2 - d) / 1.5).clamp(0.0, 1.0);
@@ -362,21 +377,21 @@ fn render_gas_fluid(
 
                 // Subtle ambient vapor fill
                 let ambient_fluid = 0.12 * sphere_edge * fluid_mult;
-                add_light(&mut r, &mut g, &mut b, &mut a, base_r, base_g, base_b, ambient_fluid);
+                add_light(&mut px, base_r, base_g, base_b, ambient_fluid);
 
                 // Real vibrant fluid body
                 let body_int = gas_volume * 0.88 * sphere_edge;
                 let cr = base_r;
                 let cg = base_g * (0.6 + 0.4 * density);
                 let cb = base_b * (0.6 + 0.4 * density);
-                add_light(&mut r, &mut g, &mut b, &mut a, cr, cg, cb, body_int);
+                add_light(&mut px, cr, cg, cb, body_int);
 
                 // Luminous filaments & tendrils
                 let filament = (gas_volume * 1.45 * (fluid_mult / 0.75) - 0.28).clamp(0.0, 1.0);
                 let fil_r = (base_r + 0.3).min(1.0);
                 let fil_g = (base_g + 0.3).min(1.0);
                 let fil_b = (base_b + 0.3).min(1.0);
-                add_light(&mut r, &mut g, &mut b, &mut a, fil_r, fil_g, fil_b, filament * 0.72 * sphere_edge);
+                add_light(&mut px, fil_r, fil_g, fil_b, filament * 0.72 * sphere_edge);
 
                 // Floating ion sparks drifting in zero-g gas
                 let sp1_x = (t * 1.3).sin() * 6.5;
@@ -385,21 +400,18 @@ fn render_gas_fluid(
                 let sp_r = (base_r + 0.4).min(1.0);
                 let sp_g = (base_g + 0.4).min(1.0);
                 let sp_b = (base_b + 0.4).min(1.0);
-                add_light(&mut r, &mut g, &mut b, &mut a, sp_r, sp_g, sp_b, sp1 * sphere_edge);
+                add_light(&mut px, sp_r, sp_g, sp_b, sp1 * sphere_edge);
 
                 let sp2_x = (t * 2.1 + 2.0).cos() * 8.0;
                 let sp2_y = (t * 1.5 + 1.0).sin() * 8.0;
                 let sp2 = (-((dx - sp2_x).powi(2) + (dy - sp2_y).powi(2)) / 3.2).exp() * 0.75;
-                add_light(&mut r, &mut g, &mut b, &mut a, sp_r, sp_g, sp_b, sp2 * sphere_edge);
+                add_light(&mut px, sp_r, sp_g, sp_b, sp2 * sphere_edge);
 
                 // --- TRANSLUCENT GLASS SHELL ---
                 // Crystal Fresnel rim tinted with base color
                 let rim = fresnel * (0.46 + 0.20 * (t * 2.5).sin()) * sphere_edge;
                 add_light(
-                    &mut r,
-                    &mut g,
-                    &mut b,
-                    &mut a,
+                    &mut px,
                     (base_r + 0.2).min(1.0),
                     (base_g + 0.2).min(1.0),
                     (base_b + 0.2).min(1.0),
@@ -411,17 +423,17 @@ fn render_gas_fluid(
                 let hl_dy = dy + 5.8;
                 let hl_d_sq = hl_dx * hl_dx + hl_dy * hl_dy;
                 let hl = (-hl_d_sq / 8.5).exp() * 0.95 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, 1.0, 0.95, 0.98, hl);
+                add_light(&mut px, 1.0, 0.95, 0.98, hl);
 
                 // Secondary bounce highlight
                 let hl2_dx = dx - 4.8;
                 let hl2_dy = dy - 5.2;
                 let hl2_d_sq = hl2_dx * hl2_dx + hl2_dy * hl2_dy;
                 let hl2 = (-hl2_d_sq / 13.0).exp() * 0.36 * sphere_edge;
-                add_light(&mut r, &mut g, &mut b, &mut a, (base_r + 0.2).min(1.0), (base_g + 0.2).min(1.0), (base_b + 0.2).min(1.0), hl2);
+                add_light(&mut px, (base_r + 0.2).min(1.0), (base_g + 0.2).min(1.0), (base_b + 0.2).min(1.0), hl2);
             }
 
-            buf[row_offset + x as usize] = pack_premul(r, g, b, a);
+            buf[row_offset + x as usize] = pack_premul(px);
         }
     }
 }

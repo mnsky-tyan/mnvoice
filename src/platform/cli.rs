@@ -6,6 +6,7 @@
 // Windows uses. Enter starts, the voice-activity detector or Enter stops.
 
 use crate::config;
+use crate::platform::audio::SAMPLE_RATE;
 use crate::platform::{audio, input, unix_audio};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -187,7 +188,7 @@ fn dictate(
                 samples.extend_from_slice(&chunk);
             }
             captured?;
-            println!("stopped ({}s of audio)", samples.len() / 16_000);
+            println!("stopped ({}s of audio)", samples.len() / SAMPLE_RATE as usize);
             let wav = audio::wav_bytes(&samples);
             let raw = crate::rest::transcribe(cfg, &wav)?;
             let (text, trailing) =
@@ -262,7 +263,7 @@ mod tests {
         let ended_at = ended_at.lock().unwrap().expect("the capture reported done");
         assert!(
             fed_at < ended_at,
-            "the transcriber was handed the clip only after the capture ended"
+            "the transcriber must be fed before the capture ends, not after"
         );
     }
 
