@@ -1,49 +1,12 @@
-# Per-repo no-mistakes overrides for mnvoice.
-
-# mnvoice builds on three platforms, but on this machine only its Windows
-# target compiles: the test suite links the `windows` crate and winres needs
-# rc.exe, so the only usable cargo is the Windows one reached through the WSL
-# drive mount. (WSL's own `cargo` is not installed and Windows PATH integration
-# is deliberately off.)
-#
-# Three WSL/Windows facts this command has to work around, each of which cost
-# real debugging time:
-#
-#   1. No baseline command. Without one the Test step has nothing deterministic
-#      to run and improvises a live GUI harness. That stalled twice in WSL:
-#      `find /` to locate the exe crawls the whole 9p-mounted C: drive and sat at
-#      0.0% CPU for the better part of an hour, and launching the tray app via
-#      interop PowerShell deadlocks because a process that never exits inherits
-#      the console handles so the wrapper can never return.
-#
-#   2. Env vars do not cross the boundary. A variable set in a bash one-liner
-#      never reaches a Windows process: `CARGO_TARGET_DIR=... cargo.exe` reads
-#      back as empty on the Windows side. `WSLENV=<name>` is the documented opt-in
-#      that forwards a named variable, and it is required here.
-#
-#   3. WSL's 9p mount supports no Windows file locking. cargo's incremental
-#      compilation dies on it with "could not create session directory lock file:
-#      Incorrect function (os error -2147024895)". Gate worktrees live on the WSL
-#      filesystem, so the build directory has to be redirected to real Windows
-#      disk. That also makes the build fast: a cold `cargo test` is ~37s.
+# Gate settings for mnvoice. commands.test is the only baseline the Test step
+# has: without it the step improvises a harness from scratch. The Windows cargo
+# reached through the WSL mount is the only toolchain that can build this
+# crate on this machine, and its target dir must sit on Windows disk because
+# the 9p mount supports no Windows file locking.
 commands:
   test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test
 
-# This repository's only workflow is .github/workflows/release.yml. It fires on
-# tag pushes ("v*") and workflow_dispatch, and - since the Linux and macOS port
-# - on pull_request too, so a PR branch does register windows/linux/macos checks.
-#
-# no_ci stays true anyway, and for a different reason than it started with: the
-# gate's own commands.test above runs the Windows suite through the Windows cargo
-# reached from WSL, which is the only place the `windows` crate and winres can be
-# built on this machine. What CI adds that this gate cannot is the two Unix jobs -
-# ubuntu-latest and macos-latest each run `cargo test` - so the platforms this
-# port actually adds are covered there and nowhere else, by a runner the gate
-# cannot fold into the same wait as its own Windows suite.
-#
-# `no-mistakes ci-workflow` can generate a PR workflow from the command above,
-# but the generated one assumes a Go module and ubuntu-latest - wrong for this
-# Rust repo, whose suite needs a Windows runner (it links the `windows` crate
-# and winres). Writing a proper windows-latest workflow by hand is the
-# stronger fix if CI on the app's own platform is ever wanted.
+# A pull_request runs all three jobs, and each platform's tag push runs that
+# job, all on real runners (release.yml), so the pipeline monitors those
+# instead of inventing its own.
 no_ci: true

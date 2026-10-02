@@ -16,7 +16,7 @@ use crate::update;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -251,6 +251,10 @@ pub fn main() {
             .map(|c| c.auto_update)
             .unwrap_or_else(config::auto_update_enabled);
         update::startup_cleanup(auto_update);
+        // One-time move off the Run key onto a logon task. On its own
+        // thread: it only decides whether the NEXT logon starts the app,
+        // so the window, the hotkey and the tray never wait on its spawns.
+        thread::spawn(migrate_autostart);
         let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -479,7 +483,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         toggle(app);
                     }
                 } else if id == IDM_STARTUP {
-                    // Toggle the registry entry. Re-checked on next open, so the
+                    // Toggle the logon task. The Run key is cleared as a side
+                    // effect, and the state is re-read on next open, so the
                     // checkbox can never drift out of sync with reality.
                     let enable = !autostart_enabled();
                     if let Err(e) = set_autostart(enable) {
@@ -703,54 +708,341 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 }
 
+const AUTOSTART_TASK: &str = r"\mnvoice";
 const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE: &str = "mnvoice";
+/// Where Task Manager records that the user turned a startup entry off, so a
+/// Run value that Disable left behind is one Windows will not start.
+const AUTOSTART_APPROVED_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
-/// reg.exe with CREATE_NO_WINDOW, so toggling autostart never flashes a console.
 fn reg_cmd() -> std::process::Command {
     let mut c = std::process::Command::new("C:\\Windows\\System32\\reg.exe");
     c.creation_flags(0x0800_0000);
     c
 }
 
-/// True when a mnvoice autostart entry exists for the current user.
+fn schtasks_cmd() -> std::process::Command {
+    let mut c = std::process::Command::new("C:\\Windows\\System32\\schtasks.exe");
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+/// What makes mnvoice start at logon, as far as the machine says.
+///
+/// Present and absent are kept apart on purpose: a Run value that is merely
+/// there is one Windows ignores once Task Manager has disabled it, so the two
+/// say different things about what the checkmark may claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutostartState {
+    /// The logon task is registered: the steady state after the migration,
+    /// where the task's own answer settles everything.
+    TaskPresent,
+    /// Neither mechanism is registered, so nothing starts at logon.
+    NoRunValue,
+    /// No logon task, and a Run value Windows still starts.
+    RunValueEnabled,
+    /// No logon task, and a Run value the user turned off in Task Manager.
+    RunValueDisabled,
+}
+
+/// Whether the tray checkmark may claim autostart, spelled from the state
+/// alone rather than from any one read.
+///
+/// A logon task speaks for itself. A Run value does not: Task Manager's
+/// Disable leaves the value in place and starts nothing, so only a value the
+/// user has not turned off counts.
+fn autostart_starting(state: AutostartState) -> bool {
+    matches!(
+        state,
+        AutostartState::TaskPresent | AutostartState::RunValueEnabled
+    )
+}
+
+/// True when something starts mnvoice at logon, read one answer at a time.
+///
+/// The Run key is still consulted, so an install that has not been relaunched
+/// since the migration still reports an accurate tray checkmark instead of
+/// offering to enable something that is already on. Every read is a process
+/// spawn on the UI thread, so the staging matters: the logon task settles the
+/// question on its own in the steady state, and the Run value's Task Manager
+/// override is only read while an old Run entry may still be there.
 fn autostart_enabled() -> bool {
-    let Ok(out) = reg_cmd()
+    let state = if task_exists() {
+        AutostartState::TaskPresent
+    } else if !run_key_set() {
+        AutostartState::NoRunValue
+    } else if run_key_disabled() {
+        AutostartState::RunValueDisabled
+    } else {
+        AutostartState::RunValueEnabled
+    };
+    autostart_starting(state)
+}
+
+fn run_key_set() -> bool {
+    reg_cmd()
         .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Remove the pre-migration Run key entry, reporting whether it is gone.
+///
+/// True when the value is not there any more, which is what `reg query`
+/// confirms afterwards: a delete that did not take against a policy or a
+/// security product leaves it in place, and nothing may read that as success.
+fn clear_run_key() -> bool {
+    let _ = reg_cmd()
+        .args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
+        .output();
+    !run_key_set()
+}
+
+/// Whether the user has turned the Run-key autostart off in Task Manager.
+///
+/// Disable does not delete the Run value, it only writes a blob under
+/// StartupApproved\Run, so a value that is merely present says nothing about
+/// whether Windows starts it. A value that is absent, or a query that could
+/// not be answered, is read as no override, which is what Windows does too.
+fn run_key_disabled() -> bool {
+    let Ok(out) = reg_cmd()
+        .args(["query", AUTOSTART_APPROVED_KEY, "/v", AUTOSTART_VALUE])
         .output()
     else {
         return false;
     };
-    out.status.success()
+    if !out.status.success() {
+        return false;
+    }
+    // reg.exe prints the value, its type and then its bytes on one line, so
+    // the tail after the type is the blob.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let tail = text
+        .lines()
+        .find_map(|line| line.split_once("REG_BINARY"))
+        .map_or("", |(_, tail)| tail);
+    startup_approved_disabled(&parse_reg_binary_hex(tail))
 }
 
-/// Register or remove the current-user autostart entry. Reversible, no admin
-/// rights needed, and visible in Task Manager's Startup tab.
-fn set_autostart(enable: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut cmd = reg_cmd();
-    if enable {
-        cmd.args([
-            "add",
-            AUTOSTART_RUN_KEY,
-            "/v",
-            AUTOSTART_VALUE,
-            "/t",
-            "REG_SZ",
-            "/d",
-            exe.display().to_string().as_str(),
-            "/f",
-        ]);
+/// Turn a `reg query` binary value's hex tail into the bytes it encodes.
+///
+/// reg.exe prints the bytes as hex, and keeping only the hex digits means the
+/// grouping in that output does not have to be guessed at.
+fn parse_reg_binary_hex(hex: &str) -> Vec<u8> {
+    let digits: String = hex.chars().filter(char::is_ascii_hexdigit).collect();
+    digits
+        .as_bytes()
+        .chunks(2)
+        .filter_map(|pair| std::str::from_utf8(pair).ok())
+        .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+        .collect()
+}
+
+/// True when a StartupApproved blob records that the user turned the entry off.
+///
+/// The flag is the first byte and the rest is the timestamp: 02 is an entry
+/// Windows still starts, 03 and 06 are the flags Task Manager writes.
+fn startup_approved_disabled(blob: &[u8]) -> bool {
+    matches!(blob.first(), Some(0x03) | Some(0x06))
+}
+
+/// The schtasks arguments that ask whether the autostart task exists.
+///
+/// Deliberately no `/fo`: the exit status answers the question on every
+/// Windows, while a listing's field separator is the machine's own list
+/// separator (a semicolon on a default German system), so anything that
+/// parsed that text was answering a question about the locale instead.
+fn schtasks_query_args() -> Vec<String> {
+    ["query", "/tn", AUTOSTART_TASK]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// What the scheduler says about the at-logon autostart task.
+///
+/// Absent and Unknown must never be merged: a task that is not there is the
+/// state a disable asks for, while a query that could not be answered says
+/// nothing at all and has to fail the toggle rather than look like success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Ask the scheduler about the task.
+///
+/// Only a process that could not be spawned at all is unanswerable: schtasks
+/// exits zero for a task that is there and non-zero when it is not, and that
+/// exit code is the only thing there is to ask.
+fn task_state() -> TaskState {
+    match schtasks_cmd().args(schtasks_query_args()).output() {
+        Ok(out) if out.status.success() => TaskState::Present,
+        Ok(_) => TaskState::Absent,
+        Err(_) => TaskState::Unknown,
+    }
+}
+
+fn task_exists() -> bool {
+    task_state() == TaskState::Present
+}
+
+/// The schtasks arguments that create the autostart task.
+///
+/// ONLOGON is what makes this worth doing: the shell starts Run-key apps one
+/// at a time and spread over minutes on a busy boot, while the Task Scheduler
+/// runs logon-triggered tasks at logon itself. LIMITED keeps the task running
+/// as the current user with no elevation prompt, which is also what keeps the
+/// tray icon in the user's own session.
+fn schtasks_create_args(exe: &str) -> Vec<String> {
+    let quoted = quoted_exe(exe);
+    [
+        "/create",
+        "/tn",
+        AUTOSTART_TASK,
+        "/tr",
+        quoted.as_str(),
+        "/sc",
+        "onlogon",
+        "/rl",
+        "limited",
+        "/f",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The exe as the task action's command line.
+///
+/// The scheduler stores the /tr string as the action's command line without
+/// re-quoting it, and an unquoted path that contains a space does not launch:
+/// it is split at the space and resolves to the wrong program. A path that
+/// already carries its quotes is passed through, because wrapping it twice
+/// would break it the same way.
+fn quoted_exe(exe: &str) -> String {
+    if exe.len() >= 2 && exe.starts_with('"') && exe.ends_with('"') {
+        exe.to_string()
     } else {
-        cmd.args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"]);
+        format!("\"{exe}\"")
+    }
+}
+
+/// Serializes every autostart mutation in the process.
+///
+/// The one-time migration runs on its own thread at startup while the tray
+/// can be toggling the same task and the same Run key at the same time, so a
+/// mutation holds this across its reads, its command and its confirming
+/// queries: each mutation then sees the state the previous one left. A
+/// poisoned lock is taken anyway, because a panicked thread must not wedge
+/// the tray forever.
+static AUTOSTART_LOCK: Mutex<()> = Mutex::new(());
+
+fn autostart_lock() -> MutexGuard<'static, ()> {
+    AUTOSTART_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Move an older Run-key install onto the Task Scheduler, once, silently.
+///
+/// Called at startup so the fix happens by relaunching rather than by asking
+/// the user to do anything. Both mechanisms firing for one boot is harmless -
+/// the single-instance mutex makes the loser exit - and the task is left in
+/// place, so the swap only ever runs in this direction.
+pub fn migrate_autostart() {
+    let _mutation = autostart_lock();
+    if task_exists() || !run_key_set() {
+        return;
+    }
+    if run_key_disabled() {
+        // Task Manager's Disable leaves the Run value in place and starts
+        // nothing, so a logon task here would turn back on what the user
+        // turned off; the entry stays exactly as Windows left it.
+        log("autostart is disabled in Task Manager, leaving the Run key alone");
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.display().to_string();
+    let ok = schtasks_cmd()
+        .args(schtasks_create_args(&exe))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        if clear_run_key() {
+            log("autostart moved from the Run key to a logon task");
+        } else {
+            // The logon task holds the autostart, but the Run value survived
+            // the delete, so both mechanisms are still registered.
+            log("autostart moved to a logon task, but the Run key could not be retired");
+        }
+    } else {
+        // Leave the Run key alone: a machine whose task creation failed keeps
+        // starting through it next boot rather than not starting at all.
+        log("autostart migration to a logon task failed, keeping the Run key");
+    }
+}
+
+/// Whether turning autostart off left the logon task gone.
+///
+/// A delete that exited zero did its job. One that failed has to be
+/// classified rather than trusted: a task that was never there already leaves
+/// the requested state in place, while one that is still registered, or a
+/// question the scheduler could not answer, is a toggle that did not take -
+/// and there the Run key is still the only autostart the user has.
+fn delete_left_task_gone(delete_ok: bool, after: TaskState) -> bool {
+    delete_ok || after == TaskState::Absent
+}
+
+/// Register or remove the at-logon autostart task. Reversible, no admin rights
+/// needed, and the Run key is cleared in both directions - but only once the
+/// scheduler is confirmed to hold the state that was asked for, so a toggle
+/// that did not take can never destroy the autostart the user had.
+fn set_autostart(enable: bool) -> Result<(), String> {
+    let _mutation = autostart_lock();
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe.display().to_string();
+    let mut cmd = schtasks_cmd();
+    if enable {
+        cmd.args(schtasks_create_args(&exe));
+    } else {
+        cmd.args(["delete", "/tn", AUTOSTART_TASK, "/f"]);
     }
     let status = cmd.status().map_err(|e| e.to_string())?;
-    if status.success() {
-        log(if enable { "autostart enabled" } else { "autostart disabled" });
-        Ok(())
+    let in_place = if enable {
+        status.success()
     } else {
-        Err("reg.exe exited non-zero".into())
+        // The delete's own exit code is authority: a zero already means the
+        // task is gone, so the scheduler is only asked when it says otherwise.
+        status.success() || delete_left_task_gone(status.success(), task_state())
+    };
+    if !in_place {
+        // Whatever carries the autostart until the scheduler holds the one
+        // that was asked for stays as it is, and the toggle reports what did
+        // not take rather than naming a fallback that is not there.
+        return Err(if enable {
+            "schtasks.exe could not create the logon task, keeping the Run key".into()
+        } else if run_key_set() {
+            "schtasks.exe could not remove the logon task, keeping the Run key".into()
+        } else {
+            "the logon task could not be confirmed removed".into()
+        });
     }
+    if !clear_run_key() {
+        // The Run value survived, so the app still starts at logon however
+        // the task reads, and the log must not claim a move that half failed.
+        return Err(if enable {
+            "the Run key could not be retired, so mnvoice starts twice at logon".into()
+        } else {
+            "the Run key could not be retired, so mnvoice still starts at logon".into()
+        });
+    }
+    log(if enable { "autostart enabled" } else { "autostart disabled" });
+    Ok(())
 }
 
 /// Open a companion file beside the exe in Notepad, creating it from a stub if
@@ -874,4 +1166,161 @@ fn relaunch_for_restart() {
         let _ = std::process::Command::new(&exe).arg("--restart").spawn();
     }
     unsafe { PostQuitMessage(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_query_arguments_do_not_ask_for_a_format() {
+        // The answer comes from the exit status, which means the same thing
+        // on every Windows. A listing is only readable when its field
+        // separator is a comma, and that separator is the machine's list
+        // separator, so no format argument may ever appear here to parse.
+        let args = schtasks_query_args();
+        assert_eq!(
+            args,
+            vec![
+                "query".to_string(),
+                "/tn".to_string(),
+                AUTOSTART_TASK.to_string()
+            ],
+            "the existence question is a plain query"
+        );
+        assert!(
+            !args.iter().any(|a| a
+                .trim_start_matches('/')
+                .eq_ignore_ascii_case("fo")
+                || a.trim_start_matches('/').eq_ignore_ascii_case("format")),
+            "expected no format argument in {args:?}"
+        );
+    }
+
+    #[test]
+    fn the_create_arguments_pin_the_latency_fix() {
+        // The flags are the entire point of the change: a logon trigger (the
+        // Run key is started late and one-at-a-time), run as the current user
+        // without elevation (keeps the tray in the user's session), and /f so
+        // re-enabling over an existing task is not an error. The action's
+        // command line carries the path in quotes, because the scheduler
+        // stores the /tr value verbatim and a spaced path that is not quoted
+        // resolves to the wrong program at logon.
+        let spaced = r"C:\Users\Some User\bin\mnvoice.exe";
+        let args = schtasks_create_args(spaced);
+        for flag in ["/create", "/sc", "onlogon", "/rl", "limited", "/f"] {
+            assert!(
+                args.iter().any(|a| a == flag),
+                "expected {flag} in {args:?}"
+            );
+        }
+        let action = args
+            .iter()
+            .position(|a| a == "/tr")
+            .and_then(|i| args.get(i + 1))
+            .expect("the action follows /tr");
+        assert_eq!(
+            action,
+            &format!("\"{spaced}\""),
+            "the action is the path wrapped in quotes"
+        );
+        let already = schtasks_create_args(&format!("\"{spaced}\""));
+        assert_eq!(
+            already
+                .iter()
+                .position(|a| a == "/tr")
+                .and_then(|i| already.get(i + 1)),
+            Some(&format!("\"{spaced}\"")),
+            "an already-quoted path is not quoted twice"
+        );
+    }
+
+    #[test]
+    fn the_binary_hex_tail_becomes_bytes() {
+        // The shape reg.exe actually prints for a StartupApproved blob.
+        assert_eq!(
+            parse_reg_binary_hex("030000009AB326D7E424DC01"),
+            vec![0x03, 0x00, 0x00, 0x00, 0x9A, 0xB3, 0x26, 0xD7, 0xE4, 0x24, 0xDC, 0x01]
+        );
+        assert_eq!(
+            parse_reg_binary_hex("02 00 00 00 00 00 00 00 00 00 00 00"),
+            vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "spacing is not part of the answer"
+        );
+        assert!(parse_reg_binary_hex("").is_empty(), "no hex is no blob");
+    }
+
+    #[test]
+    fn only_the_disabled_flag_makes_a_blob_a_user_override() {
+        // 02 is an entry Windows still starts; 03 and 06 are the flags Task
+        // Manager writes when the user turns one off.
+        assert!(!startup_approved_disabled(&[0x02, 0x00, 0x00, 0x00]));
+        assert!(startup_approved_disabled(&[0x03, 0x00, 0x00, 0x00]));
+        assert!(startup_approved_disabled(&[0x06, 0x00, 0x00, 0x00]));
+        assert!(!startup_approved_disabled(&[]), "no blob is no override");
+    }
+
+    #[test]
+    fn the_tray_checkmark_follows_what_actually_starts() {
+        // The logon task answers the question on its own, and so does a Run
+        // value Windows still starts; an entry the user turned off in Task
+        // Manager starts nothing, and so does a machine with neither.
+        assert!(autostart_starting(AutostartState::TaskPresent));
+        assert!(autostart_starting(AutostartState::RunValueEnabled));
+        assert!(!autostart_starting(AutostartState::RunValueDisabled));
+        assert!(!autostart_starting(AutostartState::NoRunValue));
+    }
+
+    #[test]
+    fn a_failed_disable_only_counts_when_the_task_is_really_gone() {
+        // The delete's own exit code is authority, so a follow-up question
+        // that could not be answered changes nothing.
+        assert!(delete_left_task_gone(true, TaskState::Unknown));
+        assert!(delete_left_task_gone(true, TaskState::Absent));
+        // A delete that failed says nothing on its own: a task that was never
+        // there already leaves the requested state in place.
+        assert!(delete_left_task_gone(false, TaskState::Absent));
+        assert!(!delete_left_task_gone(false, TaskState::Present));
+        assert!(!delete_left_task_gone(false, TaskState::Unknown));
+    }
+
+    #[test]
+    fn autostart_mutations_never_overlap() {
+        // Two threads inside their critical section at once is exactly the
+        // interleaving that silently reversed a user's disable: the tray's
+        // mutation and the migration thread must keep each other out.
+        static INSIDE: AtomicBool = AtomicBool::new(false);
+        let overlapping = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let overlapping = Arc::clone(&overlapping);
+            handles.push(std::thread::spawn(move || {
+                let _mutation = autostart_lock();
+                if INSIDE.swap(true, Ordering::SeqCst) {
+                    overlapping.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                INSIDE.store(false, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("a probe thread");
+        }
+        assert!(
+            !overlapping.load(Ordering::SeqCst),
+            "two mutations were inside their critical section at once"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_autostart_lock_is_still_taken() {
+        // A panicked thread must not wedge the tray, so the next mutation
+        // takes the poisoned lock instead of unwrapping a poison error.
+        let joiner = std::thread::spawn(|| {
+            let _mutation = autostart_lock();
+            panic!("poison the lock on purpose");
+        });
+        assert!(joiner.join().is_err(), "the probe panicked as intended");
+        let _mutation = autostart_lock();
+    }
 }

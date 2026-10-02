@@ -3,8 +3,8 @@ name: Release
 # Releases are per platform: one tag per platform (v0.1.15-win / -linux /
 # -macos), one release per tag, each carrying only that platform's artifacts.
 # A pull_request still builds and tests all three jobs - that is where the port
-# is verified on real Linux and macOS runners, since the gate on this machine
-# can only drive Windows.
+# is verified on real Linux and macOS runners, which a single-platform checkout
+# can never do for itself.
 on:
   push:
     tags:
