@@ -344,6 +344,12 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
+/// The idle tray tip. It names the hotkey actually configured, not a
+/// hardcoded one: a user with KEYBIND=F9 must not be told to press Alt+Space.
+fn idle_tip(hotkey: Option<&str>) -> String {
+    format!("mnvoice - idle. {} to dictate.", hotkey.unwrap_or("Alt+Space"))
+}
+
 unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -421,18 +427,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
-                    // The idle tip names the hotkey actually configured, not a
-                    // hardcoded one: a user with KEYBIND=F9 must not be told
-                    // to press Alt+Space.
-                    let idle_tip = app
-                        .config
-                        .as_ref()
-                        .map(|c| c.hotkey_str.as_str())
-                        .unwrap_or("Alt+Space");
                     let tip = match app.state {
                         State::Idle => {
-                            // Rebuild the string: the configured key is borrowed.
-                            format!("mnvoice - idle. {idle_tip} to dictate.")
+                            idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str()))
                         }
                         State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
                         State::Transcribing => "mnvoice - transcribing...".to_string(),
@@ -1282,6 +1279,14 @@ mod tests {
         assert!(autostart_starting(AutostartState::RunValueEnabled));
         assert!(!autostart_starting(AutostartState::RunValueDisabled));
         assert!(!autostart_starting(AutostartState::NoRunValue));
+    }
+
+    #[test]
+    fn the_idle_tray_tip_names_the_configured_hotkey() {
+        // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
+        // no config yet the documented default is what the tip names.
+        assert_eq!(idle_tip(Some("F9")), "mnvoice - idle. F9 to dictate.");
+        assert_eq!(idle_tip(None), "mnvoice - idle. Alt+Space to dictate.");
     }
 
     #[test]
