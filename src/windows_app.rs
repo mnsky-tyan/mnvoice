@@ -727,23 +727,56 @@ fn schtasks_cmd() -> std::process::Command {
     c
 }
 
-/// Whether autostart really starts at logon, spelled from the three live
-/// states rather than any one of them.
+/// What makes mnvoice start at logon, as far as the machine says.
 ///
-/// A logon task speaks for itself. A Run value does not: Task Manager's
-/// Disable leaves the value in place and starts nothing, so a present value
-/// only counts while the user has not turned it off.
-fn autostart_on(task_present: bool, run_present: bool, run_disabled: bool) -> bool {
-    task_present || (run_present && !run_disabled)
+/// Present and absent are kept apart on purpose: a Run value that is merely
+/// there is one Windows ignores once Task Manager has disabled it, so the two
+/// say different things about what the checkmark may claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutostartState {
+    /// The logon task is registered: the steady state after the migration,
+    /// where the task's own answer settles everything.
+    TaskPresent,
+    /// Neither mechanism is registered, so nothing starts at logon.
+    NoRunValue,
+    /// No logon task, and a Run value Windows still starts.
+    RunValueEnabled,
+    /// No logon task, and a Run value the user turned off in Task Manager.
+    RunValueDisabled,
 }
 
-/// True when the at-logon autostart task exists for the current user.
+/// Whether the tray checkmark may claim autostart, spelled from the state
+/// alone rather than from any one read.
+///
+/// A logon task speaks for itself. A Run value does not: Task Manager's
+/// Disable leaves the value in place and starts nothing, so only a value the
+/// user has not turned off counts.
+fn autostart_starting(state: AutostartState) -> bool {
+    matches!(
+        state,
+        AutostartState::TaskPresent | AutostartState::RunValueEnabled
+    )
+}
+
+/// True when something starts mnvoice at logon, read one answer at a time.
 ///
 /// The Run key is still consulted, so an install that has not been relaunched
 /// since the migration still reports an accurate tray checkmark instead of
-/// offering to enable something that is already on.
+/// offering to enable something that is already on. Every read is a process
+/// spawn on the UI thread, so the staging matters: the logon task settles the
+/// question on its own in the steady state, and the Run value's Task Manager
+/// override is only read while an old Run entry may still be there.
 fn autostart_enabled() -> bool {
-    autostart_on(task_exists(), run_key_set(), run_key_disabled())
+    let state = if task_exists() {
+        AutostartState::TaskPresent
+    } else if !run_key_set() {
+        AutostartState::NoRunValue
+    } else if run_key_disabled() {
+        AutostartState::RunValueDisabled
+    } else {
+        AutostartState::RunValueEnabled
+    };
+    autostart_starting(state)
 }
 
 fn run_key_set() -> bool {
@@ -1175,18 +1208,13 @@ mod tests {
 
     #[test]
     fn the_tray_checkmark_follows_what_actually_starts() {
-        // Every combination of the three live states, including the two the
-        // captain described: an entry the user turned off in Task Manager
-        // starts nothing, and its still-present Run value must not talk it
-        // back into being checked.
-        assert!(autostart_on(true, false, false));
-        assert!(autostart_on(true, true, false));
-        assert!(autostart_on(true, false, true));
-        assert!(autostart_on(true, true, true));
-        assert!(autostart_on(false, true, false));
-        assert!(!autostart_on(false, false, false));
-        assert!(!autostart_on(false, false, true));
-        assert!(!autostart_on(false, true, true));
+        // The logon task answers the question on its own, and so does a Run
+        // value Windows still starts; an entry the user turned off in Task
+        // Manager starts nothing, and so does a machine with neither.
+        assert!(autostart_starting(AutostartState::TaskPresent));
+        assert!(autostart_starting(AutostartState::RunValueEnabled));
+        assert!(!autostart_starting(AutostartState::RunValueDisabled));
+        assert!(!autostart_starting(AutostartState::NoRunValue));
     }
 
     #[test]
