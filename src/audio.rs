@@ -14,7 +14,7 @@ use windows::Win32::System::Com::*;
 
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
-pub use crate::platform::audio::{wav_bytes, SAMPLE_RATE};
+pub use crate::platform::audio::{wav_bytes, NO_SPEECH_LIMIT_MS, SAMPLE_RATE};
 pub const WM_APP_RECORDING_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
 struct CaptureRequest {
@@ -148,8 +148,8 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
 
     let mut speech_started = false;
-    let mut silence_ms = 0u32;
-    let mut no_speech_ms = 0u32;
+    let mut silence_ms = 0u64;
+    let mut no_speech_ms = 0u64;
     let block_align = engine.format.nBlockAlign.max(1) as usize;
     let vad_silence_ms = req.vad_silence_ms;
     let vad_rms_threshold = req.vad_rms_threshold;
@@ -174,14 +174,33 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 
         if frames > 0 && !ptr.is_null() {
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
-            if let Ok(s) = convert_mix(bytes, &engine.format) {
-                sample_buf.extend_from_slice(&s);
+            // Convert while the raw buffer is still borrowed, then always
+            // release it below before acting on the result.
+            let converted = convert_mix(bytes, &engine.format);
+            engine
+                .capture_client
+                .ReleaseBuffer(frames)
+                .map_err(|e| format!("capture release ({e})"))?;
+            match converted {
+                Ok(s) => sample_buf.extend_from_slice(&s),
+                // A capture format the mixer cannot translate (the device
+                // switched or a stream reset landed mid-dictation) would
+                // otherwise capture nothing, silently, until the session ends
+                // with "No speech detected". Stop and report instead.
+                Err(e) => {
+                    let _ = engine.client.Stop();
+                    let _ = engine.client.Reset();
+                    return Err(format!(
+                        "audio device delivered an unreadable format, session aborted: {e}"
+                    ));
+                }
             }
+        } else {
+            engine
+                .capture_client
+                .ReleaseBuffer(frames)
+                .map_err(|e| format!("capture release ({e})"))?;
         }
-        engine
-            .capture_client
-            .ReleaseBuffer(frames)
-            .map_err(|e| format!("capture release ({e})"))?;
 
         // Push 40ms chunks (640 samples) for ultra-low latency streaming
         while sample_buf.len() >= 640 {
@@ -191,18 +210,22 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
             let rms = (sum_sq / chunk.len() as f64).sqrt();
 
+            // Advance the voice-activity windows by the audio the chunk
+            // carries (see platform::audio::audio_ms), not by loop ticks.
+            let chunk_ms = crate::platform::audio::audio_ms(chunk.len());
+
             if rms > vad_rms_threshold {
                 speech_started = true;
                 silence_ms = 0;
             } else if speech_started {
-                silence_ms += 40;
-                if silence_ms >= vad_silence_ms {
+                silence_ms += chunk_ms;
+                if silence_ms >= u64::from(vad_silence_ms) {
                     // silence after speech -> auto-stop
                     req.stop.store(true, Ordering::SeqCst);
                 }
             } else {
-                no_speech_ms += 40;
-                if no_speech_ms >= 10000 {
+                no_speech_ms += chunk_ms;
+                if no_speech_ms >= NO_SPEECH_LIMIT_MS {
                     // 10s with no speech at all -> auto-stop
                     req.stop.store(true, Ordering::SeqCst);
                 }

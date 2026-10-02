@@ -1,7 +1,8 @@
 fn main() {
     // The resource section is a Windows concept; winres would try to run
-    // rc.exe everywhere, so this only happens for Windows targets. The version
-    // env is emitted unconditionally because the CLI prints it too.
+    // rc.exe everywhere, so this only happens for Windows targets. The tag
+    // env is emitted unconditionally because the CLI prints the version on
+    // every platform.
     if std::env::var("CARGO_CFG_WINDOWS").is_ok() {
         // Embed the application icon so it lands in the exe's resource section.
         // Without this, the tray and window class icons fall back to the generic
