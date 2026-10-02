@@ -281,8 +281,10 @@ synonyms `MODE`/`PROVIDER` for `PROTOCOL`, `ENDPOINT` for `BASE_URL`,
 `ORB_COLOR`, `ORB_FLUID_AMOUNT` for `ORB_FLUID_LEVEL`,
 `TRIGGER_HOTKEY`/`KEYBIND` for `HOTKEY`, `CANCEL_HOTKEY` for `CANCEL_KEY`,
 `SILENCE_MS` for `VAD_SILENCE_MS`, and `RMS_THRESHOLD` for
-`VAD_RMS_THRESHOLD`. Within one file a canonical key always beats its
-aliases, no matter the order they appear in.
+`VAD_RMS_THRESHOLD`. For `API_KEY`, `MODEL`, `LANGUAGE` and `BASE_URL` a
+canonical key beats its aliases no matter the order lines appear in; every
+other field takes the last line that names it (`KEYWORDS` accumulate), so
+when one file mixes a key with its alias, write the spelling you want last.
 
 #### How filler-word stripping works
 

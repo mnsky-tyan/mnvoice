@@ -643,13 +643,41 @@ mod tests {
     fn a_name_accepted_from_the_file_is_accepted_from_the_environment() {
         // The drift this table exists to prevent: these five names were once
         // file-only, so `KEYBIND=F9` as an environment variable silently did
-        // nothing while the same line in mnvoice.env worked.
-        for drifted in ["KEYBIND", "COLOR", "FLUID_LEVEL", "CUSTOM_WORDS", "VOCABULARY"] {
-            assert!(
-                FIELDS.iter().any(|(names, _)| names.contains(&drifted)),
-                "{drifted} must be accepted from both sources"
-            );
-        }
+        // nothing while the same line in mnvoice.env worked. Prove each one
+        // lands in its field from BOTH sources, observed in the RawFields the
+        // two passes actually fill.
+        let mut raw = RawFields::new();
+
+        raw.set_file(Field::Hotkey, "KEYBIND", "F9");
+        assert_eq!(raw.hotkey_str, "F9", "KEYBIND must reach the hotkey from the file");
+        raw.set_env(Field::Hotkey, "F10");
+        assert_eq!(raw.hotkey_str, "F10", "KEYBIND must reach the hotkey from the env");
+
+        raw.set_file(Field::OrbColor, "COLOR", "#A855F7");
+        assert_eq!(raw.orb_color_str, "#A855F7", "COLOR must reach the orb color from the file");
+        raw.set_env(Field::OrbColor, "cyan");
+        assert_eq!(raw.orb_color_str, "cyan", "COLOR must reach the orb color from the env");
+
+        raw.set_file(Field::OrbFluid, "FLUID_LEVEL", "0.9");
+        assert_eq!(raw.orb_fluid_str, "0.9", "FLUID_LEVEL must reach the fluid level from the file");
+        raw.set_env(Field::OrbFluid, "50%");
+        assert_eq!(raw.orb_fluid_str, "50%", "FLUID_LEVEL must reach the fluid level from the env");
+
+        raw.set_file(Field::Keywords, "CUSTOM_WORDS", "herdr, mnvoice");
+        assert!(
+            raw.keywords.contains(&"herdr".to_string()) && raw.keywords.contains(&"mnvoice".to_string()),
+            "CUSTOM_WORDS must reach the keywords from the file, got {:?}",
+            raw.keywords
+        );
+        raw.set_env(Field::Keywords, "PostgreSQL");
+        assert!(
+            raw.keywords.contains(&"PostgreSQL".to_string()),
+            "CUSTOM_WORDS must reach the keywords from the env, got {:?}",
+            raw.keywords
+        );
+
+        raw.set_file(Field::Keywords, "VOCABULARY", "six");
+        assert!(raw.keywords.contains(&"six".to_string()), "VOCABULARY must reach the keywords from the file");
     }
 
     #[test]

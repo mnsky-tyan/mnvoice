@@ -829,10 +829,15 @@ mod tests {
 
     #[test]
     fn the_feed_and_the_download_urls_name_the_same_repository() {
-        // RELEASES_FEED and asset_url/checksum_url were written by hand against
-        // the same repo; if one is ever repointed without the other, an update
+        // RELEASES_FEED, asset_url and checksum_url are written against the
+        // same repo; if one is ever repointed without the others, an update
         // check would resolve versions from a feed whose assets this binary
-        // then refuses (or worse, trusts). The feed must keep naming REPO.
+        // then refuses (or worse, trusts). Drive the real URL builders: every
+        // URL the updater produces must name REPO, and the feed must keep
+        // being the atom feed the updater parses.
+        let tag = "v0.1.18-win";
+        assert!(asset_url(tag).contains(REPO), "the exe URL must track REPO");
+        assert!(checksum_url(tag).contains(REPO), "the sums URL must track REPO");
         assert!(
             RELEASES_FEED.contains(REPO),
             "the feed must track REPO ({REPO}), got {RELEASES_FEED}"
@@ -853,6 +858,18 @@ mod tests {
             "unknown platform suffix {}",
             platform_release_suffix()
         );
+        // The suffix's consumer: a tag carrying it is ours, the same tag with
+        // either other platform's suffix is not.
+        let ours = format!("v0.1.18-{}", platform_release_suffix());
+        assert!(tag_is_ours(&ours), "{ours} must resolve as ours");
+        let others = ["win", "linux", "macos"]
+            .into_iter()
+            .filter(|s| *s != platform_release_suffix())
+            .map(|s| format!("v0.1.18-{s}"))
+            .collect::<Vec<_>>();
+        for other in others {
+            assert!(!tag_is_ours(&other), "{other} belongs to another platform");
+        }
     }
 
     #[test]
