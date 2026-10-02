@@ -45,28 +45,14 @@ pub struct Config {
 }
 
 pub fn load() -> Result<Config, String> {
-    let mut protocol_str = String::new();
-    let mut api_key = String::new();
-    let mut model = String::new();
-    let mut language = String::new();
-    let mut base_url = String::new();
-    let mut max_seconds = 120u32;
-    let mut trailing_space = true;
-    let mut keywords: Vec<String> = Vec::new();
-    let mut orb_color_str = String::new();
-    let mut orb_fluid_str = String::new();
-    let mut hotkey_str = String::new();
-    let mut cancel_key_str = String::new();
-    let mut vad_silence_ms = 3000u32;
-    let mut vad_rms_threshold = 400.0f64;
-    let mut filler_words_str = String::new();
+    let mut raw = RawFields::new();
 
     // Check for keywords.txt beside the executable
     if let Ok(exe) = std::env::current_exe() {
         for filename in ["keywords.txt", "vocabulary.txt", "words.txt"] {
             let path = exe.with_file_name(filename);
             if let Ok(text) = std::fs::read_to_string(&path) {
-                parse_keywords_text(&text, &mut keywords);
+                parse_keywords_text(&text, &mut raw.keywords);
             }
         }
     }
@@ -76,98 +62,33 @@ pub fn load() -> Result<Config, String> {
         let path = exe.with_file_name("mnvoice.env");
         if let Ok(text) = std::fs::read_to_string(&path) {
             parse(&text, |k, v| {
-                apply(
-                    k,
-                    v,
-                    &mut protocol_str,
-                    &mut api_key,
-                    &mut model,
-                    &mut language,
-                    &mut base_url,
-                    &mut max_seconds,
-                    &mut trailing_space,
-                    &mut keywords,
-                    &mut orb_color_str,
-                    &mut orb_fluid_str,
-                    &mut hotkey_str,
-                    &mut cancel_key_str,
-                    &mut vad_silence_ms,
-                    &mut vad_rms_threshold,
-                    &mut filler_words_str,
-                )
+                if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
+                    raw.set_file(*field, k, v);
+                }
             });
         }
     }
 
-    // Highest priority: real environment variables.
-    if let Ok(v) = std::env::var("PROTOCOL").or_else(|_| std::env::var("MODE")).or_else(|_| std::env::var("PROVIDER")) {
-        protocol_str = v;
-    }
-    if let Ok(v) = std::env::var("API_KEY")
-        .or_else(|_| std::env::var("DEEPGRAM_API_KEY"))
-        .or_else(|_| std::env::var("GROQ_API_KEY"))
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-    {
-        api_key = v;
-    }
-
-    if let Ok(v) = std::env::var("MODEL")
-        .or_else(|_| std::env::var("DEEPGRAM_MODEL"))
-        .or_else(|_| std::env::var("GROQ_MODEL"))
-        .or_else(|_| std::env::var("OPENAI_MODEL"))
-    {
-        model = v;
-    }
-    if let Ok(v) = std::env::var("LANGUAGE")
-        .or_else(|_| std::env::var("DEEPGRAM_LANGUAGE"))
-        .or_else(|_| std::env::var("GROQ_LANGUAGE"))
-    {
-        language = v;
-    }
-    if let Ok(v) = std::env::var("BASE_URL")
-        .or_else(|_| std::env::var("DEEPGRAM_BASE_URL"))
-        .or_else(|_| std::env::var("GROQ_BASE_URL"))
-        .or_else(|_| std::env::var("ENDPOINT"))
-    {
-        base_url = v;
-    }
-    if let Ok(v) = std::env::var("MAX_SECONDS") {
-        if let Ok(n) = v.parse() { max_seconds = n; }
-    }
-    if let Ok(v) = std::env::var("TRAILING_SPACE") {
-        trailing_space = v != "0";
-    }
-    if let Ok(v) = std::env::var("KEYWORDS").or_else(|_| std::env::var("KEYTERMS")) {
-        parse_keywords_text(&v, &mut keywords);
-    }
-    if let Ok(v) = std::env::var("ORB_COLOR").or_else(|_| std::env::var("ORB_HEX")) {
-        orb_color_str = v;
-    }
-    if let Ok(v) = std::env::var("ORB_FLUID_LEVEL").or_else(|_| std::env::var("ORB_FLUID_AMOUNT")) {
-        orb_fluid_str = v;
-    }
-    if let Ok(v) = std::env::var("HOTKEY").or_else(|_| std::env::var("TRIGGER_HOTKEY")) {
-        hotkey_str = v;
-    }
-    if let Ok(v) = std::env::var("CANCEL_KEY").or_else(|_| std::env::var("CANCEL_HOTKEY")) {
-        cancel_key_str = v;
-    }
-    if let Ok(v) = std::env::var("VAD_SILENCE_MS").or_else(|_| std::env::var("SILENCE_MS")) {
-        if let Ok(n) = v.parse() { vad_silence_ms = n; }
-    }
-    if let Ok(v) = std::env::var("VAD_RMS_THRESHOLD").or_else(|_| std::env::var("RMS_THRESHOLD")) {
-        if let Ok(n) = v.parse() { vad_rms_threshold = n; }
-    }
-    if let Ok(v) = std::env::var("FILLER_WORDS") {
-        filler_words_str = v;
+    // Highest priority: real environment variables. Both sources read the same
+    // table, so a name one accepts the other cannot silently ignore.
+    for (names, field) in FIELDS {
+        for name in *names {
+            if let Ok(v) = std::env::var(name) {
+                raw.set_env(*field, &v);
+                break;
+            }
+        }
     }
 
     // Determine protocol: streaming vs rest
-    let protocol = match protocol_str.to_lowercase().as_str() {
+    let protocol = match raw.protocol_str.to_lowercase().as_str() {
         "rest" | "http" | "batch" | "groq" | "openai" => Protocol::Rest,
         "streaming" | "stream" | "websocket" | "ws" | "deepgram" => Protocol::Streaming,
         _ => {
-            if base_url.contains("groq.com") || base_url.contains("openai.com") || model.contains("whisper") {
+            if raw.base_url.contains("groq.com")
+                || raw.base_url.contains("openai.com")
+                || raw.model.contains("whisper")
+            {
                 Protocol::Rest
             } else {
                 Protocol::Streaming
@@ -175,47 +96,50 @@ pub fn load() -> Result<Config, String> {
         }
     };
 
-    if api_key.trim().is_empty() {
+    if raw.api_key.trim().is_empty() {
         return Err("No API key configured. Set API_KEY in mnvoice.env next to the mnvoice binary.".into());
     }
 
+    let mut model = raw.model;
     if model.is_empty() {
         model = match protocol {
             Protocol::Streaming => "nova-3".into(),
             Protocol::Rest => "whisper-large-v3-turbo".into(),
         };
     }
+    let mut base_url = raw.base_url;
     if base_url.is_empty() {
         base_url = match protocol {
             Protocol::Streaming => "https://api.deepgram.com".into(),
             Protocol::Rest => "https://api.groq.com".into(),
         };
     }
+    let mut language = raw.language;
     if language.is_empty() {
         language = "en".into();
     }
 
-    let orb_color = parse_color(&orb_color_str);
-    let orb_fluid_level = parse_fluid_level(&orb_fluid_str);
+    let orb_color = parse_color(&raw.orb_color_str);
+    let orb_fluid_level = parse_fluid_level(&raw.orb_fluid_str);
 
-    let hotkey_actual_str = if hotkey_str.trim().is_empty() {
+    let hotkey_actual_str = if raw.hotkey_str.trim().is_empty() {
         "Alt+Space".to_string()
     } else {
-        hotkey_str.trim().to_string()
+        raw.hotkey_str.trim().to_string()
     };
     let hotkey = parse_hotkey(&hotkey_actual_str).unwrap_or((0x0001 | 0x4000, 0x20)); // MOD_ALT | MOD_NOREPEAT, VK_SPACE
 
-    let cancel_key_actual_str = if cancel_key_str.trim().is_empty() {
+    let cancel_key_actual_str = if raw.cancel_key_str.trim().is_empty() {
         "Escape".to_string()
     } else {
-        cancel_key_str.trim().to_string()
+        raw.cancel_key_str.trim().to_string()
     };
     let cancel_key = parse_hotkey(&cancel_key_actual_str).unwrap_or((0x4000, 0x1B)); // MOD_NOREPEAT, VK_ESCAPE
 
     // FILLER_WORDS=0 (default) strips disfluencies; =1 keeps them verbatim.
     // Empty or unset strips, so a typo can never silently re-enable fillers.
     let strip_fillers = !matches!(
-        filler_words_str.trim().to_lowercase().as_str(),
+        raw.filler_words_str.trim().to_lowercase().as_str(),
         "1" | "true" | "on" | "yes" | "keep"
     );
 
@@ -223,21 +147,21 @@ pub fn load() -> Result<Config, String> {
 
     Ok(Config {
         protocol,
-        api_key,
+        api_key: raw.api_key,
         model,
         language,
         base_url,
-        max_seconds,
-        trailing_space,
-        keywords,
+        max_seconds: raw.max_seconds,
+        trailing_space: raw.trailing_space,
+        keywords: raw.keywords,
         orb_color,
         orb_fluid_level,
         hotkey,
         hotkey_str: hotkey_actual_str,
         cancel_key,
         cancel_key_str: cancel_key_actual_str,
-        vad_silence_ms,
-        vad_rms_threshold,
+        vad_silence_ms: raw.vad_silence_ms,
+        vad_rms_threshold: raw.vad_rms_threshold,
         strip_fillers,
         // Deliberately not parsed inline below: a broken API key aborts load(),
         // and if AUTO_UPDATE were derived from the same pass the updater would
@@ -314,67 +238,189 @@ fn parse<F: FnMut(&str, &str)>(text: &str, mut f: F) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply(
-    k: &str,
-    v: &str,
-    protocol_str: &mut String,
-    api_key: &mut String,
-    model: &mut String,
-    language: &mut String,
-    base_url: &mut String,
-    max_seconds: &mut u32,
-    trailing_space: &mut bool,
-    keywords: &mut Vec<String>,
-    orb_color_str: &mut String,
-    orb_fluid_str: &mut String,
-    hotkey_str: &mut String,
-    cancel_key_str: &mut String,
-    vad_silence_ms: &mut u32,
-    vad_rms_threshold: &mut f64,
-    filler_words_str: &mut String,
-) {
-    match k {
-        "PROTOCOL" | "MODE" | "PROVIDER" => *protocol_str = v.to_string(),
-        "API_KEY" | "DEEPGRAM_API_KEY" | "GROQ_API_KEY" | "OPENAI_API_KEY" => {
-            if api_key.is_empty() || k == "API_KEY" {
-                *api_key = v.to_string();
+/// One configuration field: the first name is canonical, the rest are aliases
+/// that mean the same thing. Both sources - mnvoice.env and the process
+/// environment - drive from this one table, so the two can never disagree about
+/// which names a field accepts (that drift once made `KEYBIND=F9` work in the
+/// file while silently doing nothing as an environment variable).
+const FIELDS: &[(&[&str], Field)] = &[
+    (&["PROTOCOL", "MODE", "PROVIDER"], Field::Protocol),
+    (
+        &["API_KEY", "DEEPGRAM_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY"],
+        Field::ApiKey,
+    ),
+    (
+        &["MODEL", "DEEPGRAM_MODEL", "GROQ_MODEL", "OPENAI_MODEL"],
+        Field::Model,
+    ),
+    (&["LANGUAGE", "DEEPGRAM_LANGUAGE", "GROQ_LANGUAGE"], Field::Language),
+    (
+        &["BASE_URL", "DEEPGRAM_BASE_URL", "GROQ_BASE_URL", "ENDPOINT"],
+        Field::BaseUrl,
+    ),
+    (&["MAX_SECONDS"], Field::MaxSeconds),
+    (&["TRAILING_SPACE"], Field::TrailingSpace),
+    (
+        &["KEYWORDS", "KEYTERMS", "CUSTOM_WORDS", "VOCABULARY"],
+        Field::Keywords,
+    ),
+    (&["ORB_COLOR", "ORB_HEX", "COLOR"], Field::OrbColor),
+    (&["ORB_FLUID_LEVEL", "ORB_FLUID_AMOUNT", "FLUID_LEVEL"], Field::OrbFluid),
+    (&["HOTKEY", "TRIGGER_HOTKEY", "KEYBIND"], Field::Hotkey),
+    (&["CANCEL_KEY", "CANCEL_HOTKEY"], Field::CancelKey),
+    (&["VAD_SILENCE_MS", "SILENCE_MS"], Field::VadSilenceMs),
+    (&["VAD_RMS_THRESHOLD", "RMS_THRESHOLD"], Field::VadRmsThreshold),
+    (&["FILLER_WORDS"], Field::FillerWords),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Protocol,
+    ApiKey,
+    Model,
+    Language,
+    BaseUrl,
+    MaxSeconds,
+    TrailingSpace,
+    Keywords,
+    OrbColor,
+    OrbFluid,
+    Hotkey,
+    CancelKey,
+    VadSilenceMs,
+    VadRmsThreshold,
+    FillerWords,
+}
+
+impl Field {
+    /// The key this field is documented under; an alias never overrides it.
+    fn canonical(self) -> &'static str {
+        FIELDS
+            .iter()
+            .find(|(_, f)| *f == self)
+            .map_or("", |(names, _)| names[0])
+    }
+}
+
+/// The not-yet-interpreted field values gathered from the sources, in the
+/// order they arrive. `load` turns this into a `Config` once both passes ran.
+struct RawFields {
+    protocol_str: String,
+    api_key: String,
+    model: String,
+    language: String,
+    base_url: String,
+    max_seconds: u32,
+    trailing_space: bool,
+    keywords: Vec<String>,
+    orb_color_str: String,
+    orb_fluid_str: String,
+    hotkey_str: String,
+    cancel_key_str: String,
+    vad_silence_ms: u32,
+    vad_rms_threshold: f64,
+    filler_words_str: String,
+}
+
+impl RawFields {
+    fn new() -> Self {
+        Self {
+            protocol_str: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            language: String::new(),
+            base_url: String::new(),
+            max_seconds: 120,
+            trailing_space: true,
+            keywords: Vec::new(),
+            orb_color_str: String::new(),
+            orb_fluid_str: String::new(),
+            hotkey_str: String::new(),
+            cancel_key_str: String::new(),
+            vad_silence_ms: 3000,
+            vad_rms_threshold: 400.0,
+            filler_words_str: String::new(),
+        }
+    }
+
+    /// One KEY=VALUE from mnvoice.env. Lines accumulate in file order, so the
+    /// canonical key always wins over its aliases and an alias fills only a
+    /// field nothing has set yet (a Deepgram-specific default overridable by a
+    /// plain `API_KEY=`).
+    fn set_file(&mut self, field: Field, k: &str, v: &str) {
+        let canonical_overrides = k == field.canonical();
+        match field {
+            Field::Protocol => self.protocol_str = v.to_string(),
+            Field::ApiKey if canonical_overrides || self.api_key.is_empty() => {
+                self.api_key = v.to_string()
+            }
+            Field::Model if canonical_overrides || self.model.is_empty() => {
+                self.model = v.to_string()
+            }
+            Field::Language if canonical_overrides || self.language.is_empty() => {
+                self.language = v.to_string()
+            }
+            Field::BaseUrl if canonical_overrides || self.base_url.is_empty() => {
+                self.base_url = v.to_string()
+            }
+            Field::OrbColor => self.orb_color_str = v.to_string(),
+            Field::OrbFluid => self.orb_fluid_str = v.to_string(),
+            Field::Hotkey => self.hotkey_str = v.to_string(),
+            Field::CancelKey => self.cancel_key_str = v.to_string(),
+            Field::FillerWords => self.filler_words_str = v.to_string(),
+            Field::MaxSeconds => {
+                if let Ok(n) = v.parse() {
+                    self.max_seconds = n;
+                }
+            }
+            Field::TrailingSpace => self.trailing_space = v != "0",
+            Field::Keywords => parse_keywords_text(v, &mut self.keywords),
+            Field::VadSilenceMs => {
+                if let Ok(n) = v.parse() {
+                    self.vad_silence_ms = n;
+                }
+            }
+            Field::VadRmsThreshold => {
+                if let Ok(n) = v.parse() {
+                    self.vad_rms_threshold = n;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One process environment variable. The environment is the highest
+    /// priority source, so the value always lands, whatever the file set.
+    fn set_env(&mut self, field: Field, v: &str) {
+        match field {
+            Field::Protocol => self.protocol_str = v.to_string(),
+            Field::ApiKey => self.api_key = v.to_string(),
+            Field::Model => self.model = v.to_string(),
+            Field::Language => self.language = v.to_string(),
+            Field::BaseUrl => self.base_url = v.to_string(),
+            Field::OrbColor => self.orb_color_str = v.to_string(),
+            Field::OrbFluid => self.orb_fluid_str = v.to_string(),
+            Field::Hotkey => self.hotkey_str = v.to_string(),
+            Field::CancelKey => self.cancel_key_str = v.to_string(),
+            Field::FillerWords => self.filler_words_str = v.to_string(),
+            Field::MaxSeconds => {
+                if let Ok(n) = v.parse() {
+                    self.max_seconds = n;
+                }
+            }
+            Field::TrailingSpace => self.trailing_space = v != "0",
+            Field::Keywords => parse_keywords_text(v, &mut self.keywords),
+            Field::VadSilenceMs => {
+                if let Ok(n) = v.parse() {
+                    self.vad_silence_ms = n;
+                }
+            }
+            Field::VadRmsThreshold => {
+                if let Ok(n) = v.parse() {
+                    self.vad_rms_threshold = n;
+                }
             }
         }
-        "MODEL" | "DEEPGRAM_MODEL" | "GROQ_MODEL" | "OPENAI_MODEL" => {
-            if model.is_empty() || k == "MODEL" {
-                *model = v.to_string();
-            }
-        }
-        "LANGUAGE" | "DEEPGRAM_LANGUAGE" | "GROQ_LANGUAGE" => {
-            if language.is_empty() || k == "LANGUAGE" {
-                *language = v.to_string();
-            }
-        }
-        "BASE_URL" | "DEEPGRAM_BASE_URL" | "GROQ_BASE_URL" | "ENDPOINT" => {
-            if base_url.is_empty() || k == "BASE_URL" {
-                *base_url = v.to_string();
-            }
-        }
-        "MAX_SECONDS" => {
-            if let Ok(n) = v.parse() { *max_seconds = n; }
-        }
-        "TRAILING_SPACE" => *trailing_space = v != "0",
-        "KEYWORDS" | "KEYTERMS" | "CUSTOM_WORDS" | "VOCABULARY" => {
-            parse_keywords_text(v, keywords);
-        }
-        "ORB_COLOR" | "ORB_HEX" | "COLOR" => *orb_color_str = v.to_string(),
-        "ORB_FLUID_LEVEL" | "ORB_FLUID_AMOUNT" | "FLUID_LEVEL" => *orb_fluid_str = v.to_string(),
-        "HOTKEY" | "TRIGGER_HOTKEY" | "KEYBIND" => *hotkey_str = v.to_string(),
-        "CANCEL_KEY" | "CANCEL_HOTKEY" => *cancel_key_str = v.to_string(),
-        "VAD_SILENCE_MS" | "SILENCE_MS" => {
-            if let Ok(n) = v.parse() { *vad_silence_ms = n; }
-        }
-        "VAD_RMS_THRESHOLD" | "RMS_THRESHOLD" => {
-            if let Ok(n) = v.parse() { *vad_rms_threshold = n; }
-        }
-        "FILLER_WORDS" => *filler_words_str = v.to_string(),
-        _ => {}
     }
 }
 
@@ -558,5 +604,48 @@ mod tests {
 
         // None
         assert_eq!(parse_hotkey("none"), None);
+    }
+
+    #[test]
+    fn every_field_has_a_unique_canonical_name() {
+        for (names, _) in FIELDS {
+            let (canonical, aliases) = names.split_first().expect("every field needs a canonical name");
+            assert!(!aliases.contains(&canonical), "{canonical} must appear exactly once");
+        }
+    }
+
+    #[test]
+    fn a_name_accepted_from_the_file_is_accepted_from_the_environment() {
+        // The drift this table exists to prevent: these five names were once
+        // file-only, so `KEYBIND=F9` as an environment variable silently did
+        // nothing while the same line in mnvoice.env worked.
+        for drifted in ["KEYBIND", "COLOR", "FLUID_LEVEL", "CUSTOM_WORDS", "VOCABULARY"] {
+            assert!(
+                FIELDS.iter().any(|(names, _)| names.contains(&drifted)),
+                "{drifted} must be accepted from both sources"
+            );
+        }
+    }
+
+    #[test]
+    fn the_file_pass_lets_the_canonical_key_override_an_alias() {
+        let mut raw = RawFields::new();
+        raw.set_file(Field::ApiKey, "DEEPGRAM_API_KEY", "alias");
+        assert_eq!(raw.api_key, "alias", "an alias fills an unset field");
+        raw.set_file(Field::ApiKey, "API_KEY", "canon");
+        assert_eq!(raw.api_key, "canon", "the canonical key overrides");
+        raw.set_file(Field::ApiKey, "DEEPGRAM_API_KEY", "alias-2");
+        assert_eq!(raw.api_key, "canon", "a later alias does not override the canonical key");
+    }
+
+    #[test]
+    fn the_environment_is_the_highest_priority_source() {
+        let mut raw = RawFields::new();
+        raw.set_file(Field::ApiKey, "API_KEY", "from-file");
+        raw.set_env(Field::ApiKey, "from-env");
+        assert_eq!(raw.api_key, "from-env");
+        raw.set_file(Field::Hotkey, "KEYBIND", "F9");
+        raw.set_env(Field::Hotkey, "Ctrl+Shift+D");
+        assert_eq!(raw.hotkey_str, "Ctrl+Shift+D");
     }
 }

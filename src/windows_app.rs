@@ -6,8 +6,8 @@
 use crate::audio;
 use crate::config;
 use crate::orb;
-use crate::paste;
 use crate::platform;
+use crate::platform::input;
 use crate::platform::windows_impl::wide;
 use crate::rest;
 use crate::stream;
@@ -421,12 +421,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
+                    // The idle tip names the hotkey actually configured, not a
+                    // hardcoded one: a user with KEYBIND=F9 must not be told
+                    // to press Alt+Space.
+                    let idle_tip = app
+                        .config
+                        .as_ref()
+                        .map(|c| c.hotkey_str.as_str())
+                        .unwrap_or("Alt+Space");
                     let tip = match app.state {
-                        State::Idle => "mnvoice - idle. Alt+Space to dictate.",
-                        State::Recording => "mnvoice - listening... (auto-stops on silence)",
-                        State::Transcribing => "mnvoice - transcribing...",
+                        State::Idle => {
+                            // Rebuild the string: the configured key is borrowed.
+                            format!("mnvoice - idle. {idle_tip} to dictate.")
+                        }
+                        State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
+                        State::Transcribing => "mnvoice - transcribing...".to_string(),
                     };
-                    let _ = set_tray_tip(hwnd, tip);
+                    let _ = set_tray_tip(hwnd, &tip);
                 }
                 LRESULT(0)
             }
@@ -657,9 +668,9 @@ fn worker(
                     if text.is_empty() {
                         (false, "No speech detected".into())
                     } else {
-                        let _ = paste::type_text(&text);
+                        let _ = input::type_text(&text);
                         if trailing {
-                            let _ = paste::type_text(" ");
+                            let _ = input::type_text(" ");
                         }
                         (true, text)
                     }
