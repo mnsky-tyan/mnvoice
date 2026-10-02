@@ -16,7 +16,7 @@ use crate::update;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -931,6 +931,20 @@ fn quoted_exe(exe: &str) -> String {
     }
 }
 
+/// Serializes every autostart mutation in the process.
+///
+/// The one-time migration runs on its own thread at startup while the tray
+/// can be toggling the same task and the same Run key at the same time, so a
+/// mutation holds this across its reads, its command and its confirming
+/// queries: each mutation then sees the state the previous one left. A
+/// poisoned lock is taken anyway, because a panicked thread must not wedge
+/// the tray forever.
+static AUTOSTART_LOCK: Mutex<()> = Mutex::new(());
+
+fn autostart_lock() -> MutexGuard<'static, ()> {
+    AUTOSTART_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Move an older Run-key install onto the Task Scheduler, once, silently.
 ///
 /// Called at startup so the fix happens by relaunching rather than by asking
@@ -938,6 +952,7 @@ fn quoted_exe(exe: &str) -> String {
 /// the single-instance mutex makes the loser exit - and the task is left in
 /// place, so the swap only ever runs in this direction.
 pub fn migrate_autostart() {
+    let _mutation = autostart_lock();
     if task_exists() || !run_key_set() {
         return;
     }
@@ -988,6 +1003,7 @@ fn delete_left_task_gone(delete_ok: bool, after: TaskState) -> bool {
 /// scheduler is confirmed to hold the state that was asked for, so a toggle
 /// that did not take can never destroy the autostart the user had.
 fn set_autostart(enable: bool) -> Result<(), String> {
+    let _mutation = autostart_lock();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.display().to_string();
     let mut cmd = schtasks_cmd();
@@ -1266,5 +1282,45 @@ mod tests {
         assert!(delete_left_task_gone(false, TaskState::Absent));
         assert!(!delete_left_task_gone(false, TaskState::Present));
         assert!(!delete_left_task_gone(false, TaskState::Unknown));
+    }
+
+    #[test]
+    fn autostart_mutations_never_overlap() {
+        // Two threads inside their critical section at once is exactly the
+        // interleaving that silently reversed a user's disable: the tray's
+        // mutation and the migration thread must keep each other out.
+        static INSIDE: AtomicBool = AtomicBool::new(false);
+        let overlapping = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let overlapping = Arc::clone(&overlapping);
+            handles.push(std::thread::spawn(move || {
+                let _mutation = autostart_lock();
+                if INSIDE.swap(true, Ordering::SeqCst) {
+                    overlapping.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                INSIDE.store(false, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("a probe thread");
+        }
+        assert!(
+            !overlapping.load(Ordering::SeqCst),
+            "two mutations were inside their critical section at once"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_autostart_lock_is_still_taken() {
+        // A panicked thread must not wedge the tray, so the next mutation
+        // takes the poisoned lock instead of unwrapping a poison error.
+        let joiner = std::thread::spawn(|| {
+            let _mutation = autostart_lock();
+            panic!("poison the lock on purpose");
+        });
+        assert!(joiner.join().is_err(), "the probe panicked as intended");
+        let _mutation = autostart_lock();
     }
 }
