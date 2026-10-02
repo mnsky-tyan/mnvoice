@@ -1,0 +1,61 @@
+name: Publish release
+description:
+  Publish (or upload to) this tag's release, then confirm every expected asset
+  actually landed. Shared by all three platform jobs so their publish behavior
+  cannot drift apart.
+inputs:
+  tag:
+    required: true
+    description: The release tag being published.
+  files:
+    required: true
+    description: |
+      Newline-separated asset files to upload and verify, e.g.
+      "mnvoice-linux-x64
+      mnvoice-linux-x64.sha256". Every name is checked on the release.
+runs:
+  using: composite
+  steps:
+    - name: Publish Release
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $tag = "${{ inputs.tag }}"
+        $files = @("${{ inputs.files }}" -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        foreach ($f in $files) {
+          if (!(Test-Path $f)) { throw "$f was not produced" }
+        }
+        gh release view $tag *> $null
+        if ($LASTEXITCODE -eq 0) {
+          gh release upload $tag @files --clobber
+        } else {
+          gh release create $tag --title $tag --verify-tag @files
+        }
+        if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
+        Write-Host "published $tag"
+
+    # Belt and braces: an empty or partial release must never ship unnoticed.
+    - name: Verify asset attached
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $tag = "${{ inputs.tag }}"
+        $files = @("${{ inputs.files }}" -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        # The REST endpoint is asked directly: gh's own release listing is
+        # cached and can still lag behind an upload that just succeeded, which
+        # would fail this step after a publish that actually worked.
+        # ${{ github.repository }} is owner/repo, the same slug update.rs
+        # bakes into the updater's URLs.
+        $json = curl -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "could not read $tag from api.github.com (curl exit $LASTEXITCODE)" }
+        $assets = @(($json | ConvertFrom-Json).assets.name)
+        foreach ($need in $files) {
+          if ($assets -notcontains $need) {
+            throw "release $tag is missing $need. Assets found: '$($assets -join ', ')"
+          }
+        }
+        Write-Host "confirmed assets on $tag"

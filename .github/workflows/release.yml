@@ -45,6 +45,11 @@ jobs:
       # The raw exe is the asset the in-app updater downloads, and it is also
       # what a user gets when they would rather not unpack a zip.
       - name: Package artifacts
+        # pwsh is pinned so the hash file's encoding is fixed: under Windows
+        # PowerShell 5.1 "utf8" means BOM, under pwsh 7 it does not - that
+        # producer ambiguity is exactly why the updater needs BOM tolerance.
+        # utf8NoBOM is the explicit statement of what we ship.
+        shell: pwsh
         run: |
           mkdir dist
           cp target/release/mnvoice.exe dist/
@@ -58,52 +63,21 @@ jobs:
           # where it was fetched from, so it ships with every release.
           Get-FileHash -Algorithm SHA256 mnvoice.exe, mnvoice-windows-x64.zip |
             ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path -Leaf $_.Path)" } |
-            Set-Content -Path SHA256SUMS -Encoding utf8
+            Set-Content -Path SHA256SUMS -Encoding utf8NoBOM
 
-      # Uses the preinstalled gh CLI rather than softprops/action-gh-release,
-      # which silently succeeds while uploading nothing under the Node 24 runtime.
+      # The shared publish step uses the preinstalled gh CLI rather than
+      # softprops/action-gh-release, which silently succeeds while uploading
+      # nothing under the Node 24 runtime, and verifies each asset over the
+      # REST API after upload.
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "${{ github.ref_name }}"
-          foreach ($f in @('mnvoice.exe','mnvoice-windows-x64.zip','SHA256SUMS')) {
-            if (!(Test-Path $f)) { throw "$f was not produced" }
-          }
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag mnvoice.exe mnvoice-windows-x64.zip SHA256SUMS --clobber
-          } else {
-            gh release create $tag --title $tag --verify-tag mnvoice.exe mnvoice-windows-x64.zip SHA256SUMS
-          }
-          if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
-          Write-Host "published $tag"
-
-      # Belt and braces: an empty release must never ship unnoticed again.
-      - name: Verify asset attached
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "${{ github.ref_name }}"
-          # The REST endpoint is asked directly: gh's own release listing is
-          # cached and can still lag behind an upload that just succeeded, which
-          # would fail this step after a publish that actually worked.
-          $json = curl.exe -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/$tag" | Out-String
-          if ($LASTEXITCODE -ne 0) { throw "could not read $tag from api.github.com (curl exit $LASTEXITCODE)" }
-          $names = ($json | ConvertFrom-Json).assets.name
-          # mnvoice.exe is mandatory: it is what the updater fetches.
-          foreach ($need in @('mnvoice.exe','mnvoice-windows-x64.zip','SHA256SUMS')) {
-            if ((($names -split "`n") -notcontains $need)) {
-              throw "release $tag is missing $need. Assets found: '$names'"
-            }
-          }
-          Write-Host "confirmed assets on $tag"
+        uses: ./.github/actions/publish-release
+        with:
+          tag: ${{ github.ref_name }}
+          files: |
+            mnvoice.exe
+            mnvoice-windows-x64.zip
+            SHA256SUMS
 
   linux:
     if: >-
@@ -131,33 +105,20 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package artifact
+        # sha256sum already prints "<hash>  <name>", the exact format the
+        # updater parses; no post-processing.
         run: |
           cp target/release/mnvoice mnvoice-linux-x64
-          sha256sum mnvoice-linux-x64 | awk '{print $1"  "$2}' > mnvoice-linux-x64.sha256
+          sha256sum mnvoice-linux-x64 > mnvoice-linux-x64.sha256
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          tag="${{ github.ref_name }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" mnvoice-linux-x64 mnvoice-linux-x64.sha256 --clobber
-          else
-            gh release create "$tag" --title "$tag" --verify-tag mnvoice-linux-x64 mnvoice-linux-x64.sha256
-          fi
-
-      - name: Verify asset attached
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          names=$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/${{ github.ref_name }}" \
-            | jq -r '.assets[].name')
-          echo "$names" | grep -qx 'mnvoice-linux-x64'
+        uses: ./.github/actions/publish-release
+        with:
+          tag: ${{ github.ref_name }}
+          files: |
+            mnvoice-linux-x64
+            mnvoice-linux-x64.sha256
 
   macos:
     if: >-
@@ -183,30 +144,17 @@ jobs:
         run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Package artifact
+        # shasum -a 256 already prints "<hash>  <name>", the exact format the
+        # updater parses; no post-processing.
         run: |
           cp target/aarch64-apple-darwin/release/mnvoice mnvoice-macos-arm64
-          shasum -a 256 mnvoice-macos-arm64 | awk '{print $1"  "$2}' > mnvoice-macos-arm64.sha256
+          shasum -a 256 mnvoice-macos-arm64 > mnvoice-macos-arm64.sha256
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          tag="${{ github.ref_name }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" mnvoice-macos-arm64 mnvoice-macos-arm64.sha256 --clobber
-          else
-            gh release create "$tag" --title "$tag" --verify-tag mnvoice-macos-arm64 mnvoice-macos-arm64.sha256
-          fi
-
-      - name: Verify asset attached
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          names=$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/mnsky-tyan/mnvoice/releases/tags/${{ github.ref_name }}" \
-            | jq -r '.assets[].name')
-          echo "$names" | grep -qx 'mnvoice-macos-arm64'
+        uses: ./.github/actions/publish-release
+        with:
+          tag: ${{ github.ref_name }}
+          files: |
+            mnvoice-macos-arm64
+            mnvoice-macos-arm64.sha256

@@ -134,7 +134,9 @@ pub fn load() -> Result<Config, String> {
     } else {
         raw.cancel_key_str.trim().to_string()
     };
-    let cancel_key = parse_hotkey(&cancel_key_actual_str).unwrap_or((0x4000, 0x1B)); // MOD_NOREPEAT, VK_ESCAPE
+    // "none" disables the cancel key outright: a zero virtual key is what the
+    // Windows registration reads as "register nothing".
+    let cancel_key = resolve_cancel_key(&cancel_key_actual_str);
 
     // FILLER_WORDS=0 (default) strips disfluencies; =1 keeps them verbatim.
     // Empty or unset strips, so a typo can never silently re-enable fillers.
@@ -424,6 +426,18 @@ impl RawFields {
     }
 }
 
+/// The cancel key to register. `none` means disabled - a zero virtual key,
+/// which the hotkey registration reads as "register nothing" - and anything
+/// else parses as a hotkey, falling back to the documented Escape default
+/// only when the spelling matches nothing.
+pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
+    if s.eq_ignore_ascii_case("none") {
+        (0, 0)
+    } else {
+        parse_hotkey(s).unwrap_or((0x4000, 0x1B)) // MOD_NOREPEAT, VK_ESCAPE
+    }
+}
+
 /// Parses color from preset name or hex `#RRGGBB` / `RRGGBB`.
 /// Returns RGB float triple in range `0.0..=1.0`.
 pub fn parse_color(s: &str) -> (f32, f32, f32) {
@@ -604,6 +618,17 @@ mod tests {
 
         // None
         assert_eq!(parse_hotkey("none"), None);
+    }
+
+    #[test]
+    fn cancel_key_none_disables_instead_of_rearming_escape() {
+        // The docs promise "none" disables the cancel key. The old fallback
+        // silently re-registered Escape, so a user who asked for none still
+        // lost transcripts to a stray Escape press.
+        assert_eq!(resolve_cancel_key("none"), (0, 0));
+        assert_eq!(resolve_cancel_key("NONE"), (0, 0));
+        assert_eq!(resolve_cancel_key("Escape"), (0x4000, 0x1B));
+        assert_eq!(resolve_cancel_key("unparseable"), (0x4000, 0x1B), "unknown spelling falls back to the default");
     }
 
     #[test]
