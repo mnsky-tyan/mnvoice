@@ -635,7 +635,7 @@ mod tests {
     fn every_field_has_a_unique_canonical_name() {
         for (names, _) in FIELDS {
             let (canonical, aliases) = names.split_first().expect("every field needs a canonical name");
-            assert!(!aliases.contains(&canonical), "{canonical} must appear exactly once");
+            assert!(!aliases.contains(canonical), "{canonical} must appear exactly once");
         }
     }
 
