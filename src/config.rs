@@ -295,7 +295,8 @@ enum Field {
 }
 
 impl Field {
-    /// The key this field is documented under; an alias never overrides it.
+    /// The key this field is documented under - the first name in its
+    /// `FIELDS` entry.
     fn canonical(self) -> &'static str {
         FIELDS
             .iter()
@@ -345,10 +346,12 @@ impl RawFields {
         }
     }
 
-    /// One KEY=VALUE from mnvoice.env. Lines accumulate in file order, so the
-    /// canonical key always wins over its aliases and an alias fills only a
-    /// field nothing has set yet (a Deepgram-specific default overridable by a
-    /// plain `API_KEY=`).
+    /// One KEY=VALUE from mnvoice.env. Lines accumulate in file order: for the
+    /// alias-priority fields (`API_KEY`, `MODEL`, `LANGUAGE`, `BASE_URL`) the
+    /// canonical key wins over its aliases whatever order the lines appear in,
+    /// and an alias fills only a field nothing has set yet (a Deepgram-specific
+    /// default overridable by a plain `API_KEY=`); every other field takes the
+    /// last line that names it.
     fn set_file(&mut self, field: Field, k: &str, v: &str) {
         let canonical_overrides = k == field.canonical();
         match field {

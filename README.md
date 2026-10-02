@@ -167,7 +167,7 @@ fi
 
 Prefer Task Scheduler over the shell? mnvoice's **Start with Windows**
 checkbox creates the logon task for you, or use the exact `schtasks` command
-shown in [Quick Start](#1-download).
+shown in [Start with Windows](#start-with-windows).
 
 ---
 
@@ -186,7 +186,7 @@ CANCEL_KEY=Escape
 ```
 
 Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win` (also accepted: `Option`, `Control`, `Windows`, `Super`, `Cmd`)  
-Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`
+Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`/`Caps`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`
 
 Examples:
 ```ini

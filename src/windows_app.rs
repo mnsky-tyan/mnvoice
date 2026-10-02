@@ -665,9 +665,9 @@ fn worker(
                     if text.is_empty() {
                         (false, "No speech detected".into())
                     } else {
-                        let _ = input::type_text(&text);
+                        input::type_text(&text);
                         if trailing {
-                            let _ = input::type_text(" ");
+                            input::type_text(" ");
                         }
                         (true, text)
                     }
