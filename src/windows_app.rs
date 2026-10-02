@@ -727,16 +727,23 @@ fn schtasks_cmd() -> std::process::Command {
     c
 }
 
+/// Whether autostart really starts at logon, spelled from the three live
+/// states rather than any one of them.
+///
+/// A logon task speaks for itself. A Run value does not: Task Manager's
+/// Disable leaves the value in place and starts nothing, so a present value
+/// only counts while the user has not turned it off.
+fn autostart_on(task_present: bool, run_present: bool, run_disabled: bool) -> bool {
+    task_present || (run_present && !run_disabled)
+}
+
 /// True when the at-logon autostart task exists for the current user.
 ///
 /// The Run key is still consulted, so an install that has not been relaunched
 /// since the migration still reports an accurate tray checkmark instead of
 /// offering to enable something that is already on.
 fn autostart_enabled() -> bool {
-    if task_exists() {
-        return true;
-    }
-    run_key_set()
+    autostart_on(task_exists(), run_key_set(), run_key_disabled())
 }
 
 fn run_key_set() -> bool {
@@ -747,12 +754,16 @@ fn run_key_set() -> bool {
         .unwrap_or(false)
 }
 
-/// Remove the pre-migration Run key entry. Best-effort: a value that is not
-/// there any more is not a failure worth surfacing to the user.
-fn clear_run_key() {
+/// Remove the pre-migration Run key entry, reporting whether it is gone.
+///
+/// True when the value is not there any more, which is what `reg query`
+/// confirms afterwards: a delete that did not take against a policy or a
+/// security product leaves it in place, and nothing may read that as success.
+fn clear_run_key() -> bool {
     let _ = reg_cmd()
         .args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
         .output();
+    !run_key_set()
 }
 
 /// Whether the user has turned the Run-key autostart off in Task Manager.
@@ -897,8 +908,13 @@ pub fn migrate_autostart() {
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
-        clear_run_key();
-        log("autostart moved from the Run key to a logon task");
+        if clear_run_key() {
+            log("autostart moved from the Run key to a logon task");
+        } else {
+            // The logon task holds the autostart, but the Run value survived
+            // the delete, so both mechanisms are still registered.
+            log("autostart moved to a logon task, but the Run key could not be retired");
+        }
     } else {
         // Leave the Run key alone: a machine whose task creation failed keeps
         // starting through it next boot rather than not starting at all.
@@ -934,7 +950,9 @@ fn set_autostart(enable: bool) -> Result<(), String> {
     let in_place = if enable {
         status.success()
     } else {
-        delete_left_task_gone(status.success(), task_state())
+        // The delete's own exit code is authority: a zero already means the
+        // task is gone, so the scheduler is only asked when it says otherwise.
+        status.success() || delete_left_task_gone(status.success(), task_state())
     };
     if !in_place {
         // The Run key carries the autostart until the scheduler holds the
@@ -946,7 +964,15 @@ fn set_autostart(enable: bool) -> Result<(), String> {
             "schtasks.exe could not remove the logon task, keeping the Run key".into()
         });
     }
-    clear_run_key();
+    if !clear_run_key() {
+        // The Run value survived, so the app still starts at logon however
+        // the task reads, and the log must not claim a move that half failed.
+        return Err(if enable {
+            "the Run key could not be retired, so mnvoice starts twice at logon".into()
+        } else {
+            "the Run key could not be retired, so mnvoice still starts at logon".into()
+        });
+    }
     log(if enable { "autostart enabled" } else { "autostart disabled" });
     Ok(())
 }
@@ -1145,6 +1171,22 @@ mod tests {
         assert!(startup_approved_disabled(&[0x03, 0x00, 0x00, 0x00]));
         assert!(startup_approved_disabled(&[0x06, 0x00, 0x00, 0x00]));
         assert!(!startup_approved_disabled(&[]), "no blob is no override");
+    }
+
+    #[test]
+    fn the_tray_checkmark_follows_what_actually_starts() {
+        // Every combination of the three live states, including the two the
+        // captain described: an entry the user turned off in Task Manager
+        // starts nothing, and its still-present Run value must not talk it
+        // back into being checked.
+        assert!(autostart_on(true, false, false));
+        assert!(autostart_on(true, true, false));
+        assert!(autostart_on(true, false, true));
+        assert!(autostart_on(true, true, true));
+        assert!(autostart_on(false, true, false));
+        assert!(!autostart_on(false, false, false));
+        assert!(!autostart_on(false, false, true));
+        assert!(!autostart_on(false, true, true));
     }
 
     #[test]
