@@ -482,7 +482,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         toggle(app);
                     }
                 } else if id == IDM_STARTUP {
-                    // Toggle the registry entry. Re-checked on next open, so the
+                    // Toggle the logon task. The Run key is cleared as a side
+                    // effect, and the state is re-read on next open, so the
                     // checkbox can never drift out of sync with reality.
                     let enable = !autostart_enabled();
                     if let Err(e) = set_autostart(enable) {
