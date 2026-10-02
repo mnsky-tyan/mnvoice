@@ -710,6 +710,10 @@ unsafe fn show_menu(hwnd: HWND) {
 const AUTOSTART_TASK: &str = r"\mnvoice";
 const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE: &str = "mnvoice";
+/// Where Task Manager records that the user turned a startup entry off, so a
+/// Run value that Disable left behind is one Windows will not start.
+const AUTOSTART_APPROVED_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
 fn reg_cmd() -> std::process::Command {
     let mut c = std::process::Command::new("C:\\Windows\\System32\\reg.exe");
@@ -751,6 +755,54 @@ fn clear_run_key() {
         .output();
 }
 
+/// Whether the user has turned the Run-key autostart off in Task Manager.
+///
+/// Disable does not delete the Run value, it only writes a blob under
+/// StartupApproved\Run, so a value that is merely present says nothing about
+/// whether Windows starts it. A value that is absent, or a query that could
+/// not be answered, is read as no override, which is what Windows does too.
+fn run_key_disabled() -> bool {
+    let Ok(out) = reg_cmd()
+        .args(["query", AUTOSTART_APPROVED_KEY, "/v", AUTOSTART_VALUE])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    // reg.exe prints the value, its type and then its bytes on one line, so
+    // the tail after the type is the blob.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let tail = text
+        .lines()
+        .find_map(|line| line.split_once("REG_BINARY"))
+        .map_or("", |(_, tail)| tail);
+    startup_approved_disabled(&parse_reg_binary_hex(tail))
+}
+
+/// Turn a `reg query` binary value's hex tail into the bytes it encodes.
+///
+/// reg.exe prints the bytes as hex, and keeping only the hex digits means the
+/// grouping in that output does not have to be guessed at.
+fn parse_reg_binary_hex(hex: &str) -> Vec<u8> {
+    let digits: String = hex.chars().filter(char::is_ascii_hexdigit).collect();
+    digits
+        .as_bytes()
+        .chunks(2)
+        .filter_map(|pair| std::str::from_utf8(pair).ok())
+        .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+        .collect()
+}
+
+/// True when a StartupApproved blob records that the user turned the entry off.
+///
+/// The flag is the first byte and the rest is the timestamp: 02 is an entry
+/// Windows still starts, 03 and 06 are the flags Task Manager writes.
+fn startup_approved_disabled(blob: &[u8]) -> bool {
+    matches!(blob.first(), Some(0x03) | Some(0x06))
+}
+
 /// The schtasks arguments that ask whether the autostart task exists.
 ///
 /// Deliberately no `/fo`: the exit status answers the question on every
@@ -764,12 +816,33 @@ fn schtasks_query_args() -> Vec<String> {
         .collect()
 }
 
+/// What the scheduler says about the at-logon autostart task.
+///
+/// Absent and Unknown must never be merged: a task that is not there is the
+/// state a disable asks for, while a query that could not be answered says
+/// nothing at all and has to fail the toggle rather than look like success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Ask the scheduler about the task.
+///
+/// Only a process that could not be spawned at all is unanswerable: schtasks
+/// exits zero for a task that is there and non-zero when it is not, and that
+/// exit code is the only thing there is to ask.
+fn task_state() -> TaskState {
+    match schtasks_cmd().args(schtasks_query_args()).output() {
+        Ok(out) if out.status.success() => TaskState::Present,
+        Ok(_) => TaskState::Absent,
+        Err(_) => TaskState::Unknown,
+    }
+}
+
 fn task_exists() -> bool {
-    schtasks_cmd()
-        .args(schtasks_query_args())
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    task_state() == TaskState::Present
 }
 
 /// The schtasks arguments that create the autostart task.
@@ -807,6 +880,13 @@ pub fn migrate_autostart() {
     if task_exists() || !run_key_set() {
         return;
     }
+    if run_key_disabled() {
+        // Task Manager's Disable leaves the Run value in place and starts
+        // nothing, so a logon task here would turn back on what the user
+        // turned off; the entry stays exactly as Windows left it.
+        log("autostart is disabled in Task Manager, leaving the Run key alone");
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -826,6 +906,17 @@ pub fn migrate_autostart() {
     }
 }
 
+/// Whether turning autostart off left the logon task gone.
+///
+/// A delete that exited zero did its job. One that failed has to be
+/// classified rather than trusted: a task that was never there already leaves
+/// the requested state in place, while one that is still registered, or a
+/// question the scheduler could not answer, is a toggle that did not take -
+/// and there the Run key is still the only autostart the user has.
+fn delete_left_task_gone(delete_ok: bool, after: TaskState) -> bool {
+    delete_ok || after == TaskState::Absent
+}
+
 /// Register or remove the at-logon autostart task. Reversible, no admin rights
 /// needed, and the Run key is cleared in both directions - but only once the
 /// scheduler is confirmed to hold the state that was asked for, so a toggle
@@ -843,10 +934,7 @@ fn set_autostart(enable: bool) -> Result<(), String> {
     let in_place = if enable {
         status.success()
     } else {
-        // The delete asks for a state, not for an exit code: a task that was
-        // never there already leaves the requested state in place, so only
-        // one that is still registered counts as the toggle failing.
-        !task_exists()
+        delete_left_task_gone(status.success(), task_state())
     };
     if !in_place {
         // The Run key carries the autostart until the scheduler holds the
@@ -855,7 +943,7 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         return Err(if enable {
             "schtasks.exe could not create the logon task, keeping the Run key".into()
         } else {
-            "the logon task is still registered, keeping the Run key".into()
+            "schtasks.exe could not remove the logon task, keeping the Run key".into()
         });
     }
     clear_run_key();
@@ -1032,5 +1120,43 @@ mod tests {
             args.iter().position(|a| a == "/tr").and_then(|i| args.get(i + 1)),
             Some(&r"C:\Users\someone\bin\mnvoice.exe".to_string())
         );
+    }
+
+    #[test]
+    fn the_binary_hex_tail_becomes_bytes() {
+        // The shape reg.exe actually prints for a StartupApproved blob.
+        assert_eq!(
+            parse_reg_binary_hex("030000009AB326D7E424DC01"),
+            vec![0x03, 0x00, 0x00, 0x00, 0x9A, 0xB3, 0x26, 0xD7, 0xE4, 0x24, 0xDC, 0x01]
+        );
+        assert_eq!(
+            parse_reg_binary_hex("02 00 00 00 00 00 00 00 00 00 00 00"),
+            vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "spacing is not part of the answer"
+        );
+        assert!(parse_reg_binary_hex("").is_empty(), "no hex is no blob");
+    }
+
+    #[test]
+    fn only_the_disabled_flag_makes_a_blob_a_user_override() {
+        // 02 is an entry Windows still starts; 03 and 06 are the flags Task
+        // Manager writes when the user turns one off.
+        assert!(!startup_approved_disabled(&[0x02, 0x00, 0x00, 0x00]));
+        assert!(startup_approved_disabled(&[0x03, 0x00, 0x00, 0x00]));
+        assert!(startup_approved_disabled(&[0x06, 0x00, 0x00, 0x00]));
+        assert!(!startup_approved_disabled(&[]), "no blob is no override");
+    }
+
+    #[test]
+    fn a_failed_disable_only_counts_when_the_task_is_really_gone() {
+        // The delete's own exit code is authority, so a follow-up question
+        // that could not be answered changes nothing.
+        assert!(delete_left_task_gone(true, TaskState::Unknown));
+        assert!(delete_left_task_gone(true, TaskState::Absent));
+        // A delete that failed says nothing on its own: a task that was never
+        // there already leaves the requested state in place.
+        assert!(delete_left_task_gone(false, TaskState::Absent));
+        assert!(!delete_left_task_gone(false, TaskState::Present));
+        assert!(!delete_left_task_gone(false, TaskState::Unknown));
     }
 }
