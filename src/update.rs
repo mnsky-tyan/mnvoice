@@ -4,6 +4,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::platform::http::Transport;
+use crate::platform::version_of_tag;
 
 /// Repository that publishes mnvoice releases.
 const REPO: &str = "mnsky-tyan/mnvoice";
@@ -33,9 +34,11 @@ pub struct Release {
     pub sha256_url: String,
 }
 
-/// Version baked in at compile time from the release tag.
-pub fn current_version() -> &'static str {
-    env!("MNVOICE_VERSION")
+/// Version baked in at compile time: the release tag (`MNVOICE_TAG`, set by
+/// build.rs) parsed by the same `version_of_tag` the feed tags go through, so
+/// the updater compares like with like by construction.
+pub fn current_version() -> String {
+    crate::platform::version()
 }
 
 /// True when `a` is strictly newer than `b`, comparing dotted numeric parts.
@@ -100,9 +103,11 @@ fn verify_download(exe_url: &str, sums_url: &str, bytes: &[u8]) -> Result<(), St
     let expected = expected_hash(&String::from_utf8_lossy(&body), &asset)?;
     let actual = sha256::hex_digest(bytes);
     if actual != expected {
+        // One line on purpose: this lands in the tray toast and the log, where
+        // an embedded newline (and the indentation a string-literal continuation
+        // carries) breaks grepping and truncates the message.
         return Err(format!(
-            "downloaded {asset} does not match its published checksum 
-             (expected {expected}, got {actual}); refusing to install"
+            "downloaded {asset} does not match its published checksum (expected {expected}, got {actual}); refusing to install"
         ));
     }
     Ok(())
@@ -276,14 +281,6 @@ fn feed_tags(feed: &str) -> Vec<String> {
         from = start;
     }
     tags
-}
-
-/// The version a tag names, with the leading `v` and the platform suffix
-/// removed: "v0.1.15-win" -> "0.1.15". This is what the binary compares
-/// against the version baked in at compile time.
-fn version_of_tag(tag: &str) -> String {
-    let bare = tag.strip_prefix('v').unwrap_or(tag);
-    bare.split('-').next().unwrap_or(bare).to_string()
 }
 
 /// The suffix this platform's release tags carry.
@@ -575,12 +572,19 @@ fn staged_path(exe: &Path) -> PathBuf {
     exe.with_extension("new")
 }
 
+/// Path the current exe is moved aside to while its replacement is swapped
+/// in. One definition: an interrupted update's leftovers are recognised by
+/// exactly this name.
+fn old_path(exe: &Path) -> PathBuf {
+    let mut old = exe.as_os_str().to_os_string();
+    old.push(".old");
+    PathBuf::from(old)
+}
+
 /// Move the staged image into place, restoring the original if it fails half
 /// way through.
 fn swap_in(staged: &Path, exe: &Path) -> Result<PathBuf, String> {
-    let mut old = exe.as_os_str().to_os_string();
-    old.push(".old");
-    let old = PathBuf::from(old);
+    let old = old_path(exe);
 
     fs::rename(exe, &old).map_err(|e| format!("cannot move current exe aside ({e})"))?;
     if let Err(e) = fs::rename(staged, exe) {
@@ -606,16 +610,12 @@ fn check_exe_payload(bytes: &[u8]) -> Result<(), String> {
 /// running exe was moved aside to, and a download that never got swapped in.
 /// Best effort.
 fn clean_stale(exe: &Path) {
-    let mut old = exe.as_os_str().to_os_string();
-    old.push(".old");
-    let _ = fs::remove_file(PathBuf::from(old));
+    let _ = fs::remove_file(old_path(exe));
     let _ = fs::remove_file(staged_path(exe));
 }
 
-fn stamp_path() -> Option<PathBuf> {
-    std::env::temp_dir()
-        .join("mnvoice-last-update-check")
-        .into()
+fn stamp_path() -> PathBuf {
+    std::env::temp_dir().join("mnvoice-last-update-check")
 }
 
 /// The cadence decision for one stamp file: a missing, unreadable or nonsense
@@ -638,16 +638,11 @@ fn should_check_at(stamp: &Path) -> bool {
 /// True when a background check has not happened in the last 24 hours. Daily is
 /// plenty, and keeps traffic towards github.com trivial.
 fn should_check_today() -> bool {
-    match stamp_path() {
-        Some(path) => should_check_at(&path),
-        None => false,
-    }
+    should_check_at(&stamp_path())
 }
 
 fn mark_checked() {
-    if let Some(path) = stamp_path() {
-        mark_checked_at(&path);
-    }
+    mark_checked_at(&stamp_path());
 }
 
 fn mark_checked_at(stamp: &Path) {
@@ -830,6 +825,34 @@ mod tests {
         assert_eq!(version_of_tag("v0.1.15-win"), "0.1.15");
         assert_eq!(version_of_tag("v0.1.14"), "0.1.14");
         assert_eq!(version_of_tag("0.1.15-linux"), "0.1.15");
+    }
+
+    #[test]
+    fn the_feed_and_the_download_urls_name_the_same_repository() {
+        // RELEASES_FEED and asset_url/checksum_url were written by hand against
+        // the same repo; if one is ever repointed without the other, an update
+        // check would resolve versions from a feed whose assets this binary
+        // then refuses (or worse, trusts). The feed must keep naming REPO.
+        assert!(
+            RELEASES_FEED.contains(REPO),
+            "the feed must track REPO ({REPO}), got {RELEASES_FEED}"
+        );
+        assert!(
+            RELEASES_FEED.ends_with("/releases.atom"),
+            "the updater is built around the atom feed, got {RELEASES_FEED}"
+        );
+    }
+
+    #[test]
+    fn the_platform_suffix_is_one_of_the_three_the_workflow_publishes() {
+        // .github/workflows/release.yml ends each tag with exactly one of
+        // these; when a fourth platform is ever added, this list and that
+        // workflow must move together.
+        assert!(
+            ["win", "linux", "macos"].contains(&platform_release_suffix()),
+            "unknown platform suffix {}",
+            platform_release_suffix()
+        );
     }
 
     #[test]

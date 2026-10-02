@@ -45,12 +45,26 @@ pub mod linux_impl;
 #[cfg(target_os = "macos")]
 pub mod macos_impl;
 
-/// The version this build reports, baked by build.rs from the release tag
-/// (falling back to the crate version for local builds). Windows and the
+/// The version a tag names, with the leading `v` and the platform suffix
+/// removed: "v0.1.15-win" -> "0.1.15". This is the single definition of what
+/// a tag's version is: the binary derives its own baked-in version from it
+/// (see `version` below), so the updater's comparison can never disagree with
+/// the build about where a version ends and a platform suffix begins. Lives in
+/// the platform seam because `update` is Windows-only but the CLI prints the
+/// version on every platform.
+pub fn version_of_tag(tag: &str) -> String {
+    let bare = tag.strip_prefix('v').unwrap_or(tag);
+    bare.split('-').next().unwrap_or(bare).to_string()
+}
+
+/// The version this build reports: the release tag baked by build.rs
+/// (`MNVOICE_TAG`, falling back to the crate version for local builds), run
+/// through the same parser the updater applies to feed tags. Windows and the
 /// other platforms read the same value, so a release's three assets all
-/// identify identically.
+/// identify identically, and the build can never disagree with the updater
+/// about where a version ends and a platform suffix begins.
 pub fn version() -> String {
-    env!("MNVOICE_VERSION").to_string()
+    version_of_tag(env!("MNVOICE_TAG"))
 }
 
 /// Which release asset the Windows updater downloads. The name is stable and
