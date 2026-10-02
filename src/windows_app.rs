@@ -751,33 +751,25 @@ fn clear_run_key() {
         .output();
 }
 
-/// Whether a `schtasks /Query /FO CSV` listing names this task.
+/// The schtasks arguments that ask whether the autostart task exists.
 ///
-/// The listing's first column is the task path, so a hit is any line whose
-/// first field matches ignoring the leading backslash and letter case. The
-/// error text for a task that does not exist ("ERROR: The system cannot find
-/// the file specified.") parses as no match, which is the answer it deserves.
-fn csv_lists_task(csv: &str, task: &str) -> bool {
-    let want = task.trim_start_matches('\\').to_ascii_lowercase();
-    csv.lines().any(|line| {
-        let first = line.split(',').next().unwrap_or_default();
-        first
-            .trim()
-            .trim_matches('"')
-            .trim_start_matches('\\')
-            .to_ascii_lowercase()
-            == want
-    })
+/// Deliberately no `/fo`: the exit status answers the question on every
+/// Windows, while a listing's field separator is the machine's own list
+/// separator (a semicolon on a default German system), so anything that
+/// parsed that text was answering a question about the locale instead.
+fn schtasks_query_args() -> Vec<String> {
+    ["query", "/tn", AUTOSTART_TASK]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn task_exists() -> bool {
-    let Ok(out) = schtasks_cmd()
-        .args(["query", "/tn", AUTOSTART_TASK, "/fo", "csv"])
+    schtasks_cmd()
+        .args(schtasks_query_args())
         .output()
-    else {
-        return false;
-    };
-    csv_lists_task(&String::from_utf8_lossy(&out.stdout), AUTOSTART_TASK)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// The schtasks arguments that create the autostart task.
@@ -835,8 +827,9 @@ pub fn migrate_autostart() {
 }
 
 /// Register or remove the at-logon autostart task. Reversible, no admin rights
-/// needed, and the Run key is cleared in both directions so an older entry can
-/// never double-start the app.
+/// needed, and the Run key is cleared in both directions - but only once the
+/// scheduler is confirmed to hold the state that was asked for, so a toggle
+/// that did not take can never destroy the autostart the user had.
 fn set_autostart(enable: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.display().to_string();
@@ -847,13 +840,27 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         cmd.args(["delete", "/tn", AUTOSTART_TASK, "/f"]);
     }
     let status = cmd.status().map_err(|e| e.to_string())?;
-    clear_run_key();
-    if status.success() {
-        log(if enable { "autostart enabled" } else { "autostart disabled" });
-        Ok(())
+    let in_place = if enable {
+        status.success()
     } else {
-        Err("schtasks.exe exited non-zero".into())
+        // The delete asks for a state, not for an exit code: a task that was
+        // never there already leaves the requested state in place, so only
+        // one that is still registered counts as the toggle failing.
+        !task_exists()
+    };
+    if !in_place {
+        // The Run key carries the autostart until the scheduler holds the
+        // one that was asked for, so it stays and the toggle reports that it
+        // did not do what the user wanted.
+        return Err(if enable {
+            "schtasks.exe could not create the logon task, keeping the Run key".into()
+        } else {
+            "the logon task is still registered, keeping the Run key".into()
+        });
     }
+    clear_run_key();
+    log(if enable { "autostart enabled" } else { "autostart disabled" });
+    Ok(())
 }
 
 /// Open a companion file beside the exe in Notepad, creating it from a stub if
@@ -983,29 +990,29 @@ fn relaunch_for_restart() {
 mod tests {
     use super::*;
 
-    /// The shipped listing shape: a CSV header row plus one row per task, the
-    /// first field being the task path.
-    const LISTING: &str = "\"TaskName\",\"Next Run Time\",\"Status\",\"Logon Mode\"\n\"\\mnvoice\",N/A,\"Ready\",\"Interactive/Background\"\n";
-
     #[test]
-    fn a_listing_that_names_the_task_matches() {
-        assert!(csv_lists_task(LISTING, AUTOSTART_TASK));
-    }
-
-    #[test]
-    fn a_missing_task_is_not_a_match() {
-        // What schtasks prints for a task that does not exist.
-        assert!(!csv_lists_task(
-            "ERROR: The system cannot find the file specified.",
-            AUTOSTART_TASK
-        ));
-        assert!(!csv_lists_task("", AUTOSTART_TASK));
-    }
-
-    #[test]
-    fn a_other_tasks_listing_is_not_a_match() {
-        let other = "\"TaskName\",\"Next Run Time\",\"Status\",\"Logon Mode\"\n\\someoneelse\",N/A,\"Ready\",\"Interactive/Background\"\n";
-        assert!(!csv_lists_task(other, AUTOSTART_TASK));
+    fn the_query_arguments_do_not_ask_for_a_format() {
+        // The answer comes from the exit status, which means the same thing
+        // on every Windows. A listing is only readable when its field
+        // separator is a comma, and that separator is the machine's list
+        // separator, so no format argument may ever appear here to parse.
+        let args = schtasks_query_args();
+        assert_eq!(
+            args,
+            vec![
+                "query".to_string(),
+                "/tn".to_string(),
+                AUTOSTART_TASK.to_string()
+            ],
+            "the existence question is a plain query"
+        );
+        assert!(
+            !args.iter().any(|a| a
+                .trim_start_matches('/')
+                .eq_ignore_ascii_case("fo")
+                || a.trim_start_matches('/').eq_ignore_ascii_case("format")),
+            "expected no format argument in {args:?}"
+        );
     }
 
     #[test]
