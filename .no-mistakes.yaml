@@ -6,6 +6,7 @@
 commands:
   test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test
 
-# Every push and pull_request already runs windows/linux/macos on real runners
-# (release.yml), so the pipeline monitors those instead of inventing its own.
+# A pull_request runs all three jobs, and each platform's tag push runs that
+# job, all on real runners (release.yml), so the pipeline monitors those
+# instead of inventing its own.
 no_ci: true
