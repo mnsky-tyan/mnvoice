@@ -360,19 +360,16 @@ impl RawFields {
         }
     }
 
-    /// One KEY=VALUE from mnvoice.env. Lines accumulate in file order: for the
-    /// alias-priority fields (`API_KEY`, `MODEL`, `LANGUAGE`, `BASE_URL`) the
-    /// canonical key wins over its aliases whatever order the lines appear in,
-    /// and an alias fills only a field nothing has set yet (a Deepgram-specific
-    /// default overridable by a plain `API_KEY=`); every other field takes the
-    /// last line that names it.
-    /// One key/value pair from one source.
+    /// One key/value pair from either source: a line from mnvoice.env
+    /// (`from_file`) or a process environment variable.
     ///
-    /// `from_file` distinguishes the mnvoice.env file from the process
-    /// environment. The four alias-guarded fields (API_KEY, MODEL, LANGUAGE,
-    /// BASE_URL) take an alias only while nothing has set them yet and the
-    /// canonical name has not spoken; the environment, as the highest
-    /// priority source, always lands.
+    /// The file pass accumulates in file order: for the alias-priority fields
+    /// (`API_KEY`, `MODEL`, `LANGUAGE`, `BASE_URL`) the canonical key wins
+    /// over its aliases whatever order the lines appear in, and an alias fills
+    /// only a field nothing has set yet (a Deepgram-specific default
+    /// overridable by a plain `API_KEY=`); every other field takes the last
+    /// line that names it. The environment pass runs after the file, so it
+    /// overrides anything the file set and is not subject to the guards.
     fn set(&mut self, field: Field, k: &str, v: &str, from_file: bool) {
         let canonical_overrides = from_file && k == field.canonical();
         match field {
