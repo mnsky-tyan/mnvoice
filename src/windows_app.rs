@@ -109,11 +109,12 @@ impl State {
 /// only correct by luck and disappears entirely once the window is gone.
 static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle as u8);
 
-/// Set before startup cleanup reads the swap-aside image the previous
-/// process left behind, and read once the tray icon exists: a leftover
-/// `.old` at startup is exactly how a just-installed update announces
-/// itself, and that announcement is the only "done" the user ever sees,
-/// because the process that did the installing is the one that exits.
+/// Set at the very start of startup, before anything could consume the
+/// swap-aside image the previous process left behind, and read once the tray
+/// icon exists: a leftover `.old` at startup is exactly how a just-installed
+/// update announces itself, and that announcement is the only "done" the
+/// user ever sees, because the process that did the installing is the one
+/// that exits.
 static JUST_UPDATED: AtomicBool = AtomicBool::new(false);
 
 /// Record a state change in both the UI's own copy and the shared atomic.
@@ -257,8 +258,9 @@ pub fn main() {
             .as_ref()
             .map(|c| c.auto_update)
             .unwrap_or_else(config::auto_update_enabled);
-        // Read before startup_cleanup deletes the evidence: the swap-aside
-        // image only survives until this launch tidies it.
+        // Consume the just-updated handshake before anything else could
+        // observe or remove the swap-aside image (the predicate deletes it as
+        // it reads it, so this is also what makes the announcement at-most-once).
         JUST_UPDATED.store(update::left_old_image_behind(), Ordering::SeqCst);
         update::startup_cleanup(auto_update);
         // One-time move off the Run key onto a logon task. On its own
