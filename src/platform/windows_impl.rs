@@ -370,7 +370,7 @@ impl WebSocket for WinHttpSocket {
         }
     }
 
-    /// Read one frame, waiting at most `timeout_ms`.
+    /// Read one frame.
     ///
     /// WinHTTP has no "read with timeout" call, so the timeout is applied to
     /// the whole timeout window: a read that returns
@@ -378,12 +378,11 @@ impl WebSocket for WinHttpSocket {
     /// error, because from the streaming loop's point of view "the provider
     /// said nothing this tick" and "the socket broke" are different things and
     /// only the second should end the session.
-    fn read(&self, _timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
-        // The timeout is accepted for the trait but not honoured here: once a
-        // WinHTTP request is upgraded to a socket, its receive timeout is fixed
-        // at what the session was configured with, and the pre-seam behaviour
-        // this preserves is a blocking read ended by a frame or a close. The
-        // streaming loop re-checks its flags before every call.
+    fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        // Once a WinHTTP request is upgraded to a socket, its receive timeout
+        // is fixed at what the session was configured with, and the pre-seam
+        // behaviour this preserves is a blocking read ended by a frame or a
+        // close. The streaming loop re-checks its flags before every call.
         unsafe {
             let mut buffer = vec![0u8; 64 * 1024];
             let mut read = 0u32;

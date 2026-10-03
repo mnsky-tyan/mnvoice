@@ -48,12 +48,15 @@ pub trait WebSocket: Send + Sync {
 
     /// Read the next frame, returning `None` on a clean close.
     ///
-    /// `timeout_ms` is what keeps the streaming loop responsive to the user
-    /// releasing the hotkey: a blocking read with no timeout would hold the
-    /// worker until the provider decided to speak, so the transcript would
-    /// arrive long after the user stopped talking. A backend that cannot vary
-    /// this per read should say so in its implementation.
-    fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String>;
+    /// Reads never block indefinitely - that is what keeps the streaming loop
+    /// responsive to the user releasing the hotkey: a blocking read with no
+    /// timeout would hold the worker until the provider decided to speak, so
+    /// the transcript would arrive long after the user stopped talking. The
+    /// Unix backend polls on a socket read timeout, the Windows backend times
+    /// out on the whole WinHTTP request; the loop re-checks its flags between
+    /// calls. A backend that cannot vary this per read should say so in its
+    /// implementation.
+    fn read(&self) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// The whole network surface, one implementation per platform.

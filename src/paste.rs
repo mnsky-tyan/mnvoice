@@ -3,7 +3,6 @@
 // touching or clobbering the system clipboard.
 
 use std::thread;
-use std::time::Duration;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
@@ -43,12 +42,18 @@ pub fn type_text(text: &str) -> Result<(), String> {
                     },
                 },
             ];
-            SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+            let sent = SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+            if sent != inputs.len() as u32 {
+                return Err(format!(
+                    "SendInput injected {sent} of {} events for U+{ch:04X}",
+                    inputs.len()
+                ));
+            }
             // Small delay between characters so the target window processes each
             // keystroke before the next arrives. Without this, apps that buffer
             // input (browsers, terminals) can auto-repeat or drop events when
             // flooded with a large batch all at once.
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(crate::platform::input::KEY_GAP);
         }
     }
     Ok(())

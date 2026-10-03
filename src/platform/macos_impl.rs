@@ -15,7 +15,6 @@ use crate::platform::input::Injector;
 use enigo::{Enigo, Keyboard, Settings};
 use std::cell::RefCell;
 use std::thread;
-use std::time::Duration;
 
 // Whether this process may post synthetic keyboard events at all.
 //
@@ -40,13 +39,7 @@ thread_local! {
     static ENIGO: RefCell<Option<Enigo>> = RefCell::new(None);
 }
 
-/// Pause between two synthesized characters.
-///
-/// The injector contract in `crate::platform::input` is one event per character
-/// with a small gap; the reference is the Windows engine's 2 ms inter-keystroke
-/// sleep in `crate::paste`. A burst delivered back to back can outpace the
-/// target window's message queue and drop characters.
-const KEY_GAP: Duration = Duration::from_millis(2);
+use crate::platform::input::KEY_GAP;
 
 /// Text injection through CoreGraphics events, gated by the Accessibility
 /// permission.

@@ -423,17 +423,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
-            audio::WM_APP_RECORDING_READY => {
-                // Mic hardware is confirmed capturing. Show the orb now!
-                let app = app_ref(hwnd);
-                if app.state == State::Recording {
-                    if let Some(orb) = &mut app.orb {
-                        orb.show(orb::OrbState::Recording);
-                    }
-                    let _ = SetTimer(app.hwnd, TIMER_ORB, 33, None);
-                }
-                LRESULT(0)
-            }
             WM_HOTKEY => {
                 let app = app_ref(hwnd);
                 match wparam.0 as i32 {
