@@ -111,6 +111,59 @@ pub fn resample_linear(mono: &[f32], step: f64) -> Vec<i16> {
     out
 }
 
+/// A persistent capture engine, armed once at startup.
+///
+/// On Windows nothing names this trait - the app holds its concrete
+/// `AudioEngine` and calls its inherent method. That asymmetry is deliberate:
+/// the trait is the port's specification for the Unix engines, and the portable
+/// CLI is what actually calls it through a trait object.
+#[allow(dead_code)]
+pub trait Audio: Send {
+    /// Begin a capture session.
+    ///
+    /// Chunks of PCM are streamed to `tx` as they are captured; the session
+    /// ends when `stop` is set, when `max_seconds` elapses, or when the
+    /// backend's voice-activity detector decides the user stopped talking
+    /// (`vad_silence_ms` of quiet below `vad_rms_threshold`). The returned
+    /// receiver yields exactly one `Ok(())` or one `Err` describing why the
+    /// session ended.
+    fn capture_to_channel(
+        &self,
+        stop: Arc<AtomicBool>,
+        max_seconds: u32,
+        vad_silence_ms: u32,
+        vad_rms_threshold: f64,
+        tx: Sender<Vec<i16>>,
+    ) -> Result<Receiver<Result<(), String>>, String>;
+}
+
+/// Wrap mono i16 samples in a minimal PCM WAV container.
+///
+/// Shared rather than per-platform because the REST fallback uploads exactly
+/// this container on every platform, and a malformed header is the kind of bug
+/// you want fixed once.
+pub fn wav_bytes(samples: &[i16]) -> Vec<u8> {
+    let byte_len = samples.len() * 2;
+    let mut out = Vec::with_capacity(44 + byte_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + byte_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // PCM chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(byte_len as u32).to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,7 +176,10 @@ mod tests {
     fn the_silence_window_counts_the_audio_the_chunk_carries() {
         let mut silence = SilenceWindows::new();
         // Voice first, so the since-voice window is the one in play.
-        assert!(!silence.advance(1_280, 1.0, 0.01, 3_000), "voice is not silence");
+        assert!(
+            !silence.advance(1_280, 1.0, 0.01, 3_000),
+            "voice is not silence"
+        );
         // A chunk twice the usual size counts twice the time: 80 ms each, so
         // the three-second threshold takes 38 of them, not the 75 a fixed
         // 40 ms tick would need.
@@ -133,7 +189,10 @@ mod tests {
             if silence.advance(1_280, 0.0, 0.01, 3_000) {
                 break;
             }
-            assert!(ticks < 100, "three seconds of silence never ended the session");
+            assert!(
+                ticks < 100,
+                "three seconds of silence never ended the session"
+            );
         }
         assert_eq!(ticks, 38, "3000 ms of 80 ms chunks");
     }
@@ -183,7 +242,12 @@ mod tests {
                 }
                 assert!(ticks < 1_000);
             }
-            assert_eq!(ticks, expected, "3000 ms of {} ms silence", audio_ms(samples));
+            assert_eq!(
+                ticks,
+                expected,
+                "3000 ms of {} ms silence",
+                audio_ms(samples)
+            );
         }
     }
 
@@ -201,7 +265,12 @@ mod tests {
                 }
                 assert!(ticks < 2_000);
             }
-            assert_eq!(ticks, expected, "10 000 ms of {} ms silence", audio_ms(samples));
+            assert_eq!(
+                ticks,
+                expected,
+                "10 000 ms of {} ms silence",
+                audio_ms(samples)
+            );
         }
     }
 
@@ -210,7 +279,10 @@ mod tests {
     #[test]
     fn voice_resets_the_silence_window() {
         let mut silence = SilenceWindows::new();
-        assert!(!silence.advance(640, 1.0, 0.01, 3_000), "voice is not silence");
+        assert!(
+            !silence.advance(640, 1.0, 0.01, 3_000),
+            "voice is not silence"
+        );
         // Two quiet chunks that never reach the threshold.
         assert!(!silence.advance(640, 0.0, 0.01, 3_000));
         assert!(!silence.advance(640, 0.0, 0.01, 3_000));
@@ -287,57 +359,4 @@ mod tests {
         let out = resample_linear(&input, 8_000.0 / SAMPLE_RATE as f64);
         assert_eq!(out.len(), 16_000);
     }
-}
-
-/// A persistent capture engine, armed once at startup.
-///
-/// On Windows nothing names this trait - the app holds its concrete
-/// `AudioEngine` and calls its inherent method. That asymmetry is deliberate:
-/// the trait is the port's specification for the Unix engines, and the portable
-/// CLI is what actually calls it through a trait object.
-#[allow(dead_code)]
-pub trait Audio: Send {
-    /// Begin a capture session.
-    ///
-    /// Chunks of PCM are streamed to `tx` as they are captured; the session
-    /// ends when `stop` is set, when `max_seconds` elapses, or when the
-    /// backend's voice-activity detector decides the user stopped talking
-    /// (`vad_silence_ms` of quiet below `vad_rms_threshold`). The returned
-    /// receiver yields exactly one `Ok(())` or one `Err` describing why the
-    /// session ended.
-    fn capture_to_channel(
-        &self,
-        stop: Arc<AtomicBool>,
-        max_seconds: u32,
-        vad_silence_ms: u32,
-        vad_rms_threshold: f64,
-        tx: Sender<Vec<i16>>,
-    ) -> Result<Receiver<Result<(), String>>, String>;
-}
-
-/// Wrap mono i16 samples in a minimal PCM WAV container.
-///
-/// Shared rather than per-platform because the REST fallback uploads exactly
-/// this container on every platform, and a malformed header is the kind of bug
-/// you want fixed once.
-pub fn wav_bytes(samples: &[i16]) -> Vec<u8> {
-    let byte_len = samples.len() * 2;
-    let mut out = Vec::with_capacity(44 + byte_len);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + byte_len as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // PCM chunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
-    out.extend_from_slice(&2u16.to_le_bytes()); // block align
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(byte_len as u32).to_le_bytes());
-    for s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
 }

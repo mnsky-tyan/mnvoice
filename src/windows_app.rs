@@ -245,7 +245,10 @@ pub fn main() {
         if hotkey_ok {
             add_tray(hwnd, &format!("mnvoice - idle ({hk_str})"));
         } else {
-            add_tray(hwnd, &format!("mnvoice - HOTKEY {hk_str} UNAVAILABLE (in use by another app)"));
+            add_tray(
+                hwnd,
+                &format!("mnvoice - HOTKEY {hk_str} UNAVAILABLE (in use by another app)"),
+            );
         }
 
         // The installing process exits at relaunch, so it cannot report its
@@ -315,7 +318,11 @@ fn load_config_or_log() -> Option<config::Config> {
             // nothing above this line says which way it went.
             log(&format!(
                 "auto-update is {}",
-                if config::auto_update_enabled() { "armed" } else { "off" }
+                if config::auto_update_enabled() {
+                    "armed"
+                } else {
+                    "off"
+                }
             ));
             None
         }
@@ -327,7 +334,13 @@ fn load_config_or_log() -> Option<config::Config> {
 fn hotkey_of(config: &Option<config::Config>) -> (HOT_KEY_MODIFIERS, u32, String) {
     config
         .as_ref()
-        .map(|c| (HOT_KEY_MODIFIERS(c.hotkey.0), c.hotkey.1, c.hotkey_str.clone()))
+        .map(|c| {
+            (
+                HOT_KEY_MODIFIERS(c.hotkey.0),
+                c.hotkey.1,
+                c.hotkey_str.clone(),
+            )
+        })
         .unwrap_or((MOD_ALT | MOD_NOREPEAT, 0x20, "Alt+Space".to_string()))
 }
 
@@ -359,7 +372,11 @@ fn create_tray_window(
     audio_engine: audio::AudioEngine,
 ) -> Option<HWND> {
     unsafe {
-        let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
+        let init = Box::into_raw(Box::new(AppInit {
+            config,
+            instance: hinstance,
+            audio_engine,
+        }));
         match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS_NAME,
@@ -387,12 +404,20 @@ fn create_tray_window(
 /// from a previously killed instance) still owns it, retry for a few seconds
 /// before giving up, then let the caller surface a visible tray warning
 /// instead of silently running with a dead hotkey.
-fn register_hotkey_with_retry(hwnd: HWND, hk_mod: HOT_KEY_MODIFIERS, hk_vk: u32, hk_str: &str) -> bool {
+fn register_hotkey_with_retry(
+    hwnd: HWND,
+    hk_mod: HOT_KEY_MODIFIERS,
+    hk_vk: u32,
+    hk_str: &str,
+) -> bool {
     for attempt in 0..10 {
         match unsafe { RegisterHotKey(hwnd, HOTKEY_TOGGLE, hk_mod, hk_vk) } {
             Ok(()) => {
                 if attempt > 0 {
-                    log(&format!("RegisterHotKey({hk_str}) succeeded on attempt {}", attempt + 1));
+                    log(&format!(
+                        "RegisterHotKey({hk_str}) succeeded on attempt {}",
+                        attempt + 1
+                    ));
                 }
                 return true;
             }

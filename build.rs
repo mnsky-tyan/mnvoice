@@ -33,10 +33,7 @@ fn main() {
     // empty version the updater would compare against happily.
     let tag = std::env::var("GITHUB_REF_NAME")
         .ok()
-        .filter(|name| {
-            name.starts_with('v')
-                && name[1..].starts_with(|c: char| c.is_ascii_digit())
-        })
+        .filter(|name| name.starts_with('v') && name[1..].starts_with(|c: char| c.is_ascii_digit()))
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=MNVOICE_TAG={tag}");
     // Without this, a rebuild in the same target directory keeps the version

@@ -12,7 +12,7 @@
 2. **Direct Point-to-Point TLS Encryption**:
    - Audio packets are streamed exclusively to the speech recognition endpoint explicitly specified in `mnvoice.env` (`BASE_URL`) or via environment variables.
    - All network connections enforce TLS 1.2 / TLS 1.3: native Windows HTTP (`WinHTTP` with `WINHTTP_FLAG_SECURE`) on Windows, `rustls` with bundled roots on Linux, `Security.framework` on macOS.
-   - mnvoice does not communicate with any telemetry servers, third-party analytics, crash reporting daemons, or auxiliary endpoints.
+   - mnvoice sends no telemetry, analytics or crash reports anywhere; the Windows updater's GitHub traffic, itemised below, is the only other destination.
 
 3. **Update Traffic** (Windows, `AUTO_UPDATE` or a manual "Check for updates"):
    - The only other destination is GitHub itself: the public `releases.atom` feed names the newest release, the downloaded asset and its published `SHA256SUMS` file come from that release's own assets. Release bytes are verified against the published checksum before they are swapped in, and nothing but that check ever writes to disk.

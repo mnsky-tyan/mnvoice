@@ -60,7 +60,11 @@ impl RequestHandles {
     /// A guard that owns just the session so far; the later handles are
     /// added as they are opened.
     fn with_session(session: *mut std::ffi::c_void) -> Self {
-        Self { request: None, connect: None, session: Some(session) }
+        Self {
+            request: None,
+            connect: None,
+            session: Some(session),
+        }
     }
 
     /// The request handle for the WinHTTP calls that take one.
@@ -72,7 +76,9 @@ impl RequestHandles {
     /// a WebSocket, whose socket takes over from the request.
     fn close_request(&mut self) {
         if let Some(h) = self.request.take() {
-            unsafe { let _ = WinHttpCloseHandle(h); }
+            unsafe {
+                let _ = WinHttpCloseHandle(h);
+            }
         }
     }
 
@@ -89,9 +95,15 @@ impl Drop for RequestHandles {
         unsafe {
             // Children before parents, the same order WinHttpSocket's Drop
             // keeps for a live socket.
-            if let Some(h) = self.request.take() { let _ = WinHttpCloseHandle(h); }
-            if let Some(h) = self.connect.take() { let _ = WinHttpCloseHandle(h); }
-            if let Some(h) = self.session.take() { let _ = WinHttpCloseHandle(h); }
+            if let Some(h) = self.request.take() {
+                let _ = WinHttpCloseHandle(h);
+            }
+            if let Some(h) = self.connect.take() {
+                let _ = WinHttpCloseHandle(h);
+            }
+            if let Some(h) = self.session.take() {
+                let _ = WinHttpCloseHandle(h);
+            }
         }
     }
 }

@@ -270,4 +270,3 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
     let step = rate as f64 / SAMPLE_RATE as f64;
     Ok(resample_linear(&mono, step))
 }
-

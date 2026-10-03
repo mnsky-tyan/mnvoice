@@ -643,23 +643,42 @@ mod tests {
         let mut raw = RawFields::new();
 
         raw.set(Field::Hotkey, "KEYBIND", "F9", true);
-        assert_eq!(raw.hotkey_str, "F9", "KEYBIND must reach the hotkey from the file");
+        assert_eq!(
+            raw.hotkey_str, "F9",
+            "KEYBIND must reach the hotkey from the file"
+        );
         raw.set(Field::Hotkey, "", "F10", false);
-        assert_eq!(raw.hotkey_str, "F10", "KEYBIND must reach the hotkey from the env");
+        assert_eq!(
+            raw.hotkey_str, "F10",
+            "KEYBIND must reach the hotkey from the env"
+        );
 
         raw.set(Field::OrbColor, "COLOR", "#A855F7", true);
-        assert_eq!(raw.orb_color_str, "#A855F7", "COLOR must reach the orb color from the file");
+        assert_eq!(
+            raw.orb_color_str, "#A855F7",
+            "COLOR must reach the orb color from the file"
+        );
         raw.set(Field::OrbColor, "", "cyan", false);
-        assert_eq!(raw.orb_color_str, "cyan", "COLOR must reach the orb color from the env");
+        assert_eq!(
+            raw.orb_color_str, "cyan",
+            "COLOR must reach the orb color from the env"
+        );
 
         raw.set(Field::OrbFluid, "FLUID_LEVEL", "0.9", true);
-        assert_eq!(raw.orb_fluid_str, "0.9", "FLUID_LEVEL must reach the fluid level from the file");
+        assert_eq!(
+            raw.orb_fluid_str, "0.9",
+            "FLUID_LEVEL must reach the fluid level from the file"
+        );
         raw.set(Field::OrbFluid, "", "50%", false);
-        assert_eq!(raw.orb_fluid_str, "50%", "FLUID_LEVEL must reach the fluid level from the env");
+        assert_eq!(
+            raw.orb_fluid_str, "50%",
+            "FLUID_LEVEL must reach the fluid level from the env"
+        );
 
         raw.set(Field::Keywords, "CUSTOM_WORDS", "herdr, mnvoice", true);
         assert!(
-            raw.keywords.contains(&"herdr".to_string()) && raw.keywords.contains(&"mnvoice".to_string()),
+            raw.keywords.contains(&"herdr".to_string())
+                && raw.keywords.contains(&"mnvoice".to_string()),
             "CUSTOM_WORDS must reach the keywords from the file, got {:?}",
             raw.keywords
         );
@@ -671,7 +690,10 @@ mod tests {
         );
 
         raw.set(Field::Keywords, "VOCABULARY", "six", true);
-        assert!(raw.keywords.contains(&"six".to_string()), "VOCABULARY must reach the keywords from the file");
+        assert!(
+            raw.keywords.contains(&"six".to_string()),
+            "VOCABULARY must reach the keywords from the file"
+        );
     }
 
     #[test]
@@ -682,7 +704,10 @@ mod tests {
         raw.set(Field::ApiKey, "API_KEY", "canon", true);
         assert_eq!(raw.api_key, "canon", "the canonical key overrides");
         raw.set(Field::ApiKey, "DEEPGRAM_API_KEY", "alias-2", true);
-        assert_eq!(raw.api_key, "canon", "a later alias does not override the canonical key");
+        assert_eq!(
+            raw.api_key, "canon",
+            "a later alias does not override the canonical key"
+        );
     }
 
     #[test]

@@ -14,8 +14,12 @@ pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
     let body = multipart_body(cfg, wav);
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
 
-    let response = crate::platform::http::NativeTransport
-        .post(&url, Some(&format!("Bearer {}", cfg.api_key)), &content_type, &body)?;
+    let response = crate::platform::http::NativeTransport.post(
+        &url,
+        Some(&format!("Bearer {}", cfg.api_key)),
+        &content_type,
+        &body,
+    )?;
 
     if response.status != 200 {
         return Err(response.error_for_status("ASR endpoint"));

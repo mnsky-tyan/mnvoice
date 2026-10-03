@@ -27,7 +27,10 @@ impl Response {
     /// bounded preview of the body, so a provider's explanation survives
     /// without a megabyte of HTML in the log.
     pub fn error_for_status(&self, what: &str) -> String {
-        let preview: String = String::from_utf8_lossy(&self.body).chars().take(200).collect();
+        let preview: String = String::from_utf8_lossy(&self.body)
+            .chars()
+            .take(200)
+            .collect();
         format!("{what} returned HTTP {}: {preview}", self.status)
     }
 }

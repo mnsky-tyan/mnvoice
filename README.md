@@ -371,7 +371,9 @@ release, since the updater refuses an uncheckable release rather than installing
 unchecked.
 
 The Linux and macOS releases each publish one binary plus a `.sha256` line
-you check the same way (`sha256sum -c mnvoice-linux-x64.sha256`).
+you check the same way (`sha256sum -c mnvoice-linux-x64.sha256`, or
+`shasum -a 256 -c mnvoice-macos-arm64.sha256` on macOS, whose userland spells
+it the other way).
 
 Windows will show a SmartScreen prompt on the first run of any newly downloaded
 copy. That is a reputation check on an unsigned binary, not a virus detection -
@@ -467,7 +469,7 @@ Known limits in this release, stated rather than papered over:
 See [SECURITY.md](SECURITY.md) for full details:
 
 - Zero audio written to disk - buffers live in RAM only and are dropped immediately after transmission.
-- Point-to-point TLS directly to your configured endpoint. Zero third-party calls.
+- Point-to-point TLS directly to your configured endpoint. The only other call is the Windows self-updater's release check on GitHub - see [Updates](#updates) and the network list in [SECURITY.md](SECURITY.md).
 - Zero clipboard reads or writes - words are injected as keystrokes at the cursor, never through the clipboard.
 - No global keyboard hooks - on Windows only the two registered hotkeys are intercepted; Linux and macOS register none.
 
