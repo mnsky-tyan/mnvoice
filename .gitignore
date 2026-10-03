@@ -1,6 +1,6 @@
 /target
 *.pdb
-mnvoice.env
+# mnvoice.env is covered by the *.env pattern below
 *.env
 *.log
 

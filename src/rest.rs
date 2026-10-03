@@ -106,11 +106,12 @@ pub fn parse_json_transcript(json: &str) -> Option<String> {
 /// dictation, so dropping them cannot change what was said.
 ///
 /// Deliberately excluded: "er" (ER / emergency room), "like" ("I'd like"),
-/// "you know" and "i mean" - all common real speech. An over-eager list that
-/// eats meaningful words is far worse than a missed filler.
+/// "you know" and "i mean" - all common real speech. Also excluded: the
+/// spoken affirmatives ("uh-huh", "mm-hmm", "mhm"), which answer questions -
+/// dictating "uh-huh, do that" must not type "do that". An over-eager list
+/// that eats meaningful words is far worse than a missed filler.
 const DISFLUENCIES: &[&str] = &[
-    "uh", "uhh", "uh-huh", "uhh-huh", "um", "umm", "umm-hmm", "erm", "errm", "hmm", "hm", "mm",
-    "mmm", "mm-hmm", "mhm", "uh-hum",
+    "uh", "uhh", "um", "umm", "erm", "errm", "hmm", "hm", "mm", "mmm",
 ];
 
 /// True if the token is a disfluency, ignoring surrounding punctuation and case.
@@ -344,12 +345,17 @@ mod tests {
     #[test]
     fn test_is_disfluency() {
         // Every entry in the list, plus case and punctuation variants, must match.
-        for w in ["uh", "uhh", "um", "umm", "erm", "errm", "hmm", "hm", "mm", "mhm", "Mm,", "HMM."] {
+        for w in ["uh", "uhh", "um", "umm", "erm", "errm", "hmm", "hm", "mm", "Mm,", "HMM."] {
             assert!(is_disfluency(w), "{w} should be a filler");
         }
         // Ambiguous tokens must NOT match - eating these would corrupt real speech.
         for w in ["like", "er", "very", "so", "the", "you", "mean"] {
             assert!(!is_disfluency(w), "{w} should NOT be a filler");
+        }
+        // Spoken affirmatives answer questions, so they are real speech and
+        // must survive the filter.
+        for w in ["uh-huh", "mm-hmm", "mhm", "uh-hum"] {
+            assert!(!is_disfluency(w), "{w} is an affirmative, not a filler");
         }
     }
 }

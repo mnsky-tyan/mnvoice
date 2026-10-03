@@ -17,6 +17,21 @@ use std::sync::Arc;
 /// Every backend delivers this rate; providers are configured to expect it.
 pub const SAMPLE_RATE: u32 = 16_000;
 
+/// A session that has heard no speech at all ends itself after this long, so
+/// an accidental hotkey press does not hold the microphone hostage until
+/// `max_seconds`. Both engines enforce it.
+pub const NO_SPEECH_LIMIT_MS: u64 = 10_000;
+
+/// How much wall-clock audio a buffer of `samples` covers at the shared rate.
+///
+/// Both engines advance their voice-activity windows by the audio they
+/// consumed, not by loop ticks - a tick that ran long still counts the time it
+/// covered, so a stalled capture thread ends the session on the configured
+/// silence instead of leaving the microphone open.
+pub fn audio_ms(samples: usize) -> u64 {
+    samples as u64 * 1000 / SAMPLE_RATE as u64
+}
+
 /// A persistent capture engine, armed once at startup.
 ///
 /// On Windows nothing names this trait - the app holds its concrete

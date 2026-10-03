@@ -21,7 +21,7 @@
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
-use crate::platform::audio::{Audio, SAMPLE_RATE};
+use crate::platform::audio::{audio_ms, Audio, NO_SPEECH_LIMIT_MS, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -167,17 +167,6 @@ fn run_session(
     // `stream` drops here, which stops capture and joins the device thread.
 }
 
-/// How much of the VAD's silence windows one tick's audio covers.
-///
-/// The Windows engine advances its windows by the audio it consumed - 40 ms
-/// per 640-sample chunk - so a tick that ran long still counts the time it
-/// covered. Counting ticks instead under-counts a stalled loop, which leaves
-/// the microphone open until MAX_SECONDS rather than ending on the configured
-/// silence.
-fn audio_ms(samples: usize) -> u64 {
-    samples as u64 * 1000 / SAMPLE_RATE as u64
-}
-
 /// The two silence windows that end a dictation.
 ///
 /// Both advance by the audio each tick consumed, which is what keeps them
@@ -216,7 +205,7 @@ impl SilenceWindows {
             // Nothing said at all: the same no-speech cutoff Windows uses, so a
             // forgotten open mic cannot hold the device for max_seconds.
             self.no_speech_ms += audio_ms(samples);
-            self.no_speech_ms >= 10_000
+            self.no_speech_ms >= NO_SPEECH_LIMIT_MS
         }
     }
 }

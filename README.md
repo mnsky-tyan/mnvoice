@@ -26,7 +26,7 @@ mnvoice.exe (~417 KB)
 - **Fully configurable** - hotkey, cancel key, orb color, fluid level, filler words, STT provider, model, language, and vocabulary. All in one plain text file, none of it required.
 - **No windows, no taskbar** - lives in the system tray. Right-click for start-with-Windows, check for updates, config, keywords, and restart.
 - **Privacy focused** - zero audio written to disk, point-to-point TLS, zero telemetry. See [SECURITY.md](SECURITY.md).
-- **Tiny footprint** - ~417 KB binary, ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
+- **Tiny footprint** - ~14 MB working set, ~2.4 MB private RAM, 0% idle CPU.
 
 ---
 
@@ -165,11 +165,9 @@ if ! powershell.exe -NoProfile -Command \
 fi
 ```
 
-Task Scheduler (works even if Explorer is restarting):
-
-```cmd
-schtasks /create /tn "mnvoice" /tr "C:\path\to\mnvoice.exe" /sc onlogon /rl limited /f
-```
+Prefer Task Scheduler over the shell? mnvoice's **Start with Windows**
+checkbox creates the logon task for you, or use the exact `schtasks` command
+shown in [Start with Windows](#start-with-windows).
 
 ---
 
@@ -187,8 +185,8 @@ HOTKEY=Alt+Space
 CANCEL_KEY=Escape
 ```
 
-Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win`  
-Supported keys: `Space`, `Escape`, `Tab`, `Enter`, `F1`-`F24`, `A`-`Z`, `0`-`9`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `BackQuote`
+Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win` (also accepted: `Option`, `Control`, `Windows`, `Super`, `Cmd`)  
+Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`/`Caps`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`
 
 Examples:
 ```ini
@@ -274,6 +272,20 @@ Every key below works with any provider and any API key unless marked otherwise.
 
 Delete `mnvoice.env` at any time to fall back to every default above.
 
+Each key also answers to its vendor aliases: `DEEPGRAM_API_KEY` /
+`GROQ_API_KEY` / `OPENAI_API_KEY` (and likewise `DEEPGRAM_MODEL`,
+`GROQ_MODEL`, `OPENAI_MODEL`, `DEEPGRAM_LANGUAGE`, `GROQ_LANGUAGE`,
+`DEEPGRAM_BASE_URL`, `GROQ_BASE_URL`) work everywhere, and the shorter
+synonyms `MODE`/`PROVIDER` for `PROTOCOL`, `ENDPOINT` for `BASE_URL`,
+`KEYTERMS`/`CUSTOM_WORDS`/`VOCABULARY` for `KEYWORDS`, `ORB_HEX` for
+`ORB_COLOR`, `ORB_FLUID_AMOUNT` for `ORB_FLUID_LEVEL`,
+`TRIGGER_HOTKEY`/`KEYBIND` for `HOTKEY`, `CANCEL_HOTKEY` for `CANCEL_KEY`,
+`SILENCE_MS` for `VAD_SILENCE_MS`, and `RMS_THRESHOLD` for
+`VAD_RMS_THRESHOLD`. For `API_KEY`, `MODEL`, `LANGUAGE` and `BASE_URL` a
+canonical key beats its aliases no matter the order lines appear in; every
+other field takes the last line that names it (`KEYWORDS` accumulate), so
+when one file mixes a key with its alias, write the spelling you want last.
+
 #### How filler-word stripping works
 
 `FILLER_WORDS=0` is one setting that adapts to the provider, because not every API offers a switch for it:
@@ -305,16 +317,15 @@ entry is never mistaken for one.
 the release feed at most once per day, and only installs when it is idle - it will
 never swap the binary out from under a transcript in flight.
 
-**Checked.** Windows releases since v0.1.13 publish a `SHA256SUMS` file
-beside their assets (the earlier bare Windows tags and the Linux/macOS
-releases carry no such file, and only the Windows path ever asks for one).
-Before an automatic install, mnvoice downloads that file, reads the line for the
-asset it just downloaded, and hashes the bytes it got: a checksum that does not
-match, a file that does not list the asset, or a missing file all mean no
-install. A download is never swapped in unless the release's own published sum
-says it is the file that release published. A Windows release that cannot be
-checked is simply not installed - the check fails closed, which is what makes an
-unverifiable release a no-op rather than an unchecked install.
+**Checked.** Before an automatic install, mnvoice verifies what it
+downloaded against that release's published `SHA256SUMS` (see
+[Verifying a download](#verifying-a-download) for which releases publish
+one): it reads the line for the asset it just downloaded and hashes the bytes
+it got. A checksum that does not match, a file that does not list the asset,
+or a missing file all mean no install. A download is never swapped in unless
+the release's own published sum says it is the file that release published -
+the check fails closed, so an unverifiable release is a no-op rather than an
+unchecked install.
 
 It is off by default on purpose. Replacing a running binary is a decision you
 should make, not one that happens silently because a default pointed that way.

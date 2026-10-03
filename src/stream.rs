@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::platform::audio::SAMPLE_RATE;
 use crate::platform::http::{NativeTransport, Transport, WebSocket};
 use crate::platform::input;
 
@@ -54,14 +55,10 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
     })
 }
 
-/// Connects to a real-time streaming WebSocket endpoint and streams audio chunks from `rx`.
-/// Types confirmed words into the active cursor as they arrive; returns the full transcript.
-pub fn run_stream(
-    cfg: &Config,
-    stop: &Arc<AtomicBool>,
-    cancelled: &Arc<AtomicBool>,
-    rx: Receiver<Vec<i16>>,
-) -> Result<String, String> {
+/// The provider's listen endpoint for this config: base URL from the config
+/// (or the Deepgram default), the model and format parameters, language and
+/// keywords. Pure, so the wire contract is testable without a socket.
+fn listen_url(cfg: &Config) -> String {
     let (host, port, secure, base_path) = crate::rest::parse_base_url(&cfg.base_url)
         .unwrap_or_else(|_| ("api.deepgram.com".to_string(), 443, true, String::new()));
 
@@ -77,7 +74,7 @@ pub fn run_stream(
     // Providers that ignore it are still covered by the local filter below.
     let filler_words = if cfg.strip_fillers { "false" } else { "true" };
     let mut path = format!(
-        "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=1500&no_delay=true&vad_events=true&filler_words={filler_words}",
+        "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate={SAMPLE_RATE}&channels=1&interim_results=true&endpointing=1500&no_delay=true&vad_events=true&filler_words={filler_words}",
         cfg.model
     );
     if !cfg.language.is_empty() {
@@ -102,15 +99,64 @@ pub fn run_stream(
     }
 
     let scheme = if secure { "wss" } else { "ws" };
-    let url = format!("{scheme}://{host}:{port}{path}");
+    format!("{scheme}://{host}:{port}{path}")
+}
 
-    // Deepgram wants Token, OpenAI-compatible endpoints want Bearer; whatever
-    // the user already typed is passed through so either spelling works.
-    let auth_value = if cfg.api_key.starts_with("Token ") || cfg.api_key.starts_with("Bearer ") {
+/// The Authorization header value for this config: Deepgram wants `Token`,
+/// OpenAI-compatible endpoints want `Bearer`; whatever the user already typed
+/// is passed through so either spelling works.
+fn auth_value(cfg: &Config) -> String {
+    if cfg.api_key.starts_with("Token ") || cfg.api_key.starts_with("Bearer ") {
         cfg.api_key.clone()
     } else {
         format!("Token {}", cfg.api_key)
-    };
+    }
+}
+
+/// Types the words in `words[from..to]` at the cursor and appends them to the
+/// running transcript, space-separated from whatever is already there. This is
+/// the one place a decided word becomes typed text; the reader's branches all
+/// end here so their only differences can be the range they commit.
+fn commit_words(
+    words: &[&str],
+    from: usize,
+    to: usize,
+    has_typed_any: &mut bool,
+    full: &Mutex<String>,
+) {
+    // Clamped, so a caller whose counter has run past this frame's words (a
+    // shorter final transcript after a longer interim one) is a no-op rather
+    // than a slice panic.
+    let to = to.min(words.len());
+    if from >= to {
+        return;
+    }
+    let joined = words[from..to].join(" ");
+    let mut to_type = String::new();
+    if *has_typed_any {
+        to_type.push(' ');
+    }
+    to_type.push_str(&joined);
+    input::type_text(&to_type);
+    *has_typed_any = true;
+
+    let mut full = full.lock().unwrap();
+    if !full.is_empty() {
+        full.push(' ');
+    }
+    full.push_str(&joined);
+}
+
+/// Connects to a real-time streaming WebSocket endpoint and streams audio chunks from `rx`.
+/// Types confirmed words into the active cursor as they arrive; returns the full transcript.
+pub fn run_stream(
+    cfg: &Config,
+    stop: &Arc<AtomicBool>,
+    cancelled: &Arc<AtomicBool>,
+    rx: Receiver<Vec<i16>>,
+) -> Result<String, String> {
+    let url = listen_url(cfg);
+    let auth_value = auth_value(cfg);
     let auth_header = ("Authorization", auth_value.as_str());
 
     let socket = NativeTransport.websocket(&url, &[auth_header])?;
@@ -171,40 +217,13 @@ pub fn run_stream(
 
                     if res.is_final {
                         // Sentence/clause finalized: type all remaining words to the end
-                        if words.len() > typed_word_count {
-                            let remaining = &words[typed_word_count..];
-                            let mut to_type = remaining.join(" ");
-                            if has_typed_any {
-                                to_type = format!(" {to_type}");
-                            }
-                            input::type_text(&to_type);
-                            has_typed_any = true;
-
-                            let mut full = full_transcript_clone.lock().unwrap();
-                            if !full.is_empty() {
-                                full.push(' ');
-                            }
-                            full.push_str(&remaining.join(" "));
-                        }
+                        commit_words(&words, typed_word_count, words.len(), &mut has_typed_any, &full_transcript_clone);
                         typed_word_count = 0; // reset for next clause
                         latest_uncommitted.clear();
                     } else {
                         // Interim results: type completed words (all except the trailing partial word)
                         if words.len() > 1 && words.len() - 1 > typed_word_count {
-                            let completed = &words[typed_word_count..words.len() - 1];
-                            let mut to_type = completed.join(" ");
-                            if has_typed_any {
-                                to_type = format!(" {to_type}");
-                            }
-                            input::type_text(&to_type);
-                            has_typed_any = true;
-
-                            let mut full = full_transcript_clone.lock().unwrap();
-                            if !full.is_empty() {
-                                full.push(' ');
-                            }
-                            full.push_str(&completed.join(" "));
-
+                            commit_words(&words, typed_word_count, words.len() - 1, &mut has_typed_any, &full_transcript_clone);
                             typed_word_count = words.len() - 1;
                         }
                     }
@@ -220,19 +239,7 @@ pub fn run_stream(
         // Skipped entirely on cancel so a discarded session leaves nothing behind.
         if !latest_uncommitted.is_empty() && !cancelled_clone.load(Ordering::SeqCst) {
             let words: Vec<&str> = latest_uncommitted.split_whitespace().collect();
-            if words.len() > typed_word_count {
-                let remaining = &words[typed_word_count..];
-                let mut to_type = remaining.join(" ");
-                if has_typed_any {
-                    to_type = format!(" {to_type}");
-                }
-                input::type_text(&to_type);
-                let mut full = full_transcript_clone.lock().unwrap();
-                if !full.is_empty() {
-                    full.push(' ');
-                }
-                full.push_str(&remaining.join(" "));
-            }
+            commit_words(&words, typed_word_count, words.len(), &mut has_typed_any, &full_transcript_clone);
         }
         // The reader is out, so nothing more can arrive and the main thread's
         // wait can end with it rather than running out its clock.
@@ -303,5 +310,54 @@ mod tests {
         assert_eq!(url_encode("hello world"), "hello%20world");
         assert_eq!(url_encode("C++"), "C%2B%2B");
         assert_eq!(url_encode("mnvoice"), "mnvoice");
+    }
+
+    fn test_cfg() -> Config {
+        Config {
+            protocol: crate::config::Protocol::Streaming,
+            api_key: "tok".into(),
+            model: "nova-3".into(),
+            language: "en".into(),
+            base_url: "https://api.deepgram.com".into(),
+            max_seconds: 120,
+            trailing_space: true,
+            keywords: vec!["Kubernetes".into()],
+            orb_color: (1.0, 0.18, 0.58),
+            orb_fluid_level: 0.75,
+            hotkey: (0x4001, 0x20),
+            hotkey_str: "Alt+Space".into(),
+            cancel_key: (0x4000, 0x1B),
+            cancel_key_str: "Escape".into(),
+            vad_silence_ms: 3000,
+            vad_rms_threshold: 400.0,
+            strip_fillers: true,
+            auto_update: false,
+        }
+    }
+
+    #[test]
+    fn the_listen_url_carries_the_constant_sample_rate() {
+        // The wire must name SAMPLE_RATE, not a literal: this is the rate the
+        // capture engine resamples to, and a mismatch transcribes as garbage
+        // with no error anywhere.
+        let url = listen_url(&test_cfg());
+        assert!(
+            url.contains(&format!("sample_rate={SAMPLE_RATE}")),
+            "the wire must carry the constant rate: {url}"
+        );
+        assert!(
+            url.starts_with("wss://api.deepgram.com:443/v1/listen?model=nova-3&"),
+            "{url}"
+        );
+        assert!(url.contains("&keyterm=Kubernetes"), "nova-3 uses keyterm: {url}");
+    }
+
+    #[test]
+    fn the_auth_value_passes_a_prefixed_scheme_through() {
+        let mut cfg = test_cfg();
+        cfg.api_key = "Bearer sk-x".into();
+        assert_eq!(auth_value(&cfg), "Bearer sk-x");
+        cfg.api_key = "raw-key".into();
+        assert_eq!(auth_value(&cfg), "Token raw-key");
     }
 }

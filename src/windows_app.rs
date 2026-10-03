@@ -6,8 +6,8 @@
 use crate::audio;
 use crate::config;
 use crate::orb;
-use crate::paste;
 use crate::platform;
+use crate::platform::input;
 use crate::platform::windows_impl::wide;
 use crate::rest;
 use crate::stream;
@@ -344,6 +344,12 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
+/// The idle tray tip. It names the hotkey actually configured, not a
+/// hardcoded one: a user with KEYBIND=F9 must not be told to press Alt+Space.
+fn idle_tip(hotkey: Option<&str>) -> String {
+    format!("mnvoice - idle. {} to dictate.", hotkey.unwrap_or("Alt+Space"))
+}
+
 unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -422,11 +428,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
                     let tip = match app.state {
-                        State::Idle => "mnvoice - idle. Alt+Space to dictate.",
-                        State::Recording => "mnvoice - listening... (auto-stops on silence)",
-                        State::Transcribing => "mnvoice - transcribing...",
+                        State::Idle => {
+                            idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str()))
+                        }
+                        State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
+                        State::Transcribing => "mnvoice - transcribing...".to_string(),
                     };
-                    let _ = set_tray_tip(hwnd, tip);
+                    let _ = set_tray_tip(hwnd, &tip);
                 }
                 LRESULT(0)
             }
@@ -625,7 +633,7 @@ fn worker(
     );
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
-    let result = match cfg.protocol {
+    let mut result = match cfg.protocol {
         config::Protocol::Streaming => {
             match stream::run_stream(&cfg, &stop, &cancelled, rx) {
                 Ok(text) => {
@@ -657,9 +665,9 @@ fn worker(
                     if text.is_empty() {
                         (false, "No speech detected".into())
                     } else {
-                        let _ = paste::type_text(&text);
+                        input::type_text(&text);
                         if trailing {
-                            let _ = paste::type_text(" ");
+                            input::type_text(" ");
                         }
                         (true, text)
                     }
@@ -670,7 +678,9 @@ fn worker(
     };
 
     if let Ok(rx) = capture_done_rx {
-        let _ = rx.recv();
+        if let Ok(Err(e)) = rx.recv() {
+            result = (false, e);
+        }
     }
     *outcome.lock().unwrap() = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
@@ -1079,7 +1089,7 @@ pub(crate) fn check_for_updates_async(quiet: bool) {
                 return;
             }
         };
-        let current = update::current_version().to_string();
+        let current = update::current_version();
         if !update::is_newer(&rel.version, &current) {
             log("mnvoice is up to date");
             if !quiet {
@@ -1269,6 +1279,14 @@ mod tests {
         assert!(autostart_starting(AutostartState::RunValueEnabled));
         assert!(!autostart_starting(AutostartState::RunValueDisabled));
         assert!(!autostart_starting(AutostartState::NoRunValue));
+    }
+
+    #[test]
+    fn the_idle_tray_tip_names_the_configured_hotkey() {
+        // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
+        // no config yet the documented default is what the tip names.
+        assert_eq!(idle_tip(Some("F9")), "mnvoice - idle. F9 to dictate.");
+        assert_eq!(idle_tip(None), "mnvoice - idle. Alt+Space to dictate.");
     }
 
     #[test]

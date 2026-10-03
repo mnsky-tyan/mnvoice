@@ -4,7 +4,7 @@
 # crate on this machine, and its target dir must sit on Windows disk because
 # the 9p mount supports no Windows file locking.
 commands:
-  test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test
+  test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test --locked
 
 # A pull_request runs all three jobs, and each platform's tag push runs that
 # job, all on real runners (release.yml), so the pipeline monitors those

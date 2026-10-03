@@ -26,8 +26,8 @@
    - No credentials are ever sent to any destination other than the `Authorization` header of the configured speech-to-text service.
 
 2. **Version Control Safety**:
-   - The repository's `.gitignore` explicitly excludes all `.env` files (`*.env`, `mnvoice.env`).
-   - Only example templates (`mnvoice.env.example`) are tracked in source control.
+   - The repository's `.gitignore` explicitly excludes all `.env` files (`*.env`, which covers `mnvoice.env`).
+   - Only example templates (`mnvoice.env.example`, `keywords.txt.example`) are tracked in source control.
 
 ## Keystroke Synthesis & System Clipboard
 
