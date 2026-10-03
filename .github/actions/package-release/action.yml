@@ -1,0 +1,88 @@
+name: Package release
+description: >-
+  Produce this platform's release assets and their hash sidecar. Shared by all
+  three jobs so the packaging contract has one home: the built binary is copied
+  to the name it ships under, and the sidecar lists every asset in
+  "<lowercase-sha256>  <basename>" form with LF line endings - the exact format
+  the Windows updater parses (see update.rs's CHECKSUMS_ASSET), and the same
+  two-space separator shasum uses on macOS.
+inputs:
+  binary:
+    required: true
+    description: Path to the binary the build produced.
+  asset:
+    required: true
+    description: The name the binary ships under, e.g. mnvoice-linux-x64.
+  sidecar:
+    required: true
+    description: The hash file to write, e.g. SHA256SUMS or mnvoice-linux-x64.sha256.
+  zip:
+    required: false
+    description: Optional zip asset to build from the staged files.
+  zip_extra:
+    required: false
+    description: Space-separated extra files staged into the zip.
+runs:
+  using: composite
+  steps:
+    - name: Package (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        P_BINARY: ${{ inputs.binary }}
+        P_ASSET: ${{ inputs.asset }}
+        P_SIDECAR: ${{ inputs.sidecar }}
+        P_ZIP: ${{ inputs.zip }}
+        P_ZIP_EXTRA: ${{ inputs.zip_extra }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # The raw exe at the workspace root is what the publish step hands to
+        # gh, and it is the asset the updater downloads; the zip carries the
+        # companion templates.
+        Copy-Item -Path $env:P_BINARY -Destination $env:P_ASSET -Force
+        $files = @($env:P_ASSET)
+        if ($env:P_ZIP) {
+          $stage = "package-stage"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -Path $env:P_ASSET -Destination $stage -Force
+          foreach ($extra in $env:P_ZIP_EXTRA -split '\s+' | Where-Object { $_ }) {
+            Copy-Item -Path $extra -Destination $stage -Force
+          }
+          Compress-Archive -Path "$stage/*" -DestinationPath $env:P_ZIP
+          $files += $env:P_ZIP
+        }
+        # Line endings are written by hand on purpose: Set-Content joins with
+        # the runner's CRLF, and the hash file's shape is a manifest, not a
+        # platform default. utf8NoBOM + \n is what we ship; the updater
+        # tolerates a BOM and CRLF when it reads, which is what the BOM
+        # tolerance in the feed parser exists for.
+        $lines = foreach ($f in $files) {
+          $h = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLowerInvariant()
+          "$h  $(Split-Path -Leaf $f)"
+        }
+        [System.IO.File]::WriteAllText(
+          (Join-Path $PWD $env:P_SIDECAR),
+          ($lines -join "`n") + "`n",
+          (New-Object System.Text.UTF8Encoding($false)))
+        foreach ($f in $files) { Write-Host "wrote $f" }
+
+    - name: Package (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        P_BINARY: ${{ inputs.binary }}
+        P_ASSET: ${{ inputs.asset }}
+        P_SIDECAR: ${{ inputs.sidecar }}
+        P_ZIP: ${{ inputs.zip }}
+      run: |
+        set -euo pipefail
+        cp -- "$P_BINARY" "$P_ASSET"
+        # Text mode on purpose: sha256sum -b would prefix the asset name with
+        # the binary-mode marker "*", which breaks the two-space "<hash>  <name>"
+        # contract the sidecar is supposed to keep. Hashes are identical.
+        sha256sum "$P_ASSET" > "$P_SIDECAR"
+        if [ -n "$P_ZIP" ]; then
+          echo "a Unix zip asset is not implemented in this action" >&2
+          exit 1
+        fi
+        ls -l "$P_ASSET" "$P_SIDECAR"

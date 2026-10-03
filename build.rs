@@ -23,12 +23,20 @@ fn main() {
     // about where a version ends and a platform suffix begins.
     //
     // GITHUB_REF_NAME is the tag name on a tag push ("v0.1.18-win"), but on a
-    // branch or pull-request build it is a branch name ("main", "7/merge"),
-    // so only refs that name a tag are accepted here; everything else gets the
-    // crate version, which version_of_tag passes through unchanged.
+    // branch or pull-request build it is a branch name ("main", "7/merge", and
+    // a workflow_dispatch can select any branch at all), so only refs that
+    // name a tag are accepted here; everything else gets the crate version,
+    // which version_of_tag passes through unchanged.
+    //
+    // "Names a tag" is v followed by a digit: a branch named "v-new-hotkey"
+    // would otherwise bake that name in, and version_of_tag reduces it to an
+    // empty version the updater would compare against happily.
     let tag = std::env::var("GITHUB_REF_NAME")
         .ok()
-        .filter(|name| name.starts_with('v'))
+        .filter(|name| {
+            name.starts_with('v')
+                && name[1..].starts_with(|c: char| c.is_ascii_digit())
+        })
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=MNVOICE_TAG={tag}");
     // Without this, a rebuild in the same target directory keeps the version
