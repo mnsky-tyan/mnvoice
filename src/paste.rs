@@ -42,7 +42,7 @@ pub fn type_text(text: &str) -> Result<(), String> {
                     },
                 },
             ];
-            let sent = SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+            let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
             if sent != inputs.len() as u32 {
                 return Err(format!(
                     "SendInput injected {sent} of {} events for U+{ch:04X}",

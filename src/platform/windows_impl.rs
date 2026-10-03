@@ -42,23 +42,69 @@ fn wptr(v: &[u16]) -> PCWSTR {
 /// request cannot poison the next one.
 pub struct WinHttpTransport;
 
+/// A session, connection and request handle that travel together.
+///
+/// WinHTTP handles are children of their parents: the request belongs to the
+/// connection, the connection to the session. Dropping them in any other
+/// order - or leaking one on an early return - leaks the parents, and a
+/// session kept alive by a leaked child holds sockets for the life of the
+/// process. Drop does the teardown in the one correct order, so no call site
+/// has to remember it.
+struct RequestHandles {
+    request: Option<*mut std::ffi::c_void>,
+    connect: Option<*mut std::ffi::c_void>,
+    session: Option<*mut std::ffi::c_void>,
+}
+
+impl RequestHandles {
+    /// A guard that owns just the session so far; the later handles are
+    /// added as they are opened.
+    fn with_session(session: *mut std::ffi::c_void) -> Self {
+        Self { request: None, connect: None, session: Some(session) }
+    }
+
+    /// The request handle for the WinHTTP calls that take one.
+    fn request(&self) -> *mut std::ffi::c_void {
+        self.request.expect("request handle still held")
+    }
+
+    /// Close the request while keeping the parents - the transfer point for
+    /// a WebSocket, whose socket takes over from the request.
+    fn close_request(&mut self) {
+        if let Some(h) = self.request.take() {
+            unsafe { let _ = WinHttpCloseHandle(h); }
+        }
+    }
+
+    /// Hand the parents to a WebSocket, which owns them from here on.
+    fn take_parents(&mut self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
+        let connect = self.connect.take().expect("connect handle still held");
+        let session = self.session.take().expect("session handle still held");
+        (connect, session)
+    }
+}
+
+impl Drop for RequestHandles {
+    fn drop(&mut self) {
+        unsafe {
+            // Children before parents, the same order WinHttpSocket's Drop
+            // keeps for a live socket.
+            if let Some(h) = self.request.take() { let _ = WinHttpCloseHandle(h); }
+            if let Some(h) = self.connect.take() { let _ = WinHttpCloseHandle(h); }
+            if let Some(h) = self.session.take() { let _ = WinHttpCloseHandle(h); }
+        }
+    }
+}
+
 impl WinHttpTransport {
-    /// Open a session, connect, and issue a request. Returns the raw request
-    /// handle plus the session and connection so the caller can close them in
-    /// the right order - WinHTTP leaks if a child handle outlives its parent.
+    /// Open a session, connect, and issue a request. The handles come back
+    /// in a `RequestHandles` guard whose Drop closes them in the one correct
+    /// order, so every early return below needs no teardown of its own.
     unsafe fn open(
         method: &str,
         url: &str,
         timeout_ms: (i32, i32, i32),
-    ) -> Result<
-        (
-            *mut std::ffi::c_void,
-            *mut std::ffi::c_void,
-            *mut std::ffi::c_void,
-            bool,
-        ),
-        String,
-    > {
+    ) -> Result<(RequestHandles, bool), String> {
         let (host, port, secure, path) = parse_base_url(url)?;
 
         let session = WinHttpOpen(
@@ -71,6 +117,7 @@ impl WinHttpTransport {
         if session.is_null() {
             return Err("cannot create HTTP session".into());
         }
+        let mut handles = RequestHandles::with_session(session);
         if let Err(e) = WinHttpSetTimeouts(
             session,
             timeout_ms.0,
@@ -78,16 +125,15 @@ impl WinHttpTransport {
             timeout_ms.2,
             timeout_ms.2,
         ) {
-            let _ = WinHttpCloseHandle(session);
             return Err(format!("set timeouts ({e})"));
         }
 
         let host_w = wide(&host);
         let connect = WinHttpConnect(session, wptr(&host_w), port, 0);
         if connect.is_null() {
-            let _ = WinHttpCloseHandle(session);
             return Err(format!("cannot connect to {host}"));
         }
+        handles.connect = Some(connect);
 
         let method_w = wide(method);
         let path_w = wide(&path);
@@ -109,12 +155,11 @@ impl WinHttpTransport {
             },
         );
         if request.is_null() {
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
             return Err("cannot create HTTP request".into());
         }
+        handles.request = Some(request);
 
-        Ok((request, connect, session, secure))
+        Ok((handles, secure))
     }
 
     /// Pull the status code off an open response. Only readable while the
@@ -160,7 +205,8 @@ impl Transport for WinHttpTransport {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
-            let (request, connect, session, _) = Self::open("GET", url, (0, 15_000, 45_000))?;
+            let (handles, _) = Self::open("GET", url, (0, 15_000, 45_000))?;
+            let request = handles.request();
 
             let headers = wide(&format!(
                 "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
@@ -181,9 +227,9 @@ impl Transport for WinHttpTransport {
                 Ok::<Response, windows::core::Error>(Response { status, body })
             })();
 
-            let _ = WinHttpCloseHandle(request);
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
+            // The guard closes request, connection and session, in that
+            // order, whatever the result was.
+            drop(handles);
             result.map_err(|e| format!("request failed ({e})"))
         }
     }
@@ -198,7 +244,8 @@ impl Transport for WinHttpTransport {
         unsafe {
             // Uploads carry audio, so the read timeout is longer than the
             // feed's: a slow provider transcoding a long clip is not an error.
-            let (request, connect, session, _) = Self::open("POST", url, (0, 10_000, 60_000))?;
+            let (handles, _) = Self::open("POST", url, (0, 10_000, 60_000))?;
+            let request = handles.request();
 
             let auth_line = auth
                 .map(|v| format!("Authorization: {v}\r\n"))
@@ -230,9 +277,9 @@ impl Transport for WinHttpTransport {
                 })
             })();
 
-            let _ = WinHttpCloseHandle(request);
-            let _ = WinHttpCloseHandle(connect);
-            let _ = WinHttpCloseHandle(session);
+            // The guard closes request, connection and session, in that
+            // order, whatever the result was.
+            drop(handles);
             result.map_err(|e| format!("request failed ({e})"))
         }
     }
@@ -242,14 +289,12 @@ impl Transport for WinHttpTransport {
             // A streaming session is held open for the length of a dictation,
             // so there is no overall timeout - only the per-read timeout that
             // `WebSocket::read` passes in.
-            let (request, connect, session, _) = Self::open("GET", url, (0, 10_000, 0))?;
+            let (mut handles, _) = Self::open("GET", url, (0, 10_000, 0))?;
+            let request = handles.request();
 
             let opt_ok =
                 WinHttpSetOption(Some(request), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, None);
             if opt_ok.is_err() {
-                let _ = WinHttpCloseHandle(request);
-                let _ = WinHttpCloseHandle(connect);
-                let _ = WinHttpCloseHandle(session);
                 return Err("cannot request WebSocket upgrade".into());
             }
 
@@ -268,34 +313,28 @@ impl Transport for WinHttpTransport {
                 );
             }
 
+            // Every failure from here to the upgrade returns through the
+            // guard's Drop, which closes all three in the right order.
             if let Err(e) = WinHttpSendRequest(request, None, None, 0, 0, 0) {
-                let _ = WinHttpCloseHandle(request);
-                let _ = WinHttpCloseHandle(connect);
-                let _ = WinHttpCloseHandle(session);
                 return Err(format!("WebSocket request failed ({e})"));
             }
             if let Err(e) = WinHttpReceiveResponse(request, std::ptr::null_mut()) {
-                let _ = WinHttpCloseHandle(request);
-                let _ = WinHttpCloseHandle(connect);
-                let _ = WinHttpCloseHandle(session);
                 return Err(format!("WebSocket response failed ({e})"));
             }
 
             let status = Self::status_of(request);
             if status != 101 {
-                let _ = WinHttpCloseHandle(request);
-                let _ = WinHttpCloseHandle(connect);
-                let _ = WinHttpCloseHandle(session);
                 return Err(format!("WebSocket handshake rejected with HTTP {status}"));
             }
 
             let ws = WinHttpWebSocketCompleteUpgrade(request, 0);
-            let _ = WinHttpCloseHandle(request);
+            // The socket takes over from the request: close the request, hand
+            // the parents to the socket, and the guard closes nothing left.
+            handles.close_request();
             if ws.is_null() {
-                let _ = WinHttpCloseHandle(connect);
-                let _ = WinHttpCloseHandle(session);
                 return Err("WebSocket upgrade failed".into());
             }
+            let (connect, session) = handles.take_parents();
 
             Ok(Box::new(WinHttpSocket {
                 ws,
