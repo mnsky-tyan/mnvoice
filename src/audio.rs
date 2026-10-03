@@ -14,7 +14,7 @@ use windows::Win32::System::Com::*;
 
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
-pub use crate::platform::audio::{wav_bytes, SAMPLE_RATE};
+pub use crate::platform::audio::SAMPLE_RATE;
 use crate::platform::audio::{resample_linear, SilenceWindows};
 
 struct CaptureRequest {

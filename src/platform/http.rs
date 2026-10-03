@@ -22,6 +22,16 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+impl Response {
+    /// The error for a status the caller does not accept: the code plus a
+    /// bounded preview of the body, so a provider's explanation survives
+    /// without a megabyte of HTML in the log.
+    pub fn error_for_status(&self, what: &str) -> String {
+        let preview: String = String::from_utf8_lossy(&self.body).chars().take(200).collect();
+        format!("{what} returned HTTP {}: {preview}", self.status)
+    }
+}
+
 /// A blocking WebSocket client for the streaming transcription path.
 ///
 /// Implementations MUST allow `read` on one thread to proceed while `send`
