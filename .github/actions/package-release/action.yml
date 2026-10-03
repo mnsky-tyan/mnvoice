@@ -80,7 +80,14 @@ runs:
         # Text mode on purpose: sha256sum -b would prefix the asset name with
         # the binary-mode marker "*", which breaks the two-space "<hash>  <name>"
         # contract the sidecar is supposed to keep. Hashes are identical.
-        sha256sum "$P_ASSET" > "$P_SIDECAR"
+        # sha256sum is the GNU spelling and shasum -a 256 the BSD one, and a
+        # non-Windows runner may only carry the latter, so both are accepted
+        # and the sidecar keeps the same two-space shape either way.
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum "$P_ASSET" > "$P_SIDECAR"
+        else
+          shasum -a 256 "$P_ASSET" > "$P_SIDECAR"
+        fi
         if [ -n "$P_ZIP" ]; then
           echo "a Unix zip asset is not implemented in this action" >&2
           exit 1

@@ -7,7 +7,7 @@
 
 use crate::config;
 use crate::platform::audio::SAMPLE_RATE;
-use crate::platform::{audio, input, unix_audio};
+use crate::platform::{audio, unix_audio};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};

@@ -187,7 +187,13 @@ pub fn main() {
         thread::sleep(std::time::Duration::from_millis(700));
     }
 
-    let _mutex = claim_single_instance();
+    // Single instance: a process that finds the name taken exits here, before it
+    // registers a window class, starts a capture engine or adds a tray icon.
+    // The handle is what keeps the name claimed, so it outlives main.
+    let _mutex = match claim_single_instance() {
+        InstanceClaim::AlreadyTaken => return,
+        InstanceClaim::Acquired(handle) => handle,
+    };
     let config = load_config_or_log();
     let (hk_mod, hk_vk, hk_str) = hotkey_of(&config);
     let cancel_str = config
@@ -272,17 +278,28 @@ fn finish_pending_install(args: &[String]) -> bool {
     false
 }
 
+/// What claiming the single-instance name came to.
+///
+/// `Acquired` carries the handle, which the caller must keep alive for the
+/// process's whole life: dropping it closes the handle, the OS releases the
+/// name, and the guard stops guarding. `AlreadyTaken` is the one outcome the
+/// caller must not start on.
+enum InstanceClaim {
+    Acquired(Option<HANDLE>),
+    AlreadyTaken,
+}
+
 /// Advertise single-instance the Win32 way: a named mutex held for the
 /// process's whole life (the OS releases it at exit; there is no closer to
-/// call). Returns the raw handle to keep alive, or None when another
-/// instance already owns the name.
-fn claim_single_instance() -> Option<HANDLE> {
+/// call). Another instance owning the name is reported as `AlreadyTaken`,
+/// which is the signal for this process to exit before it starts anything.
+fn claim_single_instance() -> InstanceClaim {
     let handle = unsafe { CreateMutexW(None, true, MUTEX_NAME) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log("second instance blocked, exiting");
-        return None;
+        return InstanceClaim::AlreadyTaken;
     }
-    handle.ok()
+    InstanceClaim::Acquired(handle.ok())
 }
 
 /// Config or a logged reason. A broken config still starts the app: without

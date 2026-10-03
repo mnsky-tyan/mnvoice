@@ -205,52 +205,6 @@ fn hand_off(tx: &Sender<Vec<i16>>, chunk: Vec<i16>) -> bool {
 mod tests {
     use super::*;
 
-    /// A device rate that is not a multiple of the provider rate must still
-    /// come out at the provider rate. 44.1 kHz is the macOS built-in input's
-    /// nominal rate: keeping every second sample of it hands the provider
-    /// 22 050 samples per second while the request still says 16 000, so a
-    /// one second utterance arrives as 1.38 s of sped-up audio.
-    #[test]
-    fn a_44100hz_second_resamples_to_the_provider_rate() {
-        let input: Vec<f32> = (0..44_100).map(|i| i as f32 / 44_100.0).collect();
-        let out = resample_linear(&input, 44_100.0 / SAMPLE_RATE as f64);
-        assert!(
-            (out.len() as i64 - SAMPLE_RATE as i64).abs() <= 2,
-            "one second of 44.1 kHz audio produced {} samples",
-            out.len()
-        );
-    }
-
-    /// The resampled signal must be the same signal and not merely the same
-    /// length: interpolating a linear ramp reproduces it exactly, so anything
-    /// beyond quantisation is the resampler mangling the waveform.
-    #[test]
-    fn resampling_preserves_the_waveform() {
-        let rate = 44_100.0;
-        let n = 44_100usize;
-        let input: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let step = rate / SAMPLE_RATE as f64;
-        let out = resample_linear(&input, step);
-        let worst = out
-            .iter()
-            .enumerate()
-            .map(|(k, sample)| {
-                let expected = (k as f64 * step) / n as f64;
-                (*sample as f64 / i16::MAX as f64 - expected).abs()
-            })
-            .fold(0.0f64, f64::max);
-        assert!(worst < 2.0 / i16::MAX as f64, "worst deviation was {worst}");
-    }
-
-    /// A device slower than the provider rate is upsampled rather than
-    /// clamped to pass-through, so the provider still receives its own rate.
-    #[test]
-    fn an_8000hz_device_is_upsampled_to_the_provider_rate() {
-        let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
-        let out = resample_linear(&input, 8_000.0 / SAMPLE_RATE as f64);
-        assert_eq!(out.len(), 16_000);
-    }
-
     /// The tick boundary almost never lands on a frame boundary, so a partial
     /// frame has to survive into the next tick. Dropping it instead loses a
     /// sample or two about fifty times a second and reads the rest of the

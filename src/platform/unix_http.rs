@@ -391,15 +391,15 @@ impl WebSocket for UnixSocket {
     }
 }
 
-// A note on `read`'s ignored timeout, matching the Windows backend's stated
-// behaviour: the streaming loop is built around a blocking read - the reader
-// thread simply waits until the provider sends the next final or closes, and
-// cancellation unblocks it because the writer side closes the socket. The
-// trait has no spelling for "nothing arrived this tick": `None` and `Err` are
-// both read by the loop as the end of the stream, so honouring the deadline
-// here would cut off the last words of a dictation. The socket's short read
-// timeout therefore bounds only how long the mutex can be held, which is what
-// keeps a send on the main thread moving while the provider is quiet.
+// A note on `read`: matching the Windows backend's stated behaviour, this is
+// a blocking read - the reader thread waits until the provider sends the next
+// final or closes, and cancellation unblocks it because the writer side
+// closes the socket. The trait has no spelling for "nothing arrived this
+// tick": `None` and `Err` are both read by the loop as the end of the stream,
+// so returning on a quiet poll instead would cut off the last words of a
+// dictation. The socket's short read timeout therefore bounds only how long
+// the mutex can be held, which is what keeps a send on the main thread moving
+// while the provider is quiet.
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {

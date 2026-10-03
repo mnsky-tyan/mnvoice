@@ -191,9 +191,9 @@ jobs:
         # Intel-armed image switching under us must not silently change it.
         run: cargo build --release --locked --target aarch64-apple-darwin
 
-      # shasum -a 256 already prints "<hash>  <name>" with two spaces, the
-      # exact format the updater parses; the shared package action keeps that
-      # format for every platform (see the Linux job for the naming note).
+      # The shared package action prints "<hash>  <name>" with two spaces, the
+      # exact format the updater parses, using whichever sha256 spelling this
+      # runner carries (see the Linux job for the naming note).
       - name: Package artifact
         uses: ./.github/actions/package-release
         with:
