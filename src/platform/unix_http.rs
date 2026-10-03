@@ -345,8 +345,7 @@ impl WebSocket for UnixSocket {
         let _ = self.shutdown.shutdown(Shutdown::Both);
     }
 
-    fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
-        let _ = timeout_ms; // see the note below
+    fn read(&self) -> Result<Option<Vec<u8>>, String> {
         loop {
             let mut ws = self
                 .socket

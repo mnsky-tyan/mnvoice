@@ -14,8 +14,8 @@ use windows::Win32::System::Com::*;
 
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
-pub use crate::platform::audio::{wav_bytes, NO_SPEECH_LIMIT_MS, SAMPLE_RATE};
-pub const WM_APP_RECORDING_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
+pub use crate::platform::audio::SAMPLE_RATE;
+use crate::platform::audio::{resample_linear, SilenceWindows};
 
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
@@ -232,51 +232,6 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     Ok(())
 }
 
-/// The two silence windows that end a dictation.
-///
-/// Both advance by the audio each chunk carries, which is what keeps them
-/// honest when the capture loop is descheduled and a single chunk covers more
-/// than the usual 40 ms: the window still counts that time. The Unix engine
-/// keeps the same contract in `platform::unix_audio`.
-struct SilenceWindows {
-    /// Quiet since the last voice, once there has been any.
-    since_voice_ms: u64,
-    /// Quiet since the session opened.
-    no_speech_ms: u64,
-    heard_voice: bool,
-}
-
-impl SilenceWindows {
-    fn new() -> Self {
-        Self {
-            since_voice_ms: 0,
-            no_speech_ms: 0,
-            heard_voice: false,
-        }
-    }
-
-    /// Feeds one chunk's audio, reporting whether the session should end.
-    fn advance(&mut self, samples: usize, rms: f64, threshold: f64, vad_silence_ms: u32) -> bool {
-        if rms > threshold {
-            self.heard_voice = true;
-            self.since_voice_ms = 0;
-            false
-        } else if self.heard_voice {
-            // Silence only ends a dictation once there has been speech, which
-            // is what VAD_SILENCE_MS documents; waiting that long before the
-            // first word would stop a session the user is still thinking in.
-            self.since_voice_ms += crate::platform::audio::audio_ms(samples);
-            self.since_voice_ms >= u64::from(vad_silence_ms)
-        } else {
-            // Nothing said at all: the same no-speech cutoff the Unix engine
-            // uses, so a forgotten open mic cannot hold the device for
-            // max_seconds.
-            self.no_speech_ms += crate::platform::audio::audio_ms(samples);
-            self.no_speech_ms >= NO_SPEECH_LIMIT_MS
-        }
-    }
-}
-
 fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
     let channels = format.nChannels as usize;
     let rate = format.nSamplesPerSec as usize;
@@ -313,97 +268,6 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
     }
 
     let step = rate as f64 / SAMPLE_RATE as f64;
-    let mut out = Vec::with_capacity((mono.len() as f64 / step) as usize + 1);
-    let mut pos = 0f64;
-    while (pos as usize) < mono.len() {
-        let i = pos as usize;
-        let frac = (pos - i as f64) as f32;
-        let a = mono[i];
-        let b = if i + 1 < mono.len() { mono[i + 1] } else { a };
-        let v = (a + (b - a) * frac).clamp(-1.0, 1.0);
-        out.push((v * 32767.0) as i16);
-        pos += step;
-    }
-    Ok(out)
+    Ok(resample_linear(&mono, step))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The windows advance by the audio each chunk carries, not by a literal
-    /// 40 ms per tick: a chunk that ran long still counts the time it covered,
-    /// so a stalled loop ends on the configured silence instead of holding the
-    /// microphone until max_seconds.
-    #[test]
-    fn the_silence_window_counts_the_audio_the_chunk_carries() {
-        let mut silence = SilenceWindows::new();
-        // Voice first, so the since-voice window is the one in play.
-        assert!(!silence.advance(640, 1.0, 0.01, 3_000), "voice is not silence");
-        // A chunk twice the usual size counts twice the time: 80 ms each, so
-        // the three-second threshold takes 38 of them, not the 75 a fixed
-        // 40 ms tick would need.
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            if silence.advance(1_280, 0.0, 0.01, 3_000) {
-                break;
-            }
-            assert!(ticks < 100, "three seconds of silence never ended the session");
-        }
-        assert_eq!(ticks, 38, "3000 ms of 80 ms chunks");
-    }
-
-    /// The ordinary 40 ms chunk still ends on the configured silence, so the
-    /// audio-time accounting did not change the normal case.
-    #[test]
-    fn a_640_sample_chunk_advances_forty_milliseconds() {
-        let mut silence = SilenceWindows::new();
-        assert!(!silence.advance(640, 1.0, 0.01, 3_000));
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            if silence.advance(640, 0.0, 0.01, 3_000) {
-                break;
-            }
-            assert!(ticks < 1_000);
-        }
-        assert_eq!(ticks, 75, "3000 ms of 40 ms silence");
-    }
-
-    /// Nothing said at all ends the session after the shared no-speech limit,
-    /// counted in audio time the same way.
-    #[test]
-    fn ten_seconds_of_no_speech_ends_the_session() {
-        let mut silence = SilenceWindows::new();
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            if silence.advance(640, 0.0, 0.01, 3_000) {
-                break;
-            }
-            assert!(ticks < 2_000);
-        }
-        assert_eq!(ticks, 250, "10 000 ms of 40 ms silence");
-    }
-
-    /// A voice chunk restarts the since-voice window, so a pause that never
-    /// reached the threshold is not carried into the next one.
-    #[test]
-    fn voice_resets_the_silence_window() {
-        let mut silence = SilenceWindows::new();
-        assert!(!silence.advance(640, 1.0, 0.01, 3_000), "voice is not silence");
-        // Two quiet chunks that never reach the threshold.
-        assert!(!silence.advance(640, 0.0, 0.01, 3_000));
-        assert!(!silence.advance(640, 0.0, 0.01, 3_000));
-        // Voice again: the window restarts, so 75 fresh quiet chunks end the
-        // dictation, not the 73 the carried-over 80 ms would leave.
-        assert!(!silence.advance(640, 1.0, 0.01, 3_000));
-        let mut quiet = 0;
-        while !silence.advance(640, 0.0, 0.01, 3_000) {
-            quiet += 1;
-            assert!(quiet < 1_000);
-        }
-        assert_eq!(quiet + 1, 75, "the window restarted at the last voice");
-    }
-}

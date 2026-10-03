@@ -1,7 +1,7 @@
 # mnvoice
 
 Ultra-low-latency, hands-free push-to-talk dictation.  
-Press a hotkey (or a key on Linux and macOS), speak naturally - words type directly into whatever window you are using, in real time, with zero clipboard interference.
+Press a hotkey to start and stop (Enter on Linux and macOS), speak naturally - words type directly into whatever window you are using, in real time, with zero clipboard interference.
 
 Windows is the flagship: built in native Rust using pure Win32, WASAPI, and WinHTTP, with the tray, the orb and self-update. Linux and macOS run the same engine - same capture path, same streaming protocol, same word-typing - driven from a terminal instead of the tray. No Electron, no Python, no async runtimes.
 
@@ -206,7 +206,7 @@ ORB_COLOR=hot_pink
 ORB_COLOR=#A855F7
 ```
 
-Built-in presets: `hot_pink` (default), `cyan`, `purple`, `blue`, `emerald`, `amber`, `red`, `white`
+Built-in presets: `hot_pink` (default), `cyan`, `purple`, `blue`, `emerald`, `amber`, `red`, `white` - each also answers to a synonym (`teal`, `violet`, `sapphire`, `green`, `orange`, `gold`, `ruby`, `magenta`, `pink`, `silver`), and hex works with or without the `#`
 
 ### Fluid Level
 
@@ -239,7 +239,7 @@ BASE_URL=wss://stt.internal.company.com:8443/listen
 
 ### Custom Vocabulary
 
-Create `keywords.txt` beside `mnvoice.exe` (auto-loaded), or use the env var:
+Create `keywords.txt` beside `mnvoice.exe` (auto-loaded), or use the env var. The older spellings `vocabulary.txt` and `words.txt` are loaded the same way when present:
 
 ```ini
 KEYWORDS=Kubernetes, TypeScript, PostgreSQL, herdr, mnvoice
@@ -266,7 +266,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `VAD_SILENCE_MS` | `3000` | Silence after speech that stops recording. Raise if it cuts you off. |
 | `VAD_RMS_THRESHOLD` | `400` | Mic energy counted as speech, `0`-`32767`. Raise if noise keeps it listening. |
 | `MAX_SECONDS` | `120` | Hard recording limit before forced stop |
-| `TRAILING_SPACE` | `1` | Appends a space after each dictation (`0` to disable) |
+| `TRAILING_SPACE` | `1` | Appends a space after each dictation. Only the exact value `0` disables it - any other spelling (`false`, `no`, a typo) leaves it enabled, because the default is on and an unrecognized value must not be able to silently disable it |
 | `ORB_COLOR` | `hot_pink` | Orb fluid color: preset name or `#RRGGBB` |
 | `ORB_FLUID_LEVEL` | `0.75` | Orb fill `0.0`-`1.0`, or `0%`-`100%` |
 
@@ -278,7 +278,8 @@ Each key also answers to its vendor aliases: `DEEPGRAM_API_KEY` /
 `DEEPGRAM_BASE_URL`, `GROQ_BASE_URL`) work everywhere, and the shorter
 synonyms `MODE`/`PROVIDER` for `PROTOCOL`, `ENDPOINT` for `BASE_URL`,
 `KEYTERMS`/`CUSTOM_WORDS`/`VOCABULARY` for `KEYWORDS`, `ORB_HEX` for
-`ORB_COLOR`, `ORB_FLUID_AMOUNT` for `ORB_FLUID_LEVEL`,
+`ORB_COLOR`, `ORB_FLUID_AMOUNT` and `FLUID_LEVEL` for `ORB_FLUID_LEVEL`,
+`COLOR` for `ORB_COLOR`,
 `TRIGGER_HOTKEY`/`KEYBIND` for `HOTKEY`, `CANCEL_HOTKEY` for `CANCEL_KEY`,
 `SILENCE_MS` for `VAD_SILENCE_MS`, and `RMS_THRESHOLD` for
 `VAD_RMS_THRESHOLD`. For `API_KEY`, `MODEL`, `LANGUAGE` and `BASE_URL` a
@@ -296,8 +297,6 @@ when one file mixes a key with its alias, write the spelling you want last.
 | REST (Groq, OpenAI, self-hosted Whisper) | no such parameter exists anywhere, so mnvoice filters the returned text locally |
 
 Deepgram is the **recommended** provider rather than a requirement - the REST path works fully, just with the small quality difference above.
-
-Provider-named aliases (`DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `DEEPGRAM_MODEL`, and so on) are also accepted for convenience.
 
 ---
 

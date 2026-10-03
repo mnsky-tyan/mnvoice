@@ -18,6 +18,13 @@ use crate::platform::audio::SAMPLE_RATE;
 use crate::platform::http::{NativeTransport, Transport, WebSocket};
 use crate::platform::input;
 
+/// Little-endian PCM bytes for a chunk of i16 samples, the wire format the
+/// streaming endpoint expects (see `platform::audio::wav_bytes` for the same
+/// encoding in a WAV container).
+fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
 pub fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -185,10 +192,10 @@ pub fn run_stream(
             if cancelled_clone.load(Ordering::SeqCst) {
                 break;
             }
-            // On Windows the read blocks until a frame or close arrives, which
-            // is exactly the pre-seam behaviour; the timeout only matters on
-            // backends that can poll, where it keeps cancel responsive.
-            let frame = match ws_reader.read(1000) {
+            // Both backends time out their reads, so the loop re-checks the
+            // cancel flag before every call rather than parking until the
+            // provider speaks.
+            let frame = match ws_reader.read() {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
                 Err(_) => break,
@@ -250,13 +257,7 @@ pub fn run_stream(
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(packet_i16) => {
-                let slice_u8 = unsafe {
-                    std::slice::from_raw_parts(
-                        packet_i16.as_ptr() as *const u8,
-                        packet_i16.len() * 2,
-                    )
-                };
-                if ws.send_binary(slice_u8).is_err() {
+                if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
                     break;
                 }
             }
@@ -271,10 +272,7 @@ pub fn run_stream(
 
     // Drain all remaining audio packets accumulated in rx before closing
     while let Ok(packet_i16) = rx.try_recv() {
-        let slice_u8 = unsafe {
-            std::slice::from_raw_parts(packet_i16.as_ptr() as *const u8, packet_i16.len() * 2)
-        };
-        let _ = ws.send_binary(slice_u8);
+        let _ = ws.send_binary(&pcm_bytes(&packet_i16));
     }
 
     // Signal close to Deepgram

@@ -25,6 +25,14 @@ pub trait Injector: Send + Sync {
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
+
+/// The gap between synthesized keystrokes.
+///
+/// Shared by every backend: apps that buffer input (browsers, terminals)
+/// auto-repeat or drop events when a large batch lands at once, so each
+/// character is followed by this small sleep before the next.
+pub const KEY_GAP: Duration = Duration::from_millis(2);
 
 static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
 static FAILING: AtomicBool = AtomicBool::new(false);
@@ -34,7 +42,7 @@ static FAILING: AtomicBool = AtomicBool::new(false);
 /// Shared code (the streaming loop) types through this rather than naming a
 /// backend, which is what lets the same streaming loop type on Windows, X11
 /// and macOS without a single cfg in its body.
-pub fn global() -> &'static dyn Injector {
+fn global() -> &'static dyn Injector {
     *INJECTOR.get_or_init(|| {
         #[cfg(windows)]
         {

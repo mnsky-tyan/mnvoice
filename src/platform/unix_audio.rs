@@ -21,7 +21,10 @@
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
-use crate::platform::audio::{audio_ms, Audio, NO_SPEECH_LIMIT_MS, SAMPLE_RATE};
+use crate::platform::audio::{
+    audio_ms, resample_linear, silence_expired, Audio, SilenceWindows, NO_SPEECH_LIMIT_MS,
+    SAMPLE_RATE,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -253,25 +256,6 @@ fn hand_off(tx: &Sender<Vec<i16>>, chunk: Vec<i16>) -> bool {
     tx.send(chunk).is_ok()
 }
 
-/// Resamples mono audio to the provider rate by linear interpolation, the same
-/// conversion the Windows engine applies to the device's mix format. The step
-/// is fractional so a device rate that is not a multiple of the provider rate
-/// still comes out at exactly the provider rate.
-fn resample(mono: &[f32], step: f64) -> Vec<i16> {
-    let mut out = Vec::with_capacity((mono.len() as f64 / step) as usize + 1);
-    let mut pos = 0f64;
-    while (pos as usize) < mono.len() {
-        let i = pos as usize;
-        let frac = (pos - i as f64) as f32;
-        let a = mono[i];
-        let b = if i + 1 < mono.len() { mono[i + 1] } else { a };
-        let v = (a + (b - a) * frac).clamp(-1.0, 1.0);
-        out.push((v * i16::MAX as f32) as i16);
-        pos += step;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,7 +268,7 @@ mod tests {
     #[test]
     fn a_44100hz_second_resamples_to_the_provider_rate() {
         let input: Vec<f32> = (0..44_100).map(|i| i as f32 / 44_100.0).collect();
-        let out = resample(&input, 44_100.0 / SAMPLE_RATE as f64);
+        let out = resample_linear(&input, 44_100.0 / SAMPLE_RATE as f64);
         assert!(
             (out.len() as i64 - SAMPLE_RATE as i64).abs() <= 2,
             "one second of 44.1 kHz audio produced {} samples",
@@ -301,7 +285,7 @@ mod tests {
         let n = 44_100usize;
         let input: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let step = rate / SAMPLE_RATE as f64;
-        let out = resample(&input, step);
+        let out = resample_linear(&input, step);
         let worst = out
             .iter()
             .enumerate()
@@ -318,7 +302,7 @@ mod tests {
     #[test]
     fn an_8000hz_device_is_upsampled_to_the_provider_rate() {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
-        let out = resample(&input, 8_000.0 / SAMPLE_RATE as f64);
+        let out = resample_linear(&input, 8_000.0 / SAMPLE_RATE as f64);
         assert_eq!(out.len(), 16_000);
     }
 
@@ -342,69 +326,6 @@ mod tests {
         );
     }
 
-    /// A tick that consumed a second of device audio has to count a second
-    /// of silence, the way the Windows engine counts 40 ms per 640-sample
-    /// chunk. Counting the tick instead reaches the configured silence only
-    /// after fifty such ticks, and in the meantime nothing ends the dictation
-    /// but MAX_SECONDS.
-    #[test]
-    fn a_stalled_tick_still_counts_the_audio_it_covered() {
-        let mut silence = SilenceWindows::new();
-        // Voice first, so the since-voice window is the one in play.
-        assert!(
-            !silence.advance(16_000, 1.0, 0.01, 3_000),
-            "voice is not silence"
-        );
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            if silence.advance(16_000, 0.0, 0.01, 3_000) {
-                break;
-            }
-            assert!(
-                ticks < 100,
-                "three seconds of silence never ended the session"
-            );
-        }
-        assert_eq!(
-            ticks, 3,
-            "one second of audio per tick is one second of silence"
-        );
-    }
-
-    /// The ordinary 20 ms tick still ends on the configured silence, so the
-    /// audio-time accounting did not change the normal case.
-    #[test]
-    fn a_normal_twenty_millisecond_tick_advances_twenty_milliseconds() {
-        let mut silence = SilenceWindows::new();
-        assert!(!silence.advance(320, 1.0, 0.01, 3_000));
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            if silence.advance(320, 0.0, 0.01, 3_000) {
-                break;
-            }
-            assert!(ticks < 1_000);
-        }
-        assert_eq!(ticks, 150, "3000 ms of 20 ms silence");
-    }
-
-    /// Nothing said at all: the same ten-second cutoff Windows uses, also
-    /// counted in audio time.
-    #[test]
-    fn ten_seconds_of_no_speech_ends_the_session() {
-        let mut silence = SilenceWindows::new();
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            if silence.advance(320, 0.0, 0.01, 3_000) {
-                break;
-            }
-            assert!(ticks < 2_000);
-        }
-        assert_eq!(ticks, 500, "10 000 ms of 20 ms silence");
-    }
-
     /// A streaming loop that stopped reading has already finished, so the
     /// capture has to end with it. Discarding the send result instead leaves
     /// the microphone open: the CLI keeps printing "recording..." until the
@@ -422,23 +343,5 @@ mod tests {
             !hand_off(&tx, vec![0i16; 320]),
             "a consumer that stopped reading must end the session"
         );
-    }
-
-    /// The configured value is the threshold itself, the way the Windows
-    /// engine reads it: `VAD_SILENCE_MS=0` ends the dictation on the first
-    /// silent tick. A guard that treated zero as "detector off" left the
-    /// recording running to MAX_SECONDS while the banner still promised that
-    /// the configured silence would stop it.
-    #[test]
-    fn a_zero_silence_threshold_still_ends_the_dictation() {
-        assert!(
-            silence_expired(20, 0),
-            "one silent tick must stop a dictation configured for 0 ms"
-        );
-        assert!(
-            !silence_expired(20, 3_000),
-            "the default threshold needs three seconds of quiet"
-        );
-        assert!(silence_expired(3_000, 3_000));
     }
 }

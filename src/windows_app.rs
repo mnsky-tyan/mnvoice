@@ -7,7 +7,6 @@ use crate::audio;
 use crate::config;
 use crate::orb;
 use crate::platform;
-use crate::platform::input;
 use crate::platform::windows_impl::wide;
 use crate::rest;
 use crate::stream;
@@ -30,7 +29,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
-    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -172,17 +171,13 @@ fn kill_running_instances() {
     log(&format!("restart: terminated other {name} instances"));
 }
 
+/// Where the process starts, one step per line: finish a pending update
+/// install, heal a restart, claim the single-instance mutex, load config,
+/// then build the window, tray and hotkey and run the message loop. Each
+/// step is a named helper below.
 pub fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(pos) = args.iter().position(|a| a == update::FINISH_UPDATE_ARG) {
-        // A second, short-lived copy of this exe finishes an install the first one
-        // could not. It waits for that process to be gone, and only then, and only
-        // when the swap left the exe path empty, does it move the staged image in.
-        // Started before the single-instance mutex is taken, which the app itself
-        // is holding for as long as it is the one installing. It runs from a copy
-        // of this exe under an image name of its own, so the install it has to
-        // repair comes in after the flag on the command line.
-        update::finish_install(args.get(pos + 1).map(std::path::Path::new));
+    if finish_pending_install(&args) {
         return;
     }
     if args.iter().any(|a| a == "--restart") {
@@ -192,32 +187,9 @@ pub fn main() {
         thread::sleep(std::time::Duration::from_millis(700));
     }
 
-    let _mutex = unsafe { CreateMutexW(None, true, MUTEX_NAME) }.ok();
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        log("second instance blocked, exiting");
-        return;
-    }
-
-    let config = match config::load() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            log(&format!("config error: {e}"));
-            // Still worth knowing whether updates are armed, because that is
-            // decided from AUTO_UPDATE alone and a broken API key does not
-            // revoke it. Otherwise the app runs but never updates itself and
-            // nothing above this line says which way it went.
-            log(&format!(
-                "auto-update is {}",
-                if config::auto_update_enabled() { "armed" } else { "off" }
-            ));
-            None
-        }
-    };
-    let kw_count = config.as_ref().map(|c| c.keywords.len()).unwrap_or(0);
-    let (hk_mod, hk_vk, hk_str) = config
-        .as_ref()
-        .map(|c| (c.hotkey.0, c.hotkey.1, c.hotkey_str.clone()))
-        .unwrap_or((MOD_ALT.0 | MOD_NOREPEAT.0, 0x20, "Alt+Space".to_string()));
+    let _mutex = claim_single_instance();
+    let config = load_config_or_log();
+    let (hk_mod, hk_vk, hk_str) = hotkey_of(&config);
     let cancel_str = config
         .as_ref()
         .map(|c| c.cancel_key_str.clone())
@@ -231,24 +203,14 @@ pub fn main() {
         config.as_ref().map(|c| c.model.as_str()).unwrap_or("none"),
         hk_str,
         cancel_str,
-        kw_count
+        config.as_ref().map(|c| c.keywords.len()).unwrap_or(0)
     ));
 
     unsafe {
         let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
-        let icon = app_icon();
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinstance,
-            lpszClassName: CLASS_NAME,
-            hIcon: icon,
-            ..Default::default()
-        };
-        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS.into() {
-            log("RegisterClassW failed");
+        if !register_window_class(hinstance) {
             return;
         }
-
         let audio_engine = audio::AudioEngine::start();
         // Best-effort housekeeping: reap what an update that never swapped in
         // left behind (the staged download and helper copies - the swap-aside
@@ -269,54 +231,11 @@ pub fn main() {
         // thread: it only decides whether the NEXT logon starts the app,
         // so the window, the hotkey and the tray never wait on its spawns.
         thread::spawn(migrate_autostart);
-        let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
-        let hwnd = match CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            CLASS_NAME,
-            WINDOW_NAME,
-            WINDOW_STYLE::default(),
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            hinstance,
-            Some(init as *const std::ffi::c_void),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                log(&format!("CreateWindowExW failed: {e}"));
-                return;
-            }
+
+        let Some(hwnd) = create_tray_window(hinstance, config, audio_engine) else {
+            return;
         };
-
-        // Register the global hotkey. If another process (or a stale registration
-        // from a previously killed instance) still owns it, retry for a few seconds
-        // before giving up, then surface a visible tray warning instead of silently
-        // running with a dead hotkey.
-        let mut hotkey_ok = false;
-        for attempt in 0..10 {
-            match RegisterHotKey(hwnd, HOTKEY_TOGGLE, HOT_KEY_MODIFIERS(hk_mod), hk_vk) {
-                Ok(()) => {
-                    hotkey_ok = true;
-                    if attempt > 0 {
-                        log(&format!("RegisterHotKey({hk_str}) succeeded on attempt {}", attempt + 1));
-                    }
-                    break;
-                }
-                Err(e) => {
-                    if attempt == 9 {
-                        log(&format!(
-                            "RegisterHotKey({hk_str}) FAILED after retries: {e} - another app or a stale mnvoice instance is holding this hotkey"
-                        ));
-                    } else {
-                        thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                }
-            }
-        }
-
+        let hotkey_ok = register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str);
         if hotkey_ok {
             add_tray(hwnd, &format!("mnvoice - idle ({hk_str})"));
         } else {
@@ -333,6 +252,150 @@ pub fn main() {
             balloon("mnvoice updated", &format!("now running v{version}"));
         }
 
+        run_message_loop();
+    }
+}
+
+/// A second, short-lived copy of this exe finishes an install the first one
+/// could not. It waits for that process to be gone, and only then, and only
+/// when the swap left the exe path empty, does it move the staged image in.
+/// Started before the single-instance mutex is taken, which the app itself
+/// is holding for as long as it is the one installing. It runs from a copy
+/// of this exe under an image name of its own, so the install it has to
+/// repair comes in after the flag on the command line. Returns whether this
+/// process was that finisher.
+fn finish_pending_install(args: &[String]) -> bool {
+    if let Some(pos) = args.iter().position(|a| a == update::FINISH_UPDATE_ARG) {
+        update::finish_install(args.get(pos + 1).map(std::path::Path::new));
+        return true;
+    }
+    false
+}
+
+/// Advertise single-instance the Win32 way: a named mutex held for the
+/// process's whole life (the OS releases it at exit; there is no closer to
+/// call). Returns the raw handle to keep alive, or None when another
+/// instance already owns the name.
+fn claim_single_instance() -> Option<HANDLE> {
+    let handle = unsafe { CreateMutexW(None, true, MUTEX_NAME) };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        log("second instance blocked, exiting");
+        return None;
+    }
+    handle.ok()
+}
+
+/// Config or a logged reason. A broken config still starts the app: without
+/// it there would be no tray menu to fix the file from.
+fn load_config_or_log() -> Option<config::Config> {
+    match config::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            log(&format!("config error: {e}"));
+            // Still worth knowing whether updates are armed, because that is
+            // decided from AUTO_UPDATE alone and a broken API key does not
+            // revoke it. Otherwise the app runs but never updates itself and
+            // nothing above this line says which way it went.
+            log(&format!(
+                "auto-update is {}",
+                if config::auto_update_enabled() { "armed" } else { "off" }
+            ));
+            None
+        }
+    }
+}
+
+/// The hotkey pair and its display spelling, or the defaults when the
+/// config did not load.
+fn hotkey_of(config: &Option<config::Config>) -> (HOT_KEY_MODIFIERS, u32, String) {
+    config
+        .as_ref()
+        .map(|c| (HOT_KEY_MODIFIERS(c.hotkey.0), c.hotkey.1, c.hotkey_str.clone()))
+        .unwrap_or((MOD_ALT | MOD_NOREPEAT, 0x20, "Alt+Space".to_string()))
+}
+
+/// Registers the window class once per process. A second registration is
+/// not an error (the class survives between instances on some Windows
+/// builds), anything else is.
+fn register_window_class(hinstance: HINSTANCE) -> bool {
+    unsafe {
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinstance,
+            lpszClassName: CLASS_NAME,
+            hIcon: app_icon(),
+            ..Default::default()
+        };
+        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS.into() {
+            log("RegisterClassW failed");
+            return false;
+        }
+    }
+    true
+}
+
+/// The hidden message window the tray, the hotkey and the worker all hang
+/// off. `None` means the app cannot start.
+fn create_tray_window(
+    hinstance: HINSTANCE,
+    config: Option<config::Config>,
+    audio_engine: audio::AudioEngine,
+) -> Option<HWND> {
+    unsafe {
+        let init = Box::into_raw(Box::new(AppInit { config, instance: hinstance, audio_engine }));
+        match CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            CLASS_NAME,
+            WINDOW_NAME,
+            WINDOW_STYLE::default(),
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            hinstance,
+            Some(init as *const std::ffi::c_void),
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log(&format!("CreateWindowExW failed: {e}"));
+                None
+            }
+        }
+    }
+}
+
+/// Register the global hotkey. If another process (or a stale registration
+/// from a previously killed instance) still owns it, retry for a few seconds
+/// before giving up, then let the caller surface a visible tray warning
+/// instead of silently running with a dead hotkey.
+fn register_hotkey_with_retry(hwnd: HWND, hk_mod: HOT_KEY_MODIFIERS, hk_vk: u32, hk_str: &str) -> bool {
+    for attempt in 0..10 {
+        match unsafe { RegisterHotKey(hwnd, HOTKEY_TOGGLE, hk_mod, hk_vk) } {
+            Ok(()) => {
+                if attempt > 0 {
+                    log(&format!("RegisterHotKey({hk_str}) succeeded on attempt {}", attempt + 1));
+                }
+                return true;
+            }
+            Err(e) => {
+                if attempt == 9 {
+                    log(&format!(
+                        "RegisterHotKey({hk_str}) FAILED after retries: {e} - another app or a stale mnvoice instance is holding this hotkey"
+                    ));
+                } else {
+                    thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Pump messages until quit. Everything user-visible routes through here.
+fn run_message_loop() {
+    unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -352,19 +415,10 @@ fn app_ref(hwnd: HWND) -> &'static mut App {
 }
 
 unsafe fn add_tray(hwnd: HWND, tip: &str) {
-    let mut nid = NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
-        uID: 1,
-        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID,
-        uCallbackMessage: WM_APP_TRAY,
-        hIcon: unsafe { app_icon() },
-        guidItem: TRAY_GUID,
-        ..Default::default()
-    };
-    let tip_w = wide(tip);
-    let n = tip_w.len().min(nid.szTip.len());
-    nid.szTip[..n].copy_from_slice(&tip_w[..n]);
+    let mut nid = tray_nid(hwnd, NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID);
+    nid.uCallbackMessage = WM_APP_TRAY;
+    nid.hIcon = unsafe { app_icon() };
+    fill_wide(&mut nid.szTip, tip);
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
@@ -375,18 +429,32 @@ fn idle_tip(hotkey: Option<&str>) -> String {
 }
 
 unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
-    let mut nid = NOTIFYICONDATAW {
+    let mut nid = tray_nid(hwnd, NIF_TIP | NIF_GUID);
+    fill_wide(&mut nid.szTip, tip);
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+/// The tray icon's identity, shared by every `Shell_NotifyIconW` call: the
+/// window, the id and the GUID are what make four different calls address
+/// the same icon.
+fn tray_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
-        uFlags: NIF_TIP | NIF_GUID,
+        uFlags: flags,
         guidItem: TRAY_GUID,
         ..Default::default()
-    };
-    let tip_w = wide(tip);
-    let n = tip_w.len().min(nid.szTip.len());
-    nid.szTip[..n].copy_from_slice(&tip_w[..n]);
-    let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+/// Copies `text` into one of the fixed-size wide buffers the shell API
+/// expects, truncating at the buffer's edge - the shell reads it
+/// NUL-terminated, so clamping is the contract, not an afterthought.
+fn fill_wide(dst: &mut [u16], text: &str) {
+    let src = wide(text);
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -420,17 +488,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if let Some(orb) = &mut app.orb {
                         orb.tick();
                     }
-                }
-                LRESULT(0)
-            }
-            audio::WM_APP_RECORDING_READY => {
-                // Mic hardware is confirmed capturing. Show the orb now!
-                let app = app_ref(hwnd);
-                if app.state == State::Recording {
-                    if let Some(orb) = &mut app.orb {
-                        orb.show(orb::OrbState::Recording);
-                    }
-                    let _ = SetTimer(app.hwnd, TIMER_ORB, 33, None);
                 }
                 LRESULT(0)
             }
@@ -490,52 +547,48 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_COMMAND => {
                 let id = wparam.0 as usize;
-                if id == IDM_EXIT {
-                    let _ = Shell_NotifyIconW(
-                        NIM_DELETE,
-                        &NOTIFYICONDATAW {
-                            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                            hWnd: hwnd,
-                            uID: 1,
-                            guidItem: TRAY_GUID,
-                            ..Default::default()
-                        },
-                    );
-                    // Release the global hotkey so the next launch can claim it.
-                    // Without this, a killed or exited instance can leave Windows
-                    // still believing the hotkey is owned, breaking the next start.
-                    let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
-                    let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
-                    let app = app_ref(hwnd);
-                    set_state(app, State::Idle);
-                    PostQuitMessage(0);
-                } else if id == IDM_STOP {
-                    let app = app_ref(hwnd);
-                    if app.state == State::Recording {
-                        toggle(app);
+                match id {
+                    IDM_EXIT => {
+                        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_nid(hwnd, Default::default()));
+                        // Release the global hotkey so the next launch can claim it.
+                        // Without this, a killed or exited instance can leave Windows
+                        // still believing the hotkey is owned, breaking the next start.
+                        let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+                        let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
+                        let app = app_ref(hwnd);
+                        set_state(app, State::Idle);
+                        PostQuitMessage(0);
                     }
-                } else if id == IDM_STARTUP {
-                    // Toggle the logon task. The Run key is cleared as a side
-                    // effect, and the state is re-read on next open, so the
-                    // checkbox can never drift out of sync with reality.
-                    let enable = !autostart_enabled();
-                    if let Err(e) = set_autostart(enable) {
-                        log(&format!("autostart toggle failed: {e}"));
+                    IDM_STOP => {
+                        let app = app_ref(hwnd);
+                        if app.state == State::Recording {
+                            toggle(app);
+                        }
                     }
-                } else if id == IDM_RESTART {
-                    relaunch_for_restart();
-                } else if id == IDM_UPDATE {
-                    check_for_updates_async(false);
-                } else if id == IDM_OPEN_CONFIG {
-                    open_companion_file(
-                        "mnvoice.env",
-                        "# mnvoice - see mnvoice.env.example for every key\nPROTOCOL=streaming\nAPI_KEY=\n",
-                    );
-                } else if id == IDM_OPEN_KEYWORDS {
-                    open_companion_file(
-                        "keywords.txt",
-                        "# one word per line, or comma-separated\n",
-                    );
+                    IDM_STARTUP => {
+                        // Toggle the logon task. The Run key is cleared as a side
+                        // effect, and the state is re-read on next open, so the
+                        // checkbox can never drift out of sync with reality.
+                        let enable = !autostart_enabled();
+                        if let Err(e) = set_autostart(enable) {
+                            log(&format!("autostart toggle failed: {e}"));
+                        }
+                    }
+                    IDM_RESTART => relaunch_for_restart(),
+                    IDM_UPDATE => check_for_updates_async(false),
+                    IDM_OPEN_CONFIG => {
+                        open_companion_file(
+                            "mnvoice.env",
+                            "# mnvoice - see mnvoice.env.example for every key\nPROTOCOL=streaming\nAPI_KEY=\n",
+                        );
+                    }
+                    IDM_OPEN_KEYWORDS => {
+                        open_companion_file(
+                            "keywords.txt",
+                            "# one word per line, or comma-separated\n",
+                        );
+                    }
+                    _ => {}
                 }
                 LRESULT(0)
             }
@@ -679,23 +732,9 @@ fn worker(
             while let Ok(chunk) = rx.recv() {
                 samples.extend_from_slice(&chunk);
             }
-            let wav = audio::wav_bytes(&samples);
-            match rest::transcribe(&cfg, &wav) {
-                Ok(text) => {
-                    // No provider here exposes a native filler_words parameter, so
-                    // disfluencies are removed locally before anything is typed.
-                    let (text, trailing) =
-                        rest::rest_typing(&text, cfg.strip_fillers, cfg.trailing_space);
-                    if text.is_empty() {
-                        (false, "No speech detected".into())
-                    } else {
-                        input::type_text(&text);
-                        if trailing {
-                            input::type_text(" ");
-                        }
-                        (true, text)
-                    }
-                }
+            match rest::dictate_rest(&cfg, &samples) {
+                Ok(text) if text.is_empty() => (false, "No speech detected".into()),
+                Ok(text) => (true, text),
                 Err(e) => (false, e),
             }
         }
@@ -1190,20 +1229,9 @@ fn balloon(title: &str, body: &str) {
         let Ok(hwnd) = FindWindowW(w!("mnvoiceTrayClass"), w!("mnvoice")) else {
             return;
         };
-        let mut nid = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: 1,
-            uFlags: NIF_INFO | NIF_GUID,
-            guidItem: TRAY_GUID,
-            ..Default::default()
-        };
-        let t = wide(title);
-        let n = t.len().min(nid.szInfoTitle.len());
-        nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
-        let b = wide(body);
-        let n = b.len().min(nid.szInfo.len());
-        nid.szInfo[..n].copy_from_slice(&b[..n]);
+        let mut nid = tray_nid(hwnd, NIF_INFO | NIF_GUID);
+        fill_wide(&mut nid.szInfoTitle, title);
+        fill_wide(&mut nid.szInfo, body);
         nid.dwInfoFlags = NIIF_INFO;
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }

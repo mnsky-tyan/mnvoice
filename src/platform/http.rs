@@ -22,6 +22,16 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+impl Response {
+    /// The error for a status the caller does not accept: the code plus a
+    /// bounded preview of the body, so a provider's explanation survives
+    /// without a megabyte of HTML in the log.
+    pub fn error_for_status(&self, what: &str) -> String {
+        let preview: String = String::from_utf8_lossy(&self.body).chars().take(200).collect();
+        format!("{what} returned HTTP {}: {preview}", self.status)
+    }
+}
+
 /// A blocking WebSocket client for the streaming transcription path.
 ///
 /// Implementations MUST allow `read` on one thread to proceed while `send`
@@ -48,12 +58,15 @@ pub trait WebSocket: Send + Sync {
 
     /// Read the next frame, returning `None` on a clean close.
     ///
-    /// `timeout_ms` is what keeps the streaming loop responsive to the user
-    /// releasing the hotkey: a blocking read with no timeout would hold the
-    /// worker until the provider decided to speak, so the transcript would
-    /// arrive long after the user stopped talking. A backend that cannot vary
-    /// this per read should say so in its implementation.
-    fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String>;
+    /// Reads never block indefinitely - that is what keeps the streaming loop
+    /// responsive to the user releasing the hotkey: a blocking read with no
+    /// timeout would hold the worker until the provider decided to speak, so
+    /// the transcript would arrive long after the user stopped talking. The
+    /// Unix backend polls on a socket read timeout, the Windows backend times
+    /// out on the whole WinHTTP request; the loop re-checks its flags between
+    /// calls. A backend that cannot vary this per read should say so in its
+    /// implementation.
+    fn read(&self) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// The whole network surface, one implementation per platform.

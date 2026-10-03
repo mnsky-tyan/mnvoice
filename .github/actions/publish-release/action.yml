@@ -16,7 +16,9 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Publish Release
+    # One step on purpose: the publish and the verification must agree
+    # exactly on which names are expected, so the list is parsed once, here.
+    - name: Publish and verify release
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
@@ -36,20 +38,14 @@ runs:
         if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
         Write-Host "published $tag"
 
-    # Belt and braces: an empty or partial release must never ship unnoticed.
-    - name: Verify asset attached
-      shell: pwsh
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $tag = "${{ inputs.tag }}"
-        $files = @("${{ inputs.files }}" -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        # The REST endpoint is asked directly: gh's own release listing is
-        # cached and can still lag behind an upload that just succeeded, which
+        # Belt and braces: an empty or partial release must never ship unnoticed.
+        # The REST endpoint is asked directly because gh's own release listing
+        # is cached and can still lag behind an upload that just succeeded, which
         # would fail this step after a publish that actually worked.
-        # ${{ github.repository }} is owner/repo, the same slug update.rs
-        # bakes into the updater's URLs.
+        # ${{ github.repository }} is the owner/repo this release publishes
+        # under. update.rs hardcodes that slug as literals in its URLs, so the
+        # two are kept in step by hand: a fork must change BOTH for its own
+        # binaries to update from it.
         $json = curl -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" | Out-String
         if ($LASTEXITCODE -ne 0) { throw "could not read $tag from api.github.com (curl exit $LASTEXITCODE)" }
         $assets = @(($json | ConvertFrom-Json).assets.name)

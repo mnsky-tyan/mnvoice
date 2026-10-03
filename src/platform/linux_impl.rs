@@ -14,15 +14,8 @@ use crate::platform::input::Injector;
 use enigo::{Enigo, Keyboard, Settings};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
 
-/// Pause between two synthesized characters.
-///
-/// The injector contract in `crate::platform::input` is one event per character
-/// with a small gap; the reference is the Windows engine's 2 ms inter-keystroke
-/// sleep in `crate::paste`. A burst delivered back to back can outpace the
-/// target window's message queue and drop characters.
-const KEY_GAP: Duration = Duration::from_millis(2);
+use crate::platform::input::KEY_GAP;
 
 /// Text injection through XTest. X11 and XWayland windows receive the keys; a
 /// native Wayland window receives nothing, and nothing here can detect that.
