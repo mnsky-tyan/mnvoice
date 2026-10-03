@@ -250,8 +250,10 @@ pub fn main() {
         }
 
         let audio_engine = audio::AudioEngine::start();
-        // Best-effort housekeeping: drop the leftover .old from a previous
-        // update and arm the periodic background check when AUTO_UPDATE=1.
+        // Best-effort housekeeping: reap what an update that never swapped in
+        // left behind (the staged download and helper copies - the swap-aside
+        // .old belongs to the just-updated handshake consumed just above) and
+        // arm the periodic background check when AUTO_UPDATE=1.
         // The fallback keeps updates armed when the config did not load, which
         // is when a user is most likely stuck on an outdated build.
         let auto_update = config

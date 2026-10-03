@@ -1590,7 +1590,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     }
 
     #[test]
-    fn leftovers_from_an_earlier_update_are_reaped_at_startup() {
+    fn clean_stale_leaves_the_swap_aside_image_to_the_just_updated_handshake() {
         // clean_stale owns the staged download only: the swap-aside .old image
         // belongs to the just-updated handshake, which consumes it as it reads
         // it (see a_leftover_swap_aside_image_means_the_update_installed).
