@@ -16,7 +16,7 @@ pub fn type_text(text: &str) -> Result<(), String> {
 
     unsafe {
         for &ch in &utf16 {
-            let mut inputs = [
+            let inputs = [
                 INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 {
