@@ -192,9 +192,10 @@ pub fn run_stream(
             if cancelled_clone.load(Ordering::SeqCst) {
                 break;
             }
-            // Both backends time out their reads, so the loop re-checks the
-            // cancel flag before every call rather than parking until the
-            // provider speaks.
+            // A read blocks until the next frame, a close, or an error, so
+            // cancel is checked before every call and honoured at the word
+            // boundary; a reader parked inside `read` is released by the
+            // `close()` this function issues once the session ends.
             let frame = match ws_reader.read() {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,

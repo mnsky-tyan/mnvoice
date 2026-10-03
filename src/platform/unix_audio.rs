@@ -21,10 +21,7 @@
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
-use crate::platform::audio::{
-    audio_ms, resample_linear, silence_expired, Audio, SilenceWindows, NO_SPEECH_LIMIT_MS,
-    SAMPLE_RATE,
-};
+use crate::platform::audio::{resample_linear, Audio, SilenceWindows, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -142,7 +139,7 @@ fn run_session(
         // Windows engine hands it.
         let mono = take_frames(&buffer, channels);
 
-        let chunk = resample(&mono, resample_step);
+        let chunk = resample_linear(&mono, resample_step);
 
         // The silence detector reads the same window that goes downstream,
         // so it runs before the hand-off (sending moves the chunk).
@@ -168,58 +165,6 @@ fn run_session(
         }
     }
     // `stream` drops here, which stops capture and joins the device thread.
-}
-
-/// The two silence windows that end a dictation.
-///
-/// Both advance by the audio each tick consumed, which is what keeps them
-/// honest when the capture thread is descheduled and a single tick carries a
-/// second of device audio: the window still counts a second.
-struct SilenceWindows {
-    /// Quiet since the last voice, once there has been any.
-    since_voice_ms: u64,
-    /// Quiet since the session opened.
-    no_speech_ms: u64,
-    heard_voice: bool,
-}
-
-impl SilenceWindows {
-    fn new() -> Self {
-        Self {
-            since_voice_ms: 0,
-            no_speech_ms: 0,
-            heard_voice: false,
-        }
-    }
-
-    /// Feeds one tick's audio, reporting whether the session should end.
-    fn advance(&mut self, samples: usize, rms: f64, threshold: f64, vad_silence_ms: u32) -> bool {
-        if rms > threshold {
-            self.heard_voice = true;
-            self.since_voice_ms = 0;
-            false
-        } else if self.heard_voice {
-            // Silence only ends a dictation once there has been speech, which
-            // is what VAD_SILENCE_MS documents; waiting that long before the
-            // first word would stop a session the user is still thinking in.
-            self.since_voice_ms += audio_ms(samples);
-            silence_expired(self.since_voice_ms, vad_silence_ms)
-        } else {
-            // Nothing said at all: the same no-speech cutoff Windows uses, so a
-            // forgotten open mic cannot hold the device for max_seconds.
-            self.no_speech_ms += audio_ms(samples);
-            self.no_speech_ms >= NO_SPEECH_LIMIT_MS
-        }
-    }
-}
-
-/// Whether the silence detector ends a dictation that has heard speech.
-///
-/// The threshold is the configured value itself, the way the Windows engine
-/// reads it, so `VAD_SILENCE_MS=0` stops on the first silent tick instead of
-/// switching the detector off.
-fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
-    since_voice_ms >= vad_silence_ms as u64
 }
 
 /// Mixes the interleaved frames in `buf` down to mono and leaves a partial

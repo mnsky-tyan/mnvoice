@@ -97,6 +97,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The release tag and the crate version must name the same release: the
+      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
+      # pushed without the bump ships a binary whose two versions disagree.
+      - name: Verify the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          named="${tag#v}"          # drop the leading v
+          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$named" != "$crate" ]; then
+            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches crate version $crate"
+
       - name: Install system libraries
         # cpal needs the ALSA headers (PipeWire arrives through its ALSA layer)
         # and enigo's injector links xkbcommon whichever X11 backend it uses.
@@ -142,6 +159,23 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # The release tag and the crate version must name the same release: the
+      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
+      # pushed without the bump ships a binary whose two versions disagree.
+      - name: Verify the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          named="${tag#v}"          # drop the leading v
+          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$named" != "$crate" ]; then
+            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches crate version $crate"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

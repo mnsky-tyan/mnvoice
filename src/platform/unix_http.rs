@@ -506,7 +506,7 @@ mod tests {
         let reader_socket = Arc::clone(&socket);
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let _ = outcome_tx.send(reader_socket.read(1000));
+            let _ = outcome_tx.send(reader_socket.read());
         });
 
         // Let the reader park inside `read` before asking the socket to stop.

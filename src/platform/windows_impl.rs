@@ -287,8 +287,9 @@ impl Transport for WinHttpTransport {
     fn websocket(&self, url: &str, headers: &[(&str, &str)]) -> Result<Box<dyn WebSocket>, String> {
         unsafe {
             // A streaming session is held open for the length of a dictation,
-            // so there is no overall timeout - only the per-read timeout that
-            // `WebSocket::read` passes in.
+            // so there is no overall timeout and the socket carries no receive
+            // timeout: `read` blocks until a frame, a close, or a transport
+            // error, the contract the trait documents.
             let (mut handles, _) = Self::open("GET", url, (0, 10_000, 0))?;
             let request = handles.request();
 
@@ -411,12 +412,11 @@ impl WebSocket for WinHttpSocket {
 
     /// Read one frame.
     ///
-    /// WinHTTP has no "read with timeout" call, so the timeout is applied to
-    /// the whole timeout window: a read that returns
-    /// `ERROR_WINHTTP_TIMEOUT` is reported as an empty poll rather than an
-    /// error, because from the streaming loop's point of view "the provider
-    /// said nothing this tick" and "the socket broke" are different things and
-    /// only the second should end the session.
+    /// WinHTTP has no "read with timeout" call and the socket is opened with
+    /// no receive timeout, so the receive blocks until a frame arrives, the
+    /// peer closes, or the transport fails - the contract the trait
+    /// documents. Any nonzero result ends the read: from the streaming loop's
+    /// point of view a session that stopped delivering frames is over.
     fn read(&self) -> Result<Option<Vec<u8>>, String> {
         // Once a WinHTTP request is upgraded to a socket, its receive timeout
         // is fixed at what the session was configured with, and the pre-seam
