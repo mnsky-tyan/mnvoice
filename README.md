@@ -339,7 +339,17 @@ traffic and every check would fail with `HTTP 403`. The feed is served from the
 web endpoint, so it has no per-IP quota, needs no token, and is a small
 machine-readable document instead of a 200 KB page.
 
-**Manual.** Tray menu > `Check for updates`. Same result, whenever you ask.
+**Manual.** Tray menu > `Check for updates`. Same result, whenever you ask -
+and the tray narrates it as it goes: "Checking for updates / reading the
+release feed on github.com" the moment the check starts, then "Found vX /
+downloading and verifying its published checksum" once an install begins.
+
+**When it finishes.** The process that installs the update is the one that
+exits at relaunch, so it can never report its own success. The relaunched
+mnvoice carries that one sentence instead: an "mnvoice updated / now running
+vX" balloon, shown once per install, whether you asked for the update or
+`AUTO_UPDATE=1` installed it. The silent background check keeps its silence
+and only writes to the log.
 
 **Your settings survive.** `mnvoice.env` and `keywords.txt` sit beside the exe as
 separate files and are never touched by an update, so your key, vocabulary and

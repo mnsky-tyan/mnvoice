@@ -606,11 +606,12 @@ fn check_exe_payload(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove what an interrupted or deferred update left behind: the image the
-/// running exe was moved aside to, and a download that never got swapped in.
+/// Remove what a download that never got swapped in left behind: a staged
+/// image the swap never consumed. (The swap-aside `.old` image is owned by
+/// `left_old_image_behind`, which consumes it as it reads it; it must not be
+/// tidied here first or the just-updated announcement would never fire.)
 /// Best effort.
 fn clean_stale(exe: &Path) {
-    let _ = fs::remove_file(old_path(exe));
     let _ = fs::remove_file(staged_path(exe));
 }
 
@@ -682,6 +683,35 @@ pub fn startup_cleanup(auto_update: bool) {
         std::thread::sleep(std::time::Duration::from_secs(60));
         background_check_auto();
     });
+}
+
+/// Whether the running exe was swapped in by the previous process.
+///
+/// A completed install moves the old image aside and exits; nothing restores
+/// it (a failed swap renames it back), so a leftover swap-aside file at
+/// startup is the one honest handshake that says "the exe that just started
+/// is the update". This predicate CONSUMES the evidence: the file is deleted
+/// as it is observed, so the announcement is at-most-once even if a later
+/// launch (a tray Restart, say) would otherwise see the stale file and claim
+/// another update happened. Call it BEFORE `startup_cleanup`; the process
+/// that did the installing is the one that exits and can never report its
+/// own success, so this side's word is the only word there is.
+pub fn left_old_image_behind() -> bool {
+    match current_exe() {
+        Ok(exe) => left_old_image_behind_at(&exe),
+        Err(_) => false,
+    }
+}
+
+fn left_old_image_behind_at(exe: &Path) -> bool {
+    let old = old_path(exe);
+    if !old.exists() {
+        return false;
+    }
+    // Consume the handshake: best effort, so a scanner holding the file
+    // cannot make the announcement silently swallow the update.
+    let _ = fs::remove_file(&old);
+    true
 }
 
 #[cfg(test)]
@@ -1065,6 +1095,27 @@ mod tests {
             !err.contains("does not name a version"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_leftover_swap_aside_image_means_the_update_installed() {
+        // The completion handshake: the old image survives only a successful
+        // swap (a failed one renames it back). The predicate consumes it as
+        // it reads, so the announcement fires exactly once per real install -
+        // a second launch must not claim another update happened.
+        let dir = std::env::temp_dir().join("mnvoice-old-image-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("mnvoice.exe");
+        fs::write(&exe, b"MZ").unwrap();
+        assert!(!left_old_image_behind_at(&exe), "no previous install yet");
+        fs::write(old_path(&exe), b"old image").unwrap();
+        assert!(left_old_image_behind_at(&exe), "a completed install left the old image behind");
+        assert!(
+            !left_old_image_behind_at(&exe),
+            "the handshake is consumed: the second launch must not re-announce"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1539,12 +1590,15 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     }
 
     #[test]
-    fn leftovers_from_an_earlier_update_are_reaped_at_startup() {
+    fn clean_stale_leaves_the_swap_aside_image_to_the_just_updated_handshake() {
+        // clean_stale owns the staged download only: the swap-aside .old image
+        // belongs to the just-updated handshake, which consumes it as it reads
+        // it (see a_leftover_swap_aside_image_means_the_update_installed).
         let (dir, exe) = install_folder("stale-leftovers");
         fs::write(dir.join("mnvoice.exe.old"), installed_exe()).unwrap();
         fs::write(staged_path(&exe), downloaded_exe()).unwrap();
         clean_stale(&exe);
-        assert!(!dir.join("mnvoice.exe.old").exists());
+        assert!(dir.join("mnvoice.exe.old").exists(), "the .old image is the handshake's, not clean_stale's");
         assert!(!dir.join("mnvoice.new").exists());
         // The running image and the personal config beside it are left alone.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
@@ -1571,7 +1625,9 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // What the next start does before the window exists.
         clean_stale(&exe);
         reap_helpers();
-        assert!(!dir.join("mnvoice.exe.old").exists());
+        // The .old image is left for the just-updated handshake to consume;
+        // the staged image and the helper copy are what clean_stale reaps.
+        assert!(dir.join("mnvoice.exe.old").exists());
         assert!(!staged_path(&exe).exists());
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
 

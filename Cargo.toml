@@ -5,6 +5,17 @@ edition = "2021"
 description = "Ultra-low-latency, hands-free push-to-talk dictation utility with real-time streaming and zero-clipboard typing"
 license = "MIT"
 
+# Embedded in the exe's version resource alongside the defaults winres fills
+# from this table (FileVersion, ProductVersion, ProductName). A complete,
+# honest identity table is what reputation heuristics read first on an
+# unsigned binary: an empty OriginalFilename on an exe named mnvoice.exe is
+# exactly the mismatch that makes security software guess.
+[package.metadata.winres]
+OriginalFilename = "mnvoice.exe"
+FileDescription = "Push-to-talk dictation - types your speech at the cursor"
+CompanyName = "mnvoice"
+LegalCopyright = "MIT License"
+
 [build-dependencies]
 winres = "0.1"
 

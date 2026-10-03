@@ -109,6 +109,14 @@ impl State {
 /// only correct by luck and disappears entirely once the window is gone.
 static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle as u8);
 
+/// Set at the very start of startup, before anything could consume the
+/// swap-aside image the previous process left behind, and read once the tray
+/// icon exists: a leftover `.old` at startup is exactly how a just-installed
+/// update announces itself, and that announcement is the only "done" the
+/// user ever sees, because the process that did the installing is the one
+/// that exits.
+static JUST_UPDATED: AtomicBool = AtomicBool::new(false);
+
 /// Record a state change in both the UI's own copy and the shared atomic.
 fn set_state(app: &mut App, state: State) {
     app.state = state;
@@ -242,14 +250,20 @@ pub fn main() {
         }
 
         let audio_engine = audio::AudioEngine::start();
-        // Best-effort housekeeping: drop the leftover .old from a previous
-        // update and arm the periodic background check when AUTO_UPDATE=1.
+        // Best-effort housekeeping: reap what an update that never swapped in
+        // left behind (the staged download and helper copies - the swap-aside
+        // .old belongs to the just-updated handshake consumed just above) and
+        // arm the periodic background check when AUTO_UPDATE=1.
         // The fallback keeps updates armed when the config did not load, which
         // is when a user is most likely stuck on an outdated build.
         let auto_update = config
             .as_ref()
             .map(|c| c.auto_update)
             .unwrap_or_else(config::auto_update_enabled);
+        // Consume the just-updated handshake before anything else could
+        // observe or remove the swap-aside image (the predicate deletes it as
+        // it reads it, so this is also what makes the announcement at-most-once).
+        JUST_UPDATED.store(update::left_old_image_behind(), Ordering::SeqCst);
         update::startup_cleanup(auto_update);
         // One-time move off the Run key onto a logon task. On its own
         // thread: it only decides whether the NEXT logon starts the app,
@@ -307,6 +321,16 @@ pub fn main() {
             add_tray(hwnd, &format!("mnvoice - idle ({hk_str})"));
         } else {
             add_tray(hwnd, &format!("mnvoice - HOTKEY {hk_str} UNAVAILABLE (in use by another app)"));
+        }
+
+        // The installing process exits at relaunch, so it cannot report its
+        // own success - this process is the success. The swap-aside image it
+        // left behind is the handshake: say what happened now that there is a
+        // tray icon to say it from.
+        if JUST_UPDATED.load(Ordering::SeqCst) {
+            let version = platform::version();
+            log(&format!("previous install finished, running v{version}"));
+            balloon("mnvoice updated", &format!("now running v{version}"));
         }
 
         let mut msg = MSG::default();
@@ -1079,6 +1103,12 @@ fn open_companion_file(name: &str, stub: &str) {
 /// the exe mid-dictation would lose the transcript in flight.
 pub(crate) fn check_for_updates_async(quiet: bool) {
     thread::spawn(move || {
+        // The check can take seconds and installs take longer; from here on a
+        // manual check narrates every stage, because a tray button that goes
+        // silent for twenty seconds reads as broken, not as busy.
+        if !quiet {
+            balloon("Checking for updates", "reading the release feed on github.com");
+        }
         let rel = match update::check_latest() {
             Ok(r) => r,
             Err(e) => {
@@ -1119,6 +1149,15 @@ pub(crate) fn check_for_updates_async(quiet: bool) {
         }
 
         log(&format!("installing v{}", rel.version));
+        if !quiet {
+            // The download, the checksum verify and the swap happen inside the
+            // call below; this is the window where the user would otherwise
+            // stare at a silent tray.
+            balloon(
+                &format!("Found v{}", rel.version),
+                "downloading and verifying its published checksum",
+            );
+        }
         if let Err(e) = update::install_and_relaunch(&rel, session_active) {
             log(&format!("update failed: {e}"));
             if !quiet {
