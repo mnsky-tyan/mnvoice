@@ -684,6 +684,26 @@ pub fn startup_cleanup(auto_update: bool) {
     });
 }
 
+/// Whether the running exe was swapped in by the previous process.
+///
+/// A completed install moves the old image aside and exits; nothing restores
+/// it (a failed swap renames it back), so a leftover swap-aside file at
+/// startup is the one honest handshake that says "the exe that just started
+/// is the update". Read this BEFORE `startup_cleanup`, which deletes the
+/// evidence; the caller announces the update from it once a tray icon
+/// exists, because the process that did the installing is the one that
+/// exits and can never report its own success.
+pub fn left_old_image_behind() -> bool {
+    match current_exe() {
+        Ok(exe) => left_old_image_behind_at(&exe),
+        Err(_) => false,
+    }
+}
+
+fn left_old_image_behind_at(exe: &Path) -> bool {
+    old_path(exe).exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1085,22 @@ mod tests {
             !err.contains("does not name a version"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_leftover_swap_aside_image_means_the_update_installed() {
+        // The completion handshake: the old image survives only a successful
+        // swap (a failed one renames it back), so its presence is the signal
+        // the relaunched process announces from.
+        let dir = std::env::temp_dir().join("mnvoice-old-image-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("mnvoice.exe");
+        fs::write(&exe, b"MZ").unwrap();
+        assert!(!left_old_image_behind_at(&exe), "no previous install yet");
+        fs::write(old_path(&exe), b"old image").unwrap();
+        assert!(left_old_image_behind_at(&exe), "a completed install left the old image behind");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
