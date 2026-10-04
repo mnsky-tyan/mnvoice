@@ -592,7 +592,7 @@ mod tests {
 
         // Named but empty counts as present, and empty is off.
         assert_eq!(parse_auto_update_text("AUTO_UPDATE=\n"), Some(String::new()));
-        assert!(!parse_auto_update(&String::new()), "an empty value is off");
+        assert!(!parse_auto_update(""), "an empty value is off");
 
         // Last entry wins, so a later correction overrides an earlier one, and
         // comments, stray spaces, quotes and case do not derail the read.
