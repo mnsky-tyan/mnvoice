@@ -19,11 +19,13 @@ fn main() {
 
     // The release tag is the source of truth for the app version, and it is
     // emitted raw: platform::version_of_tag is the convention for what a tag's
-    // version is, and the publish side keeps to the same shapes (one owner:
-    // .github/actions/verify-release-tag). This build cannot call that code
-    // (separate compilation unit), so the filter below is a deliberate second
-    // spelling of the same rule - stricter than the workflow's, because a
-    // wrong version here is baked into an exe.
+    // version is, and the publish side owns the release shape in one place -
+    // .github/actions/verify-release-tag, which accepts only vX.Y.Z or
+    // vX.Y.Z-{platform} and checks the version against the crate. This build
+    // cannot call it (separate compilation unit), so the filter below is not
+    // that rule and is looser than the workflow's: it only stops a non-tag ref
+    // name from being baked into the exe, and any wrong version that survives
+    // it is the workflow's to catch before it publishes.
     //
     // GITHUB_REF_NAME is the tag name on a tag push ("v0.1.18-win"), but on a
     // branch or pull-request build it is a branch name ("main", "7/merge", and

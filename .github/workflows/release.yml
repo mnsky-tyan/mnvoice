@@ -117,12 +117,18 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --target x86_64-unknown-linux-gnu
 
       - name: Build release
-        run: cargo build --release --locked
+        # The target is named explicitly rather than taken from the runner:
+        # the asset is published under the x64 name, so pinning it keeps the
+        # test run, the build output and the packaged path aligned (the same
+        # hazard the macOS job's comment names).
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
       # sha256sum already prints "<hash>  <name>" with two spaces, the exact
       # format the updater parses; the shared package action keeps that format
