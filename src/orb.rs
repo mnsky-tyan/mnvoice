@@ -9,8 +9,8 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{w, PCWSTR};
 
-pub const ORB_WIDTH: i32 = 48;
-pub const ORB_HEIGHT: i32 = 48;
+const ORB_WIDTH: i32 = 48;
+const ORB_HEIGHT: i32 = 48;
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
 
 const ORB_CX: f32 = 24.0;
@@ -200,7 +200,7 @@ impl Orb {
         }
     }
 
-    fn render_frame(&self) {
+    fn render_frame(&mut self) {
         if self.bits.is_null() {
             return;
         }

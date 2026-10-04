@@ -29,6 +29,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The release tag and the crate version must name the same release: the
+      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
+      # pushed without the bump ships a binary whose two versions disagree.
+      - name: Verify the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          named="${tag#v}"          # drop the leading v
+          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$named" != "$crate" ]; then
+            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches crate version $crate"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,27 +60,19 @@ jobs:
         run: cargo build --release --locked
 
       # The raw exe is the asset the in-app updater downloads, and it is also
-      # what a user gets when they would rather not unpack a zip.
+      # what a user gets when they would rather not unpack a zip. The shared
+      # action owns the packaging contract: binary under its released name,
+      # a sidecar in "<lowercase-hash>  <basename>" form with LF endings
+      # (SHA256SUMS is the one spelling update.rs's CHECKSUMS_ASSET reads),
+      # and the zip staged from the exe plus the two companion templates.
       - name: Package artifacts
-        # pwsh is pinned so the hash file's encoding is fixed: under Windows
-        # PowerShell 5.1 "utf8" means BOM, under pwsh 7 it does not - that
-        # producer ambiguity is exactly why the updater needs BOM tolerance.
-        # utf8NoBOM is the explicit statement of what we ship.
-        shell: pwsh
-        run: |
-          mkdir dist
-          cp target/release/mnvoice.exe dist/
-          # The raw exe is also left at the workspace root so the publish step can
-          # hand it to gh; only the zip is created from dist.
-          cp target/release/mnvoice.exe mnvoice.exe
-          cp mnvoice.env.example dist/
-          cp keywords.txt.example dist/
-          Compress-Archive -Path dist/* -DestinationPath mnvoice-windows-x64.zip
-          # A published hash is the only way to check a download independently of
-          # where it was fetched from, so it ships with every release.
-          Get-FileHash -Algorithm SHA256 mnvoice.exe, mnvoice-windows-x64.zip |
-            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path -Leaf $_.Path)" } |
-            Set-Content -Path SHA256SUMS -Encoding utf8NoBOM
+        uses: ./.github/actions/package-release
+        with:
+          binary: target/release/mnvoice.exe
+          asset: mnvoice.exe
+          sidecar: SHA256SUMS
+          zip: mnvoice-windows-x64.zip
+          zip_extra: mnvoice.env.example keywords.txt.example
 
       # The shared publish step uses the preinstalled gh CLI rather than
       # softprops/action-gh-release, which silently succeeds while uploading
@@ -88,6 +97,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The release tag and the crate version must name the same release: the
+      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
+      # pushed without the bump ships a binary whose two versions disagree.
+      - name: Verify the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          named="${tag#v}"          # drop the leading v
+          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$named" != "$crate" ]; then
+            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches crate version $crate"
+
       - name: Install system libraries
         # cpal needs the ALSA headers (PipeWire arrives through its ALSA layer)
         # and enigo's injector links xkbcommon whichever X11 backend it uses.
@@ -104,12 +130,17 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      # sha256sum already prints "<hash>  <name>" with two spaces, the exact
+      # format the updater parses; the shared package action keeps that format
+      # for every platform. The Unix sidecars are named after their asset -
+      # SHA256SUMS is the Windows spelling, the only one update.rs's
+      # CHECKSUMS_ASSET reads, and the README documents both.
       - name: Package artifact
-        # sha256sum already prints "<hash>  <name>", the exact format the
-        # updater parses; no post-processing.
-        run: |
-          cp target/release/mnvoice mnvoice-linux-x64
-          sha256sum mnvoice-linux-x64 > mnvoice-linux-x64.sha256
+        uses: ./.github/actions/package-release
+        with:
+          binary: target/release/mnvoice
+          asset: mnvoice-linux-x64
+          sidecar: mnvoice-linux-x64.sha256
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -129,6 +160,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The release tag and the crate version must name the same release: the
+      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
+      # pushed without the bump ships a binary whose two versions disagree.
+      - name: Verify the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          named="${tag#v}"          # drop the leading v
+          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$named" != "$crate" ]; then
+            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches crate version $crate"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -143,12 +191,15 @@ jobs:
         # Intel-armed image switching under us must not silently change it.
         run: cargo build --release --locked --target aarch64-apple-darwin
 
+      # The shared package action prints "<hash>  <name>" with two spaces, the
+      # exact format the updater parses, using whichever sha256 spelling this
+      # runner carries (see the Linux job for the naming note).
       - name: Package artifact
-        # shasum -a 256 already prints "<hash>  <name>", the exact format the
-        # updater parses; no post-processing.
-        run: |
-          cp target/aarch64-apple-darwin/release/mnvoice mnvoice-macos-arm64
-          shasum -a 256 mnvoice-macos-arm64 > mnvoice-macos-arm64.sha256
+        uses: ./.github/actions/package-release
+        with:
+          binary: target/aarch64-apple-darwin/release/mnvoice
+          asset: mnvoice-macos-arm64
+          sidecar: mnvoice-macos-arm64.sha256
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')

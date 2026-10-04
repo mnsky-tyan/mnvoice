@@ -14,16 +14,15 @@ pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
     let body = multipart_body(cfg, wav);
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
 
-    let response = crate::platform::http::NativeTransport
-        .post(&url, Some(&format!("Bearer {}", cfg.api_key)), &content_type, &body)?;
+    let response = crate::platform::http::NativeTransport.post(
+        &url,
+        Some(&format!("Bearer {}", cfg.api_key)),
+        &content_type,
+        &body,
+    )?;
 
     if response.status != 200 {
-        let preview: String =
-            String::from_utf8_lossy(&response.body).chars().take(200).collect();
-        return Err(format!(
-            "ASR endpoint returned HTTP {}: {preview}",
-            response.status
-        ));
+        return Err(response.error_for_status("ASR endpoint"));
     }
 
     let raw_text = String::from_utf8_lossy(&response.body);
@@ -152,6 +151,28 @@ pub fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (Str
     };
     let space = trailing_space && !text.is_empty();
     (text, space)
+}
+
+/// Transcribes captured `samples` and types the cleaned text.
+///
+/// Returns the transcript; an empty string means the provider heard nothing.
+/// The tray app and the CLI each drain their capture channel their own way
+/// (the tray blocks until the capture closes it, the CLI drains after its
+/// capture thread reports done) - the glue after the drain is the part that
+/// must not drift.
+pub fn dictate_rest(cfg: &Config, samples: &[i16]) -> Result<String, String> {
+    let wav = crate::platform::audio::wav_bytes(samples);
+    let raw = transcribe(cfg, &wav)?;
+    // No provider here exposes a native filler_words parameter, so
+    // disfluencies are removed locally before anything is typed.
+    let (text, trailing) = rest_typing(&raw, cfg.strip_fillers, cfg.trailing_space);
+    if !text.is_empty() {
+        crate::platform::input::type_text(&text);
+        if trailing {
+            crate::platform::input::type_text(" ");
+        }
+    }
+    Ok(text)
 }
 
 pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> {

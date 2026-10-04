@@ -345,8 +345,7 @@ impl WebSocket for UnixSocket {
         let _ = self.shutdown.shutdown(Shutdown::Both);
     }
 
-    fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
-        let _ = timeout_ms; // see the note below
+    fn read(&self) -> Result<Option<Vec<u8>>, String> {
         loop {
             let mut ws = self
                 .socket
@@ -392,15 +391,15 @@ impl WebSocket for UnixSocket {
     }
 }
 
-// A note on `read`'s ignored timeout, matching the Windows backend's stated
-// behaviour: the streaming loop is built around a blocking read - the reader
-// thread simply waits until the provider sends the next final or closes, and
-// cancellation unblocks it because the writer side closes the socket. The
-// trait has no spelling for "nothing arrived this tick": `None` and `Err` are
-// both read by the loop as the end of the stream, so honouring the deadline
-// here would cut off the last words of a dictation. The socket's short read
-// timeout therefore bounds only how long the mutex can be held, which is what
-// keeps a send on the main thread moving while the provider is quiet.
+// A note on `read`: matching the Windows backend's stated behaviour, this is
+// a blocking read - the reader thread waits until the provider sends the next
+// final or closes, and cancellation unblocks it because the writer side
+// closes the socket. The trait has no spelling for "nothing arrived this
+// tick": `None` and `Err` are both read by the loop as the end of the stream,
+// so returning on a quiet poll instead would cut off the last words of a
+// dictation. The socket's short read timeout therefore bounds only how long
+// the mutex can be held, which is what keeps a send on the main thread moving
+// while the provider is quiet.
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
@@ -507,7 +506,7 @@ mod tests {
         let reader_socket = Arc::clone(&socket);
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let _ = outcome_tx.send(reader_socket.read(1000));
+            let _ = outcome_tx.send(reader_socket.read());
         });
 
         // Let the reader park inside `read` before asking the socket to stop.

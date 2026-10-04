@@ -22,6 +22,19 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+impl Response {
+    /// The error for a status the caller does not accept: the code plus a
+    /// bounded preview of the body, so a provider's explanation survives
+    /// without a megabyte of HTML in the log.
+    pub fn error_for_status(&self, what: &str) -> String {
+        let preview: String = String::from_utf8_lossy(&self.body)
+            .chars()
+            .take(200)
+            .collect();
+        format!("{what} returned HTTP {}: {preview}", self.status)
+    }
+}
+
 /// A blocking WebSocket client for the streaming transcription path.
 ///
 /// Implementations MUST allow `read` on one thread to proceed while `send`
@@ -35,7 +48,7 @@ pub struct Response {
 /// The concrete type differs per platform - WinHTTP's WebSocket on Windows, a
 /// pure-Rust client elsewhere - so this is a trait rather than a struct. The
 /// methods are the minimum the streaming loop actually uses: send a binary
-/// frame, send a text frame, and read one frame with a timeout.
+/// frame, send a text frame, and read one frame.
 pub trait WebSocket: Send + Sync {
     /// Send a binary frame (a slice of PCM audio).
     fn send_binary(&self, data: &[u8]) -> Result<(), String>;
@@ -48,12 +61,17 @@ pub trait WebSocket: Send + Sync {
 
     /// Read the next frame, returning `None` on a clean close.
     ///
-    /// `timeout_ms` is what keeps the streaming loop responsive to the user
-    /// releasing the hotkey: a blocking read with no timeout would hold the
-    /// worker until the provider decided to speak, so the transcript would
-    /// arrive long after the user stopped talking. A backend that cannot vary
-    /// this per read should say so in its implementation.
-    fn read(&self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String>;
+    /// A blocking read: it returns when a frame arrives, when the peer closes,
+    /// or on a transport error - never merely because the provider was quiet,
+    /// because surfacing a quiet poll as the end of the stream would cut off
+    /// the last words of a dictation. Cancel is therefore carried by the
+    /// caller's flags plus `close()`: `close` terminates the socket, which is
+    /// what releases a reader parked in `read`. The Unix backend's short
+    /// socket read timeout bounds only how long its internal lock is held and
+    /// the Windows socket carries no receive timeout at all, so neither
+    /// returns to the caller on a timeout; a backend that cannot block this
+    /// way must say so in its implementation.
+    fn read(&self) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// The whole network surface, one implementation per platform.

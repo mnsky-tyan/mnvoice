@@ -7,7 +7,7 @@
 
 use crate::config;
 use crate::platform::audio::SAMPLE_RATE;
-use crate::platform::{audio, input, unix_audio};
+use crate::platform::{audio, unix_audio};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -189,17 +189,7 @@ fn dictate(
             }
             captured?;
             println!("stopped ({}s of audio)", samples.len() / SAMPLE_RATE as usize);
-            let wav = audio::wav_bytes(&samples);
-            let raw = crate::rest::transcribe(cfg, &wav)?;
-            let (text, trailing) =
-                crate::rest::rest_typing(&raw, cfg.strip_fillers, cfg.trailing_space);
-            if !text.is_empty() {
-                input::type_text(&text);
-                if trailing {
-                    input::type_text(" ");
-                }
-            }
-            text
+            crate::rest::dictate_rest(cfg, &samples)?
         }
     };
 

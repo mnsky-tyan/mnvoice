@@ -79,11 +79,7 @@ pub fn is_newer(a: &str, b: &str) -> bool {
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
     let response = crate::platform::http::NativeTransport.get(url, accept)?;
     if response.status != 200 {
-        let preview: String = String::from_utf8_lossy(&response.body).chars().take(200).collect();
-        return Err(format!(
-            "update request returned HTTP {}: {preview}",
-            response.status
-        ));
+        return Err(response.error_for_status("update request"));
     }
     Ok(response.body)
 }

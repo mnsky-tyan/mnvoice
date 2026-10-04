@@ -63,7 +63,7 @@ pub fn load() -> Result<Config, String> {
         if let Ok(text) = std::fs::read_to_string(&path) {
             parse(&text, |k, v| {
                 if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
-                    raw.set_file(*field, k, v);
+                    raw.set(*field, k, v, true);
                 }
             });
         }
@@ -74,13 +74,19 @@ pub fn load() -> Result<Config, String> {
     for (names, field) in FIELDS {
         for name in *names {
             if let Ok(v) = std::env::var(name) {
-                raw.set_env(*field, &v);
+                raw.set(*field, "", &v, false);
                 break;
             }
         }
     }
 
     // Determine protocol: streaming vs rest
+    derive(raw)
+}
+
+/// The derivation both sources feed: protocol defaults, the key requirement,
+/// hotkey pairs and the display strings that must name them.
+fn derive(raw: RawFields) -> Result<Config, String> {
     let protocol = match raw.protocol_str.to_lowercase().as_str() {
         "rest" | "http" | "batch" | "groq" | "openai" => Protocol::Rest,
         "streaming" | "stream" | "websocket" | "ws" | "deepgram" => Protocol::Streaming,
@@ -122,21 +128,29 @@ pub fn load() -> Result<Config, String> {
     let orb_color = parse_color(&raw.orb_color_str);
     let orb_fluid_level = parse_fluid_level(&raw.orb_fluid_str);
 
-    let hotkey_actual_str = if raw.hotkey_str.trim().is_empty() {
-        "Alt+Space".to_string()
-    } else {
-        raw.hotkey_str.trim().to_string()
+    // The displayed spelling must name the pair that was actually registered:
+    // an unparseable HOTKEY falls back to the default below, so echoing
+    // "Foobar" back into the tray tip and the log would advertise a key that
+    // does nothing.
+    let hotkey_input = raw.hotkey_str.trim().to_string();
+    let hotkey_parsed = parse_hotkey(&hotkey_input);
+    let hotkey = hotkey_parsed.unwrap_or((0x0001 | 0x4000, 0x20)); // MOD_ALT | MOD_NOREPEAT, VK_SPACE
+    let hotkey_actual_str = match (hotkey_input.is_empty(), hotkey_parsed) {
+        (false, Some(_)) => hotkey_input,
+        _ => "Alt+Space".to_string(),
     };
-    let hotkey = parse_hotkey(&hotkey_actual_str).unwrap_or((0x0001 | 0x4000, 0x20)); // MOD_ALT | MOD_NOREPEAT, VK_SPACE
 
-    let cancel_key_actual_str = if raw.cancel_key_str.trim().is_empty() {
-        "Escape".to_string()
-    } else {
-        raw.cancel_key_str.trim().to_string()
-    };
+    let cancel_input = raw.cancel_key_str.trim().to_string();
     // "none" disables the cancel key outright: a zero virtual key is what the
     // Windows registration reads as "register nothing".
-    let cancel_key = resolve_cancel_key(&cancel_key_actual_str);
+    let cancel_key = resolve_cancel_key(&cancel_input);
+    let cancel_actual_str = if cancel_input.is_empty()
+        || (!cancel_input.eq_ignore_ascii_case("none") && parse_hotkey(&cancel_input).is_none())
+    {
+        "Escape".to_string()
+    } else {
+        cancel_input
+    };
 
     // FILLER_WORDS=0 (default) strips disfluencies; =1 keeps them verbatim.
     // Empty or unset strips, so a typo can never silently re-enable fillers.
@@ -161,7 +175,7 @@ pub fn load() -> Result<Config, String> {
         hotkey,
         hotkey_str: hotkey_actual_str,
         cancel_key,
-        cancel_key_str: cancel_key_actual_str,
+        cancel_key_str: cancel_actual_str,
         vad_silence_ms: raw.vad_silence_ms,
         vad_rms_threshold: raw.vad_rms_threshold,
         strip_fillers,
@@ -346,26 +360,30 @@ impl RawFields {
         }
     }
 
-    /// One KEY=VALUE from mnvoice.env. Lines accumulate in file order: for the
-    /// alias-priority fields (`API_KEY`, `MODEL`, `LANGUAGE`, `BASE_URL`) the
-    /// canonical key wins over its aliases whatever order the lines appear in,
-    /// and an alias fills only a field nothing has set yet (a Deepgram-specific
-    /// default overridable by a plain `API_KEY=`); every other field takes the
-    /// last line that names it.
-    fn set_file(&mut self, field: Field, k: &str, v: &str) {
-        let canonical_overrides = k == field.canonical();
+    /// One key/value pair from either source: a line from mnvoice.env
+    /// (`from_file`) or a process environment variable.
+    ///
+    /// The file pass accumulates in file order: for the alias-priority fields
+    /// (`API_KEY`, `MODEL`, `LANGUAGE`, `BASE_URL`) the canonical key wins
+    /// over its aliases whatever order the lines appear in, and an alias fills
+    /// only a field nothing has set yet (a Deepgram-specific default
+    /// overridable by a plain `API_KEY=`); every other field takes the last
+    /// line that names it. The environment pass runs after the file, so it
+    /// overrides anything the file set and is not subject to the guards.
+    fn set(&mut self, field: Field, k: &str, v: &str, from_file: bool) {
+        let canonical_overrides = from_file && k == field.canonical();
         match field {
             Field::Protocol => self.protocol_str = v.to_string(),
-            Field::ApiKey if canonical_overrides || self.api_key.is_empty() => {
+            Field::ApiKey if !from_file || canonical_overrides || self.api_key.is_empty() => {
                 self.api_key = v.to_string()
             }
-            Field::Model if canonical_overrides || self.model.is_empty() => {
+            Field::Model if !from_file || canonical_overrides || self.model.is_empty() => {
                 self.model = v.to_string()
             }
-            Field::Language if canonical_overrides || self.language.is_empty() => {
+            Field::Language if !from_file || canonical_overrides || self.language.is_empty() => {
                 self.language = v.to_string()
             }
-            Field::BaseUrl if canonical_overrides || self.base_url.is_empty() => {
+            Field::BaseUrl if !from_file || canonical_overrides || self.base_url.is_empty() => {
                 self.base_url = v.to_string()
             }
             Field::OrbColor => self.orb_color_str = v.to_string(),
@@ -378,6 +396,10 @@ impl RawFields {
                     self.max_seconds = n;
                 }
             }
+            // Deliberately the one key where an unknown spelling keeps the
+            // default on: TRAILING_SPACE defaults to enabled, and treating a
+            // typo as "off" would let `TRAILING_SPACE=flase` silently strip
+            // the space. Only the exact spelling 0 disables.
             Field::TrailingSpace => self.trailing_space = v != "0",
             Field::Keywords => parse_keywords_text(v, &mut self.keywords),
             Field::VadSilenceMs => {
@@ -390,41 +412,10 @@ impl RawFields {
                     self.vad_rms_threshold = n;
                 }
             }
+            // The alias guards leave the four guarded variants uncovered when
+            // a guard fails, so this fallback is what makes the match legal -
+            // not dead code.
             _ => {}
-        }
-    }
-
-    /// One process environment variable. The environment is the highest
-    /// priority source, so the value always lands, whatever the file set.
-    fn set_env(&mut self, field: Field, v: &str) {
-        match field {
-            Field::Protocol => self.protocol_str = v.to_string(),
-            Field::ApiKey => self.api_key = v.to_string(),
-            Field::Model => self.model = v.to_string(),
-            Field::Language => self.language = v.to_string(),
-            Field::BaseUrl => self.base_url = v.to_string(),
-            Field::OrbColor => self.orb_color_str = v.to_string(),
-            Field::OrbFluid => self.orb_fluid_str = v.to_string(),
-            Field::Hotkey => self.hotkey_str = v.to_string(),
-            Field::CancelKey => self.cancel_key_str = v.to_string(),
-            Field::FillerWords => self.filler_words_str = v.to_string(),
-            Field::MaxSeconds => {
-                if let Ok(n) = v.parse() {
-                    self.max_seconds = n;
-                }
-            }
-            Field::TrailingSpace => self.trailing_space = v != "0",
-            Field::Keywords => parse_keywords_text(v, &mut self.keywords),
-            Field::VadSilenceMs => {
-                if let Ok(n) = v.parse() {
-                    self.vad_silence_ms = n;
-                }
-            }
-            Field::VadRmsThreshold => {
-                if let Ok(n) = v.parse() {
-                    self.vad_rms_threshold = n;
-                }
-            }
         }
     }
 }
@@ -651,57 +642,136 @@ mod tests {
         // two passes actually fill.
         let mut raw = RawFields::new();
 
-        raw.set_file(Field::Hotkey, "KEYBIND", "F9");
-        assert_eq!(raw.hotkey_str, "F9", "KEYBIND must reach the hotkey from the file");
-        raw.set_env(Field::Hotkey, "F10");
-        assert_eq!(raw.hotkey_str, "F10", "KEYBIND must reach the hotkey from the env");
+        raw.set(Field::Hotkey, "KEYBIND", "F9", true);
+        assert_eq!(
+            raw.hotkey_str, "F9",
+            "KEYBIND must reach the hotkey from the file"
+        );
+        raw.set(Field::Hotkey, "", "F10", false);
+        assert_eq!(
+            raw.hotkey_str, "F10",
+            "KEYBIND must reach the hotkey from the env"
+        );
 
-        raw.set_file(Field::OrbColor, "COLOR", "#A855F7");
-        assert_eq!(raw.orb_color_str, "#A855F7", "COLOR must reach the orb color from the file");
-        raw.set_env(Field::OrbColor, "cyan");
-        assert_eq!(raw.orb_color_str, "cyan", "COLOR must reach the orb color from the env");
+        raw.set(Field::OrbColor, "COLOR", "#A855F7", true);
+        assert_eq!(
+            raw.orb_color_str, "#A855F7",
+            "COLOR must reach the orb color from the file"
+        );
+        raw.set(Field::OrbColor, "", "cyan", false);
+        assert_eq!(
+            raw.orb_color_str, "cyan",
+            "COLOR must reach the orb color from the env"
+        );
 
-        raw.set_file(Field::OrbFluid, "FLUID_LEVEL", "0.9");
-        assert_eq!(raw.orb_fluid_str, "0.9", "FLUID_LEVEL must reach the fluid level from the file");
-        raw.set_env(Field::OrbFluid, "50%");
-        assert_eq!(raw.orb_fluid_str, "50%", "FLUID_LEVEL must reach the fluid level from the env");
+        raw.set(Field::OrbFluid, "FLUID_LEVEL", "0.9", true);
+        assert_eq!(
+            raw.orb_fluid_str, "0.9",
+            "FLUID_LEVEL must reach the fluid level from the file"
+        );
+        raw.set(Field::OrbFluid, "", "50%", false);
+        assert_eq!(
+            raw.orb_fluid_str, "50%",
+            "FLUID_LEVEL must reach the fluid level from the env"
+        );
 
-        raw.set_file(Field::Keywords, "CUSTOM_WORDS", "herdr, mnvoice");
+        raw.set(Field::Keywords, "CUSTOM_WORDS", "herdr, mnvoice", true);
         assert!(
-            raw.keywords.contains(&"herdr".to_string()) && raw.keywords.contains(&"mnvoice".to_string()),
+            raw.keywords.contains(&"herdr".to_string())
+                && raw.keywords.contains(&"mnvoice".to_string()),
             "CUSTOM_WORDS must reach the keywords from the file, got {:?}",
             raw.keywords
         );
-        raw.set_env(Field::Keywords, "PostgreSQL");
+        raw.set(Field::Keywords, "", "PostgreSQL", false);
         assert!(
             raw.keywords.contains(&"PostgreSQL".to_string()),
             "CUSTOM_WORDS must reach the keywords from the env, got {:?}",
             raw.keywords
         );
 
-        raw.set_file(Field::Keywords, "VOCABULARY", "six");
-        assert!(raw.keywords.contains(&"six".to_string()), "VOCABULARY must reach the keywords from the file");
+        raw.set(Field::Keywords, "VOCABULARY", "six", true);
+        assert!(
+            raw.keywords.contains(&"six".to_string()),
+            "VOCABULARY must reach the keywords from the file"
+        );
     }
 
     #[test]
     fn the_file_pass_lets_the_canonical_key_override_an_alias() {
         let mut raw = RawFields::new();
-        raw.set_file(Field::ApiKey, "DEEPGRAM_API_KEY", "alias");
+        raw.set(Field::ApiKey, "DEEPGRAM_API_KEY", "alias", true);
         assert_eq!(raw.api_key, "alias", "an alias fills an unset field");
-        raw.set_file(Field::ApiKey, "API_KEY", "canon");
+        raw.set(Field::ApiKey, "API_KEY", "canon", true);
         assert_eq!(raw.api_key, "canon", "the canonical key overrides");
-        raw.set_file(Field::ApiKey, "DEEPGRAM_API_KEY", "alias-2");
-        assert_eq!(raw.api_key, "canon", "a later alias does not override the canonical key");
+        raw.set(Field::ApiKey, "DEEPGRAM_API_KEY", "alias-2", true);
+        assert_eq!(
+            raw.api_key, "canon",
+            "a later alias does not override the canonical key"
+        );
     }
 
     #[test]
     fn the_environment_is_the_highest_priority_source() {
         let mut raw = RawFields::new();
-        raw.set_file(Field::ApiKey, "API_KEY", "from-file");
-        raw.set_env(Field::ApiKey, "from-env");
+        raw.set(Field::ApiKey, "API_KEY", "from-file", true);
+        raw.set(Field::ApiKey, "", "from-env", false);
         assert_eq!(raw.api_key, "from-env");
-        raw.set_file(Field::Hotkey, "KEYBIND", "F9");
-        raw.set_env(Field::Hotkey, "Ctrl+Shift+D");
+        raw.set(Field::Hotkey, "KEYBIND", "F9", true);
+        raw.set(Field::Hotkey, "", "Ctrl+Shift+D", false);
         assert_eq!(raw.hotkey_str, "Ctrl+Shift+D");
+    }
+
+    /// Runs the real file pass over `text` and the real derivation, standing
+    /// in for the mnvoice.env beside the exe. The API key load() demands is
+    /// always supplied so the config derives instead of erroring.
+    fn load_from(text: &str) -> Config {
+        let mut raw = RawFields::new();
+        parse(text, |k, v| {
+            if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
+                raw.set(*field, k, v, true);
+            }
+        });
+        if raw.api_key.trim().is_empty() {
+            raw.api_key = "test-key".to_string();
+        }
+        derive(raw).expect("test config should derive")
+    }
+
+    /// The merged setter keeps both sources' semantics: an alias from the
+    /// file yields to the canonical name, the same alias from the environment
+    /// always lands.
+    #[test]
+    fn file_alias_yields_but_env_alias_always_lands() {
+        let mut raw = RawFields::new();
+        raw.set(Field::ApiKey, "DEEPGRAM_API_KEY", "alias", true);
+        assert_eq!(raw.api_key, "alias", "a file alias fills an empty field");
+        raw.set(Field::ApiKey, "DEEPGRAM_API_KEY", "alias2", true);
+        assert_eq!(raw.api_key, "alias", "a file alias never overrides");
+        raw.set(Field::ApiKey, "API_KEY", "canonical", true);
+        assert_eq!(raw.api_key, "canonical", "the canonical name overrides");
+        raw.set(Field::ApiKey, "DEEPGRAM_API_KEY", "alias3", false);
+        assert_eq!(raw.api_key, "alias3", "an environment alias always lands");
+    }
+
+    /// An unparseable HOTKEY registers the default pair, so the displayed
+    /// spelling must fall back with it - the tray tip and the log must not
+    /// advertise a key that does nothing.
+    #[test]
+    fn an_unparseable_hotkey_displays_the_pair_actually_registered() {
+        let cfg = load_from("API_KEY=k\nHOTKEY=Foobar\nCANCEL_KEY=AlsoNotAKey");
+        assert_eq!(cfg.hotkey, (0x0001 | 0x4000, 0x20));
+        assert_eq!(cfg.hotkey_str, "Alt+Space");
+        assert_eq!(cfg.cancel_key, (0x4000, 0x1B));
+        assert_eq!(cfg.cancel_key_str, "Escape");
+    }
+
+    /// A key that parses keeps its spelling on screen, and "none" still
+    /// disables the cancel key under its own name.
+    #[test]
+    fn a_parsed_hotkey_displays_its_own_spelling() {
+        let cfg = load_from("API_KEY=k\nHOTKEY=Ctrl+Shift+D\nCANCEL_KEY=none");
+        assert_eq!(cfg.hotkey_str, "Ctrl+Shift+D");
+        assert_eq!(cfg.cancel_key, (0, 0));
+        assert_eq!(cfg.cancel_key_str, "none");
     }
 }
