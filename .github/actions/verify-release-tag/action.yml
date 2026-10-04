@@ -1,0 +1,48 @@
+name: Verify release tag
+description: >-
+  The single owner of the tag-shape rule for a release: a tag must be exactly
+  vX.Y.Z or vX.Y.Z-<one platform segment>, and the version it names must equal
+  the crate version. The publisher (this workflow) and the consumer (the
+  updater's tag_is_ours) accept exactly this set and nothing else - a tag with
+  a second segment (v0.1.21-rc1-win), or a platform this project does not
+  publish (v0.1.21-android), fails here before anything builds or publishes.
+  Kept in one file on purpose: the rule used to be spelled in the job
+  selectors, three bash guards, build.rs and the updater, and the copies
+  disagreed on exactly the shapes this action rejects.
+inputs:
+  tag:
+    required: true
+    description: The tag being released (github.ref_name).
+runs:
+  using: composite
+  steps:
+    - name: Verify tag shape and version
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        tag="$TAG"
+
+        # The convention: vX.Y.Z, or vX.Y.Z plus exactly one platform segment.
+        # Pre-release or vendor suffixes (rc, beta, android, ...) are not
+        # shapes this project publishes; if one is ever wanted, the mechanism
+        # is GitHub's pre-release flag on a normal-shaped tag, not a second
+        # tag segment.
+        if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(win|linux|macos))?$ ]]; then
+          echo "::error file=.github/actions/verify-release-tag/action.yml::$tag is not a release shape (want vX.Y.Z or vX.Y.Z-{win,linux,macos})"
+          echo "the updater recognizes exactly those tags; anything else is invisible to it once published"
+          exit 1
+        fi
+
+        # The version named by the tag must equal the crate version: the
+        # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
+        # pushed without the bump ships a binary whose two versions disagree.
+        named="${tag#v}"
+        named="${named%%-*}"
+        crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+        if [ "$named" != "$crate" ]; then
+          echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
+          exit 1
+        fi
+        echo "tag $tag is a release shape naming crate version $crate"

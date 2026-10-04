@@ -53,9 +53,10 @@ runs:
         }
         # Line endings are written by hand on purpose: Set-Content joins with
         # the runner's CRLF, and the hash file's shape is a manifest, not a
-        # platform default. utf8NoBOM + \n is what we ship; the updater
-        # tolerates a BOM and CRLF when it reads, which is what the BOM
-        # tolerance in the feed parser exists for.
+        # platform default. utf8NoBOM + \n is what we ship. The updater's
+        # checksum parser (expected_hash in src/update.rs) tolerates a BOM and
+        # CRLF when it reads, which is exactly the tolerance this removes the
+        # need for; the release-feed parser has no such tolerance to point at.
         $lines = foreach ($f in $files) {
           $h = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLowerInvariant()
           "$h  $(Split-Path -Leaf $f)"

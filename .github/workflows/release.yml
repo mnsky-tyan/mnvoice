@@ -8,7 +8,15 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      # Exactly the shapes .github/actions/verify-release-tag accepts: the
+      # bare version tag and one platform-suffixed tag. A tag outside this
+      # set starts no workflow at all - which is the quiet failure this
+      # glob list, and the shape check the first step performs, exist to
+      # prevent.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-win'
+      - 'v[0-9]+.[0-9]+.[0-9]+-linux'
+      - 'v[0-9]+.[0-9]+.[0-9]+-macos'
   pull_request:
   workflow_dispatch:
 
@@ -29,22 +37,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # The release tag and the crate version must name the same release: the
-      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
-      # pushed without the bump ships a binary whose two versions disagree.
-      - name: Verify the tag matches the crate version
+      # One owner for the tag rule (shape + version), shared by all three jobs:
+      # the shapes it accepts are exactly the ones the updater recognizes, and
+      # the version it names must be the crate's. Replaces the three copies of
+      # this check that used to live here.
+      - name: Verify the release tag
         if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          named="${tag#v}"          # drop the leading v
-          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
-          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-          if [ "$named" != "$crate" ]; then
-            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
-            exit 1
-          fi
-          echo "tag $tag matches crate version $crate"
+        uses: ./.github/actions/verify-release-tag
+        with:
+          tag: ${{ github.ref_name }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -97,22 +98,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # The release tag and the crate version must name the same release: the
-      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
-      # pushed without the bump ships a binary whose two versions disagree.
-      - name: Verify the tag matches the crate version
+      # One owner for the tag rule (shape + version), shared by all three jobs:
+      # the shapes it accepts are exactly the ones the updater recognizes, and
+      # the version it names must be the crate's. Replaces the three copies of
+      # this check that used to live here.
+      - name: Verify the release tag
         if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          named="${tag#v}"          # drop the leading v
-          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
-          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-          if [ "$named" != "$crate" ]; then
-            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
-            exit 1
-          fi
-          echo "tag $tag matches crate version $crate"
+        uses: ./.github/actions/verify-release-tag
+        with:
+          tag: ${{ github.ref_name }}
 
       - name: Install system libraries
         # cpal needs the ALSA headers (PipeWire arrives through its ALSA layer)
@@ -138,7 +132,7 @@ jobs:
       - name: Package artifact
         uses: ./.github/actions/package-release
         with:
-          binary: target/release/mnvoice
+          binary: target/x86_64-unknown-linux-gnu/release/mnvoice
           asset: mnvoice-linux-x64
           sidecar: mnvoice-linux-x64.sha256
 
@@ -160,22 +154,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # The release tag and the crate version must name the same release: the
-      # updater compares tags, Windows Explorer reads Cargo.toml, and a tag
-      # pushed without the bump ships a binary whose two versions disagree.
-      - name: Verify the tag matches the crate version
+      # One owner for the tag rule (shape + version), shared by all three jobs:
+      # the shapes it accepts are exactly the ones the updater recognizes, and
+      # the version it names must be the crate's. Replaces the three copies of
+      # this check that used to live here.
+      - name: Verify the release tag
         if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          named="${tag#v}"          # drop the leading v
-          named="${named%%-*}"      # drop a platform suffix (-win/-linux/-macos)
-          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-          if [ "$named" != "$crate" ]; then
-            echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
-            exit 1
-          fi
-          echo "tag $tag matches crate version $crate"
+        uses: ./.github/actions/verify-release-tag
+        with:
+          tag: ${{ github.ref_name }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

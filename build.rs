@@ -17,10 +17,13 @@ fn main() {
         println!("cargo:rerun-if-changed=assets/mnvoice.ico");
     }
 
-    // The release tag is the single source of truth for the app version, and
-    // it is emitted raw: platform::version_of_tag is the one definition of
-    // what a tag's version is, so the build cannot disagree with the updater
-    // about where a version ends and a platform suffix begins.
+    // The release tag is the source of truth for the app version, and it is
+    // emitted raw: platform::version_of_tag is the convention for what a tag's
+    // version is, and the publish side keeps to the same shapes (one owner:
+    // .github/actions/verify-release-tag). This build cannot call that code
+    // (separate compilation unit), so the filter below is a deliberate second
+    // spelling of the same rule - stricter than the workflow's, because a
+    // wrong version here is baked into an exe.
     //
     // GITHUB_REF_NAME is the tag name on a tag push ("v0.1.18-win"), but on a
     // branch or pull-request build it is a branch name ("main", "7/merge", and

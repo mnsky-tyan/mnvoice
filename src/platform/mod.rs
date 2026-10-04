@@ -46,12 +46,13 @@ pub mod linux_impl;
 pub mod macos_impl;
 
 /// The version a tag names, with the leading `v` and the platform suffix
-/// removed: "v0.1.15-win" -> "0.1.15". This is the single definition of what
-/// a tag's version is: the binary derives its own baked-in version from it
-/// (see `version` below), so the updater's comparison can never disagree with
-/// the build about where a version ends and a platform suffix begins. Lives in
-/// the platform seam because `update` is Windows-only but the CLI prints the
-/// version on every platform.
+/// removed: "v0.1.15-win" -> "0.1.15". This is the consuming side's
+/// definition of what a tag's version is; the publishing side keeps the same
+/// rule in .github/actions/verify-release-tag. The binary derives its own
+/// baked-in version from it (see `version` below), so the updater's comparison
+/// can never disagree with the build about where a version ends and a platform
+/// suffix begins. Lives in the platform seam because `update` is Windows-only
+/// but the CLI prints the version on every platform.
 pub fn version_of_tag(tag: &str) -> String {
     let bare = tag.strip_prefix('v').unwrap_or(tag);
     bare.split('-').next().unwrap_or(bare).to_string()
