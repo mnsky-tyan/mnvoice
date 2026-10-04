@@ -2,10 +2,11 @@ name: Verify release tag
 description: >-
   The single owner of the tag-shape rule for a release: a tag must be exactly
   vX.Y.Z or vX.Y.Z-<one platform segment>, and the version it names must equal
-  the crate version. The publisher (this workflow) and the consumer (the
-  updater's tag_is_ours) accept exactly this set and nothing else - a tag with
-  a second segment (v0.1.21-rc1-win), or a platform this project does not
-  publish (v0.1.21-android), fails here before anything builds or publishes.
+  the crate version. The publisher (this workflow) accepts exactly that set,
+  and the consumer (the updater's tag_is_ours) recognizes the same shapes in
+  the feed - a tag with a second segment (v0.1.21-rc1-win), or a platform
+  this project does not publish (v0.1.21-android), fails here before anything
+  builds or publishes and is invisible to the updater once it is out.
   Kept in one file on purpose: the rule used to be spelled in the job
   selectors, three bash guards, build.rs and the updater, and the copies
   disagreed on exactly the shapes this action rejects.
