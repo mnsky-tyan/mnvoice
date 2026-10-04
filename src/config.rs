@@ -418,7 +418,10 @@ impl RawFields {
 /// The cancel key to register. `none` means disabled - a zero virtual key,
 /// which the hotkey registration reads as "register nothing" - and anything
 /// else parses as a hotkey, falling back to the documented Escape default
-/// only when the spelling matches nothing.
+/// only when the spelling matches nothing. The live tray/log path takes the
+/// pair straight from `cancel_key_with_display`, so a normal build reaches
+/// this only through its tests; it stays as the public spelling.
+#[allow(dead_code)]
 pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
     cancel_key_with_display(s).0
 }

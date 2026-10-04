@@ -210,7 +210,7 @@ Built-in presets: `hot_pink` (default), `cyan`, `purple`, `blue`, `emerald`, `am
 
 ### Fluid Level
 
-Controls how dense / full the fluid inside the orb appears. `0.0` = wispy mist, `1.0` = fully filled.
+Controls how dense / full the fluid inside the orb appears. `0.05` = wispy mist (the floor; lower values clamp to it), `1.0` = fully filled.
 
 ```ini
 ORB_FLUID_LEVEL=0.75   # or 75%
