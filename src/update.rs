@@ -898,6 +898,34 @@ mod tests {
         }
     }
 
+    /// A tag with a second segment (v0.1.21-rc1-win) or a platform this
+    /// project does not publish (v0.1.21-android) is NOT ours, and the
+    /// release workflow must refuse to build it either: both sides of that
+    /// contract live in one place - .github/actions/verify-release-tag on
+    /// the publish side, this matcher on the consume side - and the shapes
+    /// they accept are the same by review, so the divergence this pins was
+    /// once a real, published-but-invisible release. A pre-release is
+    /// GitHub's pre-release flag on a normal-shaped tag, never a second
+    /// tag segment.
+    #[test]
+    fn a_tag_with_a_second_segment_belong_to_no_release() {
+        for shaped in [
+            "v0.1.21-rc1-win",
+            "v0.1.21-beta-linux",
+            "v0.1.21-android",
+            "v0.1.21-win-installer",
+        ] {
+            assert!(
+                !tag_is_ours(shaped),
+                "{shaped} is not a release shape and must never resolve as ours"
+            );
+        }
+        // The version extractor still reads the version out of such a tag,
+        // which is why the publish side guards on the shape instead: the
+        // version alone cannot tell a real release from a near-miss.
+        assert_eq!(version_of_tag("v0.1.21-rc1-win"), "0.1.21");
+    }
+
     #[test]
     fn the_split_resolves_this_platforms_release_and_derives_its_url() {
         // The newest entry is another platform's release. Resolving by tag

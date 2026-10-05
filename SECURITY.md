@@ -15,7 +15,8 @@
    - mnvoice sends no telemetry, analytics or crash reports anywhere; the Windows updater's GitHub traffic, itemised below, is the only other destination.
 
 3. **Update Traffic** (Windows, `AUTO_UPDATE` or a manual "Check for updates"):
-   - The only other destination is GitHub itself: the public `releases.atom` feed names the newest release, the downloaded asset and its published `SHA256SUMS` file come from that release's own assets. Release bytes are verified against the published checksum before they are swapped in, and nothing but that check ever writes to disk.
+   - The only other destination is GitHub itself: the public `releases.atom` feed names the newest release, the downloaded asset and its published `SHA256SUMS` file come from that release's own assets. Release bytes are verified against the published checksum before they are swapped in.
+   - Beyond that check the updater writes three things to disk, and nothing else: a daily-check timestamp (`%TEMP%\mnvoice-last-update-check`, refreshed on each background check whether or not an update exists), the downloaded image staged beside the executable under a `.new` extension before the swap, and a short-lived helper copy of the executable in `%TEMP%` (`mnvoice-updater-<pid>.exe`) so a half-finished install can still repair itself. No audio, key, or configuration file touches any of them.
 
 4. **Log Files & Diagnostics**:
    - Diagnostic logging (`%TEMP%\mnvoice.log`, Windows tray build) records only application lifecycle events (start, stop, errors) and the final transcribed text snippet. The Linux and macOS binaries print the same lifecycle lines to the terminal and write no log file.

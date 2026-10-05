@@ -142,15 +142,10 @@ fn derive(raw: RawFields) -> Result<Config, String> {
 
     let cancel_input = raw.cancel_key_str.trim().to_string();
     // "none" disables the cancel key outright: a zero virtual key is what the
-    // Windows registration reads as "register nothing".
-    let cancel_key = resolve_cancel_key(&cancel_input);
-    let cancel_actual_str = if cancel_input.is_empty()
-        || (!cancel_input.eq_ignore_ascii_case("none") && parse_hotkey(&cancel_input).is_none())
-    {
-        "Escape".to_string()
-    } else {
-        cancel_input
-    };
+    // Windows registration reads as "register nothing". The pair and the
+    // spelling shown are decided together so the tray/log cannot name a key
+    // different from the one registered.
+    let (cancel_key, cancel_actual_str) = cancel_key_with_display(&cancel_input);
 
     // FILLER_WORDS=0 (default) strips disfluencies; =1 keeps them verbatim.
     // Empty or unset strips, so a typo can never silently re-enable fillers.
@@ -423,12 +418,29 @@ impl RawFields {
 /// The cancel key to register. `none` means disabled - a zero virtual key,
 /// which the hotkey registration reads as "register nothing" - and anything
 /// else parses as a hotkey, falling back to the documented Escape default
-/// only when the spelling matches nothing.
+/// only when the spelling matches nothing. The live tray/log path takes the
+/// pair straight from `cancel_key_with_display`, so a normal build reaches
+/// this only through its tests; it stays as the public spelling.
+#[allow(dead_code)]
 pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
+    cancel_key_with_display(s).0
+}
+
+/// The cancel key to register plus the spelling to show for it, decided in
+/// one place: the display must never advertise a key other than the pair
+/// that was registered, and the fallbacks live here rather than being
+/// re-derived by each caller.
+fn cancel_key_with_display(s: &str) -> ((u32, u32), String) {
+    let s = s.trim();
+    if s.is_empty() {
+        return ((0x4000, 0x1B), "Escape".to_string());
+    }
     if s.eq_ignore_ascii_case("none") {
-        (0, 0)
-    } else {
-        parse_hotkey(s).unwrap_or((0x4000, 0x1B)) // MOD_NOREPEAT, VK_ESCAPE
+        return ((0, 0), s.to_string());
+    }
+    match parse_hotkey(s) {
+        Some(pair) => (pair, s.to_string()),
+        None => ((0x4000, 0x1B), "Escape".to_string()),
     }
 }
 
@@ -583,7 +595,7 @@ mod tests {
 
         // Named but empty counts as present, and empty is off.
         assert_eq!(parse_auto_update_text("AUTO_UPDATE=\n"), Some(String::new()));
-        assert!(!parse_auto_update(&String::new()), "an empty value is off");
+        assert!(!parse_auto_update(""), "an empty value is off");
 
         // Last entry wins, so a later correction overrides an earlier one, and
         // comments, stray spaces, quotes and case do not derail the read.

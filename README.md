@@ -210,7 +210,7 @@ Built-in presets: `hot_pink` (default), `cyan`, `purple`, `blue`, `emerald`, `am
 
 ### Fluid Level
 
-Controls how dense / full the fluid inside the orb appears. `0.0` = wispy mist, `1.0` = fully filled.
+Controls how dense / full the fluid inside the orb appears. `0.05` = wispy mist (the floor; lower values clamp to it), `1.0` = fully filled.
 
 ```ini
 ORB_FLUID_LEVEL=0.75   # or 75%
@@ -268,7 +268,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `MAX_SECONDS` | `120` | Hard recording limit before forced stop |
 | `TRAILING_SPACE` | `1` | Appends a space after each dictation. Only the exact value `0` disables it - any other spelling (`false`, `no`, a typo) leaves it enabled, because the default is on and an unrecognized value must not be able to silently disable it |
 | `ORB_COLOR` | `hot_pink` | Orb fluid color: preset name or `#RRGGBB` |
-| `ORB_FLUID_LEVEL` | `0.75` | Orb fill `0.0`-`1.0`, or `0%`-`100%` |
+| `ORB_FLUID_LEVEL` | `0.75` | Orb fill `0.05`-`1.0`, or `5%`-`100%` (values below the floor clamp to it) |
 
 Delete `mnvoice.env` at any time to fall back to every default above.
 

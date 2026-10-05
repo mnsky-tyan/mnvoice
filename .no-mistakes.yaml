@@ -6,7 +6,7 @@
 commands:
   test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test --locked
 
-# A pull_request runs all three jobs, and each platform's tag push runs that
-# job, all on real runners (release.yml), so the pipeline monitors those
-# instead of inventing its own.
-no_ci: true
+# A pull_request runs all three jobs (windows/linux/macos), and each platform's
+# tag push runs that job, all on real runners (release.yml), so the pipeline
+# waits on those real checks for every PR rather than inventing its own.
+ci_timeout: 30m
