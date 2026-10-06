@@ -380,7 +380,8 @@ mod tests {
     }
 
     #[test]
-    fn the_auth_value_passes_a_prefixed_scheme_through() {        let mut cfg = test_cfg();
+    fn the_auth_value_passes_a_prefixed_scheme_through() {
+        let mut cfg = test_cfg();
         cfg.api_key = "Bearer sk-x".into();
         assert_eq!(auth_value(&cfg), "Bearer sk-x");
         cfg.api_key = "raw-key".into();

@@ -19,9 +19,8 @@ fn main() {
 
     // The release tag is the source of truth for the app version, and it is
     // emitted raw: platform::version_of_tag is the convention for what a tag's
-    // version is, and the publish side owns the release shape in one place -
-    // .github/actions/verify-release-tag, which accepts only vX.Y.Z or
-    // vX.Y.Z-{platform} and checks the version against the crate. This build
+    // version is, and the publish side owns the release shape (and the version
+    // checks) in one place - .github/actions/verify-release-tag. This build
     // cannot call it (separate compilation unit), so the filter below is not
     // that rule and is looser than the workflow's: it only stops a non-tag ref
     // name from being baked into the exe, and any wrong version that survives
