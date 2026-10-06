@@ -30,6 +30,7 @@ jobs:
     # On a pull_request there is no tag to interpret, so all jobs build.
     if: >-
       github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
       endsWith(github.ref_name, '-win') ||
       !contains(github.ref_name, '-')
     runs-on: windows-latest
@@ -53,12 +54,17 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       # The release must not ship a suite that fails on the runner that built
-      # it, so the Windows job runs the same suite the gate runs locally.
+      # it, so the Windows job runs the same suite the gate runs locally. The
+      # target is named explicitly for the same reason the Unix jobs name
+      # theirs: the published asset is x64 by contract, so its architecture
+      # must not follow whatever a future windows-latest image defaults to.
+      # On today's x64 runner this is byte-identical to the untargeted build
+      # (and so to the local gate), which is why it changes nothing now.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --target x86_64-pc-windows-msvc
 
       - name: Build release
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       # The raw exe is the asset the in-app updater downloads, and it is also
       # what a user gets when they would rather not unpack a zip. The shared
@@ -69,7 +75,7 @@ jobs:
       - name: Package artifacts
         uses: ./.github/actions/package-release
         with:
-          binary: target/release/mnvoice.exe
+          binary: target/x86_64-pc-windows-msvc/release/mnvoice.exe
           asset: mnvoice.exe
           sidecar: SHA256SUMS
           zip: mnvoice-windows-x64.zip
@@ -92,6 +98,7 @@ jobs:
   linux:
     if: >-
       github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
       endsWith(github.ref_name, '-linux')
     runs-on: ubuntu-latest
     steps:
@@ -154,6 +161,7 @@ jobs:
   macos:
     if: >-
       github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
       endsWith(github.ref_name, '-macos')
     runs-on: macos-latest
     steps:

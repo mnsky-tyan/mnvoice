@@ -171,9 +171,12 @@ fn dictate(
 
     println!("recording... (Enter to stop)");
 
+    // The CLI has no cancel key (Enter stops and transcribes), so this flag is
+    // never set here; it exists so the REST path takes the same contract as
+    // the tray and the streaming path instead of a special-cased signature.
+    let cancelled = Arc::new(AtomicBool::new(false));
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
-            let cancelled = Arc::new(AtomicBool::new(false));
             let (text, recorded) =
                 transcribe_while_recording(&stop, rx, &capture_done, lines, |stop, rx| {
                     crate::stream::run_stream(cfg, stop, &cancelled, rx)
@@ -189,7 +192,7 @@ fn dictate(
             }
             captured?;
             println!("stopped ({}s of audio)", samples.len() / SAMPLE_RATE as usize);
-            crate::rest::dictate_rest(cfg, &samples)?
+            crate::rest::dictate_rest(cfg, &samples, &cancelled)?
         }
     };
 

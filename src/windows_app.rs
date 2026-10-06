@@ -180,7 +180,7 @@ pub fn main() {
     if finish_pending_install(&args) {
         return;
     }
-    if args.iter().any(|a| a == "--restart") {
+    if args.iter().any(|a| a == update::RESTART_ARG) {
         // Graceful self-heal: terminate any running instance, wait for it to
         // release the global hotkey, then continue starting fresh.
         kill_running_instances();
@@ -572,7 +572,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    let _ = set_tray_tip(hwnd, "mnvoice - idle");
+                    let _ = set_tray_tip(
+                        hwnd,
+                        &idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str())),
+                    );
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription.
@@ -725,7 +728,12 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - idle") };
+    let _ = unsafe {
+        set_tray_tip(
+            app.hwnd,
+            &idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str())),
+        )
+    };
     log("recording cancelled");
 }
 
@@ -743,13 +751,18 @@ fn worker(
     let max_seconds = cfg.max_seconds;
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
-    let capture_done_rx = audio_engine.capture_to_channel(
-        stop_audio,
-        max_seconds,
-        cfg.vad_silence_ms,
-        cfg.vad_rms_threshold,
-        tx,
-    );
+    // The outer Err means the request could not even be queued (the engine is
+    // gone); the original code ignored that case and so does this - it is not
+    // a capture failure the user can act on.
+    let capture_done = audio_engine
+        .capture_to_channel(
+            stop_audio,
+            max_seconds,
+            cfg.vad_silence_ms,
+            cfg.vad_rms_threshold,
+            tx,
+        )
+        .ok();
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
     let mut result = match cfg.protocol {
@@ -774,15 +787,32 @@ fn worker(
             while let Ok(chunk) = rx.recv() {
                 samples.extend_from_slice(&chunk);
             }
-            match rest::dictate_rest(&cfg, &samples) {
-                Ok(text) if text.is_empty() => (false, "No speech detected".into()),
-                Ok(text) => (true, text),
-                Err(e) => (false, e),
+            // A capture failure is reported BEFORE the buffer is uploaded or
+            // typed: the CLI returns on the capture error first, and typing a
+            // transcript the caller is about to disown is the inconsistency
+            // this arm used to have with it. A cancelled session is the same
+            // case - dictate_rest refuses to type it, and there is no reason
+            // to upload it either.
+            let capture_err = capture_done
+                .as_ref()
+                .and_then(|done| match done.recv() {
+                    Ok(Err(e)) => Some(e),
+                    _ => None,
+                });
+            match capture_err {
+                Some(e) => (false, e),
+                None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
+                    Ok(text) if text.is_empty() => (false, "No speech detected".into()),
+                    Ok(text) => (true, text),
+                    Err(e) => (false, e),
+                },
             }
         }
     };
 
-    if let Ok(rx) = capture_done_rx {
+    // Streaming leaves the capture report unread until here; the REST arm above
+    // has already consumed it (a second recv sees a closed channel and no-ops).
+    if let Some(rx) = capture_done {
         if let Ok(Err(e)) = rx.recv() {
             result = (false, e);
         }
@@ -1279,10 +1309,11 @@ fn balloon(title: &str, body: &str) {
     }
 }
 
-/// Relaunch this exe with --restart so a fresh instance takes over, then exit.
+/// Relaunch this exe with the restart argument so a fresh instance takes over,
+/// then exit.
 fn relaunch_for_restart() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(&exe).arg("--restart").spawn();
+        let _ = std::process::Command::new(&exe).arg(update::RESTART_ARG).spawn();
     }
     unsafe { PostQuitMessage(0) };
 }

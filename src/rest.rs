@@ -160,13 +160,27 @@ pub fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (Str
 /// (the tray blocks until the capture closes it, the CLI drains after its
 /// capture thread reports done) - the glue after the drain is the part that
 /// must not drift.
-pub fn dictate_rest(cfg: &Config, samples: &[i16]) -> Result<String, String> {
+///
+/// `cancelled` is honoured here for the same reason `run_stream` honours it:
+/// a cancel must discard the session, so a cancelled recording is neither
+/// uploaded to the provider nor typed. Without this the REST path shipped the
+/// buffer and typed the words while the caller reported "nothing typed".
+pub fn dictate_rest(
+    cfg: &Config,
+    samples: &[i16],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<String, String> {
+    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(String::new());
+    }
     let wav = crate::platform::audio::wav_bytes(samples);
     let raw = transcribe(cfg, &wav)?;
     // No provider here exposes a native filler_words parameter, so
     // disfluencies are removed locally before anything is typed.
     let (text, trailing) = rest_typing(&raw, cfg.strip_fillers, cfg.trailing_space);
-    if !text.is_empty() {
+    // Re-check after the round trip: the user may have cancelled while the
+    // provider was working, and typing then would be the same lie as before.
+    if !text.is_empty() && !cancelled.load(std::sync::atomic::Ordering::SeqCst) {
         crate::platform::input::type_text(&text);
         if trailing {
             crate::platform::input::type_text(" ");
@@ -225,6 +239,41 @@ fn multipart_body(cfg: &Config, wav: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancelled REST session must not upload and must not type. The guard
+    /// runs before any network or injection, so a cancelled call is
+    /// observable here without a provider: it returns an empty transcript
+    /// without ever reaching `transcribe`.
+    #[test]
+    fn a_cancelled_rest_session_neither_uploads_nor_types() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        // A real config whose base URL is unreachable: if the guard ever
+        // stopped short-circuiting, this call would attempt the network and
+        // fail here instead of returning Ok, which is exactly the regression
+        // this test exists to catch.
+        let cfg = Config {
+            protocol: crate::config::Protocol::Rest,
+            api_key: "unused".into(),
+            model: "nova-3".into(),
+            language: "en".into(),
+            base_url: "https://127.0.0.1:1".into(),
+            max_seconds: 120,
+            trailing_space: true,
+            keywords: Vec::new(),
+            orb_color: (1.0, 0.18, 0.58),
+            orb_fluid_level: 0.75,
+            hotkey: (0x4001, 0x20),
+            hotkey_str: "Alt+Space".into(),
+            cancel_key: (0x4000, 0x1B),
+            cancel_key_str: "Escape".into(),
+            vad_silence_ms: 3000,
+            vad_rms_threshold: 400.0,
+            strip_fillers: true,
+            auto_update: false,
+        };
+        let out = dictate_rest(&cfg, &[0i16; 640], &cancelled);
+        assert_eq!(out, Ok(String::new()));
+    }
 
     #[test]
     fn test_parse_json_transcript_basic() {

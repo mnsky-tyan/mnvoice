@@ -46,4 +46,15 @@ runs:
           echo "::error file=Cargo.toml::release tag $tag names version $named, but Cargo.toml declares $crate - bump the crate before tagging"
           exit 1
         fi
-        echo "tag $tag is a release shape naming crate version $crate"
+
+        # The lock file carries the crate version too, and it is the ONE other
+        # file a bump must move with Cargo.toml. v0.1.22 was tagged without it
+        # and every platform's --locked build refused to start, which is a
+        # loud failure but a late one (after toolchain setup, and only while
+        # nobody removes --locked). Catch it here, at the first step.
+        lock="$(awk '/^name = "mnvoice"$/,/^version = /' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+        if [ "$lock" != "$crate" ]; then
+          echo "::error file=Cargo.lock::Cargo.lock has mnvoice at $lock, Cargo.toml declares $crate - update the lock with the bump (cargo update -p mnvoice --offline, or cargo build) before tagging"
+          exit 1
+        fi
+        echo "tag $tag is a release shape naming crate version $crate (lock agrees)"

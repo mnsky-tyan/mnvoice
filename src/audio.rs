@@ -204,9 +204,10 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
         while sample_buf.len() >= 640 {
             let chunk: Vec<i16> = sample_buf.drain(..640).collect();
 
-            // Compute RMS for Voice Activity Detection
-            let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
-            let rms = (sum_sq / chunk.len() as f64).sqrt();
+            // Compute RMS for Voice Activity Detection. The metric is shared
+            // with the Unix engines (platform::audio::rms_of) so a threshold
+            // means the same thing on every platform.
+            let rms = crate::platform::audio::rms_of(&chunk);
 
             // Advance the voice-activity windows by the audio the chunk
             // carries (see platform::audio::audio_ms), not by loop ticks.

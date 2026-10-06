@@ -65,9 +65,13 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
 /// The provider's listen endpoint for this config: base URL from the config
 /// (or the Deepgram default), the model and format parameters, language and
 /// keywords. Pure, so the wire contract is testable without a socket.
-fn listen_url(cfg: &Config) -> String {
-    let (host, port, secure, base_path) = crate::rest::parse_base_url(&cfg.base_url)
-        .unwrap_or_else(|_| ("api.deepgram.com".to_string(), 443, true, String::new()));
+///
+/// An unparseable `BASE_URL` is an error, exactly as it is on the REST path
+/// (`rest::endpoint_url`): the config is only defaulted when it is EMPTY, so a
+/// present-but-broken value must fail closed rather than silently point the
+/// session - and the user's API key - at Deepgram.
+fn listen_url(cfg: &Config) -> Result<String, String> {
+    let (host, port, secure, base_path) = crate::rest::parse_base_url(&cfg.base_url)?;
 
     let prefix = if !base_path.is_empty() {
         base_path
@@ -106,7 +110,7 @@ fn listen_url(cfg: &Config) -> String {
     }
 
     let scheme = if secure { "wss" } else { "ws" };
-    format!("{scheme}://{host}:{port}{path}")
+    Ok(format!("{scheme}://{host}:{port}{path}"))
 }
 
 /// The Authorization header value for this config: Deepgram wants `Token`,
@@ -162,7 +166,7 @@ pub fn run_stream(
     cancelled: &Arc<AtomicBool>,
     rx: Receiver<Vec<i16>>,
 ) -> Result<String, String> {
-    let url = listen_url(cfg);
+    let url = listen_url(cfg)?;
     let auth_value = auth_value(cfg);
     let auth_header = ("Authorization", auth_value.as_str());
 
@@ -339,7 +343,7 @@ mod tests {
         // The wire must name SAMPLE_RATE, not a literal: this is the rate the
         // capture engine resamples to, and a mismatch transcribes as garbage
         // with no error anywhere.
-        let url = listen_url(&test_cfg());
+        let url = listen_url(&test_cfg()).expect("the default base URL parses");
         assert!(
             url.contains(&format!("sample_rate={SAMPLE_RATE}")),
             "the wire must carry the constant rate: {url}"
@@ -351,9 +355,32 @@ mod tests {
         assert!(url.contains("&keyterm=Kubernetes"), "nova-3 uses keyterm: {url}");
     }
 
+    /// A BASE_URL that is present but unparseable must be an error, not a
+    /// silent redirect to Deepgram: the config is only defaulted when it is
+    /// empty, so a typo would otherwise send the audio AND the user's API key
+    /// to a provider they did not ask for. REST already fails closed here.
     #[test]
-    fn the_auth_value_passes_a_prefixed_scheme_through() {
+    fn an_unparseable_base_url_is_refused_not_redirected_to_deepgram() {
         let mut cfg = test_cfg();
+        cfg.base_url = "localhost:8000".into(); // no scheme
+        let err = listen_url(&cfg).expect_err("a scheme-less base URL must not parse");
+        assert!(
+            err.contains("BASE_URL"),
+            "the error must name the config key that is wrong: {err}"
+        );
+        // A well-formed custom endpoint is still honoured verbatim, which is
+        // what makes the refusal above a guard rather than a restriction.
+        let mut cfg = test_cfg();
+        cfg.base_url = "https://stt.corp/deepgram".into();
+        let url = listen_url(&cfg).expect("a well-formed custom base URL parses");
+        assert!(
+            url.starts_with("wss://stt.corp:443/deepgram?"),
+            "a configured path is used verbatim: {url}"
+        );
+    }
+
+    #[test]
+    fn the_auth_value_passes_a_prefixed_scheme_through() {        let mut cfg = test_cfg();
         cfg.api_key = "Bearer sk-x".into();
         assert_eq!(auth_value(&cfg), "Bearer sk-x");
         cfg.api_key = "raw-key".into();

@@ -379,6 +379,15 @@ fn current_exe() -> Result<PathBuf, String> {
 /// single-instance mutex, which the app itself already holds.
 pub const FINISH_UPDATE_ARG: &str = "--finish-update";
 
+/// Argument that asks a freshly swapped-in exe to relaunch itself as the
+/// tray app after the installing process exits.
+///
+/// Both ends live on opposite sides of the update/app boundary (`update.rs`
+/// spawns it, `windows_app::main` parses it), so it is a const for the same
+/// reason `FINISH_UPDATE_ARG` is: a bare literal on both sides means a rename
+/// on one side silently breaks install recovery and the tray Restart item.
+pub const RESTART_ARG: &str = "--restart";
+
 /// Prefix of the recovery helper's copy of this exe in the temp directory.
 ///
 /// The helper needs an image name of its own because it is a second copy of
@@ -432,7 +441,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // --restart hands the hotkey and the single-instance mutex over cleanly, and
     // exiting here releases them from this side too - the new image takes this
     // exe's path, so the old process must not keep running the renamed one.
-    if let Err(e) = Command::new(&exe).arg("--restart").spawn() {
+    if let Err(e) = Command::new(&exe).arg(RESTART_ARG).spawn() {
         let _ = fs::rename(&old, &exe);
         let _ = helper.kill();
         reap_helpers();
@@ -521,7 +530,7 @@ pub fn finish_install(install: Option<&Path>) {
     }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
-    if let Err(e) = Command::new(exe).arg("--restart").spawn() {
+    if let Err(e) = Command::new(exe).arg(RESTART_ARG).spawn() {
         crate::windows_app::log(&format!("update helper: cannot start the new exe ({e})"));
         return;
     }

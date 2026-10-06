@@ -14,14 +14,17 @@
 //   - cpal's `Stream` is not `Send` (it stores its callback as a plain
 //     `dyn FnMut`, which may hold raw pointers), so the stream is created,
 //     played and dropped entirely inside one thread. Device errors therefore
-//     arrive through the done-channel rather than at construction time.
+//     arrive through the done-channel rather than at construction time: open
+//     and start failures return from `run_session` directly, and an error
+//     the device raises mid-session is caught in the error callback, recorded
+//     in a slot the ticker checks, and returned as the session's `Err`.
 //   - Devices rarely capture at 16 kHz mono, and the realtime callback must
 //     never block, so the callback only appends raw samples to a shared
 //     buffer. A 20 ms ticker does the rest: mix to mono, resample to the
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
-use crate::platform::audio::{resample_linear, Audio, SilenceWindows, SAMPLE_RATE};
+use crate::platform::audio::{resample_linear, rms_of, Audio, SilenceWindows, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -87,7 +90,22 @@ fn run_session(
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let err_fn = move |e| eprintln!("mnvoice audio stream error: {e}");
+    // A stream error after `play()` never comes back through a return value -
+    // cpal hands it to the error callback and keeps the ticker running with no
+    // new frames. Storing it here is what lets the loop below end the session
+    // with the real reason instead of running silently to `max_seconds` and
+    // reporting a clean stop (which is what a mid-session unplug used to look
+    // like, unlike the Windows engine, which surfaces the same failure).
+    let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let err_slot = Arc::clone(&stream_error);
+    let err_fn = move |e| {
+        if let Ok(mut slot) = err_slot.lock() {
+            // First error wins: the first is the cause, later ones are noise.
+            if slot.is_none() {
+                *slot = Some(format!("audio stream error: {e}"));
+            }
+        }
+    };
     let cb_buffer = Arc::clone(&buffer);
     let push = move |data: &[f32]| {
         if let Ok(mut buf) = cb_buffer.lock() {
@@ -132,6 +150,14 @@ fn run_session(
     loop {
         thread::sleep(Duration::from_millis(20));
 
+        // A device that failed mid-session stops delivering frames; report it
+        // as the error it is rather than as a silent, successful timeout.
+        if let Ok(slot) = stream_error.lock() {
+            if let Some(e) = slot.as_ref() {
+                return Err(e.clone());
+            }
+        }
+
         // Frames arrive interleaved, so the channels are averaged into mono
         // before resampling. Taking every nth sample of a stereo stream
         // instead would alternate left and right, and the provider would be
@@ -144,12 +170,7 @@ fn run_session(
         // The silence detector reads the same window that goes downstream,
         // so it runs before the hand-off (sending moves the chunk).
         let chunk_len = chunk.len();
-        let rms = if chunk.is_empty() {
-            0.0
-        } else {
-            let sum: f64 = chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum();
-            (sum / chunk.len() as f64).sqrt()
-        };
+        let rms = rms_of(&chunk);
 
         if !chunk.is_empty() && !hand_off(&tx, chunk) {
             return Ok(());

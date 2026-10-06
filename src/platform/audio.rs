@@ -111,6 +111,21 @@ pub fn resample_linear(mono: &[f32], step: f64) -> Vec<i16> {
     out
 }
 
+/// Root-mean-square level of a mono chunk, the value the local VAD compares
+/// against its threshold.
+///
+/// Shared by both engines for the same reason `resample_linear` is: the energy
+/// metric the silence detector depends on must not be spelled twice, or a
+/// threshold tuned against one copy silently means something else on the other
+/// platform. An empty chunk is 0.0 (silence), not NaN.
+pub fn rms_of(samples: &[i16]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / samples.len() as f64).sqrt()
+}
+
 /// A persistent capture engine, armed once at startup.
 ///
 /// On Windows nothing names this trait - the app holds its concrete
@@ -167,6 +182,23 @@ pub fn wav_bytes(samples: &[i16]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The energy metric both engines hand the silence detector: silence is
+    /// 0.0 (never NaN, which would poison every comparison against the
+    /// threshold), full scale is half of i16::MAX for a square wave, and the
+    /// result is the same value the two engines used to compute separately.
+    #[test]
+    fn the_shared_rms_metric_is_defined_for_every_chunk() {
+        assert_eq!(rms_of(&[]), 0.0, "an empty chunk is silence, not NaN");
+        assert_eq!(rms_of(&[0i16; 640]), 0.0);
+        // A constant full-scale signal: RMS of a square wave is its
+        // amplitude, and i16::MAX as f64 rounds to 32767.0.
+        assert!((rms_of(&[i16::MAX; 64]) - 32767.0).abs() < 1.0);
+        // Half amplitude -> half the RMS.
+        assert!((rms_of(&[i16::MAX / 2; 64]) - 16383.5).abs() < 2.0);
+        // Symmetry: negating every sample cannot change the level.
+        assert_eq!(rms_of(&[1000, -2000, 3000]), rms_of(&[-1000, 2000, -3000]));
+    }
 
     /// The windows advance by the audio each chunk carries, not by a literal
     /// tick length: a chunk that ran long still counts the time it covered,
