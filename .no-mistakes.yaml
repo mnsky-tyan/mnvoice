@@ -5,7 +5,16 @@
 # the 9p mount supports no Windows file locking.
 commands:
   test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test --locked
-  test.notes: "The user's live mnvoice.exe runs continuously on this machine (C:\\Users\\tyanw\\bin\\mnvoice.exe). Do NOT kill, terminate, or replace any running mnvoice.exe process, and do not mutate the live bin/mnvoice.exe install. Test behavior using pure unit tests through cargo test --locked."
+
+# The Test step is an agent, so it also reads AGENTS.md. The user's live
+# mnvoice.exe holds the `mnvoice-single-instance` mutex, so it must never be
+# stopped to free it.
+test:
+  notes: >-
+    The user's live mnvoice.exe runs continuously on this machine
+    (C:\Users\tyanw\bin\mnvoice.exe). Do NOT kill, terminate, or replace any
+    running mnvoice.exe process, and do not mutate the live bin/mnvoice.exe
+    install. Test behavior using pure unit tests through cargo test --locked.
 
 # A pull_request runs all three jobs (windows/linux/macos), and each platform's
 # tag push runs that job, all on real runners (release.yml), so the pipeline

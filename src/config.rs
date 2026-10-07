@@ -476,7 +476,7 @@ pub fn parse_color(s: &str) -> (f32, f32, f32) {
         "amber" | "orange" | "gold" => (1.0, 0.62, 0.05),
         "red" | "ruby" => (1.0, 0.22, 0.22),
         "white" | "silver" => (0.95, 0.95, 1.0),
-        "pink" | "hot_pink" | "magenta" => (1.0, 0.18, 0.58),
+        "pink" | "hot_pink" | "magenta" => DEFAULT_ORB_COLOR,
         _ => {
             let hex = s.trim_start_matches('#');
             if hex.len() == 6 {
@@ -585,6 +585,10 @@ mod tests {
         assert_eq!(parse_color("cyan"), (0.0, 0.95, 0.90));
         assert_eq!(parse_color("purple"), (0.68, 0.25, 0.98));
         assert_eq!(parse_color("emerald"), (0.12, 0.85, 0.45));
+        assert_eq!(parse_color("pink"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("hot_pink"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("magenta"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("not-a-color"), DEFAULT_ORB_COLOR);
         let (r, g, b) = parse_color("#FF2D78");
         assert!((r - 1.0).abs() < 0.01);
         assert!((g - 0.176).abs() < 0.01);

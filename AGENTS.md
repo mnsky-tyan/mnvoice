@@ -8,7 +8,7 @@ and direct keyboard event injection.
 
 1. **NEVER KILL THE RUNNING `mnvoice.exe` PROCESS**:
    - The user runs a live `mnvoice.exe` instance continuously on this machine (`C:\Users\tyanw\bin\mnvoice.exe`).
-   - It holds a single-instance named mutex (`Global\mnvoice_single_instance_tyanw`).
+   - It holds a single-instance named mutex (`mnvoice-single-instance`, session-local; see `MUTEX_NAME` in `src/windows_app.rs`).
    - Automated tests and test-step agents MUST NEVER kill, terminate, or replace any running `mnvoice.exe` process.
    - Do NOT touch or overwrite `C:\Users\tyanw\bin\mnvoice.exe` during tests or reviews (only during explicit release/update deployment).
 
