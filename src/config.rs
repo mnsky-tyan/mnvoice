@@ -141,10 +141,10 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         ((0, 0), "none".to_string())
     } else {
         let parsed = parse_hotkey(&hotkey_input);
-        let pair = parsed.unwrap_or((0x0001 | 0x4000, 0x20)); // MOD_ALT | MOD_NOREPEAT, VK_SPACE
+        let pair = parsed.unwrap_or((DEFAULT_HOTKEY_MOD, DEFAULT_HOTKEY_VK));
         let display = match (hotkey_input.is_empty(), parsed) {
             (false, Some(_)) => hotkey_input,
-            _ => "Alt+Space".to_string(),
+            _ => DEFAULT_HOTKEY_STR.to_string(),
         };
         (pair, display)
     };
@@ -491,12 +491,17 @@ pub fn parse_color(s: &str) -> (f32, f32, f32) {
 pub fn parse_fluid_level(s: &str) -> f32 {
     let s = s.trim().trim_end_matches('%');
     if let Ok(val) = s.parse::<f32>() {
-        let val = if val > 1.0 { val / 100.0 } else { val };
-        val.clamp(0.05, 1.0)
-    } else {
-        0.75 // default
+        if val.is_finite() {
+            let val = if val > 1.0 { val / 100.0 } else { val };
+            return val.clamp(0.05, 1.0);
+        }
     }
+    0.75 // default
 }
+
+pub const DEFAULT_HOTKEY_MOD: u32 = 0x0001 | 0x4000; // MOD_ALT | MOD_NOREPEAT
+pub const DEFAULT_HOTKEY_VK: u32 = 0x20; // VK_SPACE
+pub const DEFAULT_HOTKEY_STR: &str = "Alt+Space";
 
 /// Parses a hotkey string like "Alt+Space", "Ctrl+Shift+D", "Win+Space", "F8", "Escape" into (modifiers, vk).
 pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
@@ -586,6 +591,8 @@ mod tests {
         assert_eq!(parse_fluid_level("1.0"), 1.0);
         assert_eq!(parse_fluid_level("150%"), 1.0);
         assert_eq!(parse_fluid_level("0.01"), 0.05);
+        assert_eq!(parse_fluid_level("nan"), 0.75);
+        assert_eq!(parse_fluid_level("NaN"), 0.75);
     }
 
     #[test]

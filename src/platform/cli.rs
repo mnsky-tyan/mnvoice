@@ -194,7 +194,7 @@ fn dictate(
                 transcribe_while_recording(&stop, rx, &capture_done, lines, |stop, rx| {
                     crate::stream::run_stream(cfg, stop, &cancelled, rx)
                 });
-            println!("stopped ({}s of audio)", recorded.as_secs());
+            println!("stopped ({}s elapsed)", recorded.as_secs());
             text?
         }
         config::Protocol::Rest => {

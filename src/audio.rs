@@ -306,8 +306,12 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
         ));
     }
 
-    let frame = channels * sample_bytes;
-    if frame == 0 || raw.len() % frame != 0 {
+    let frame = if format.nBlockAlign > 0 {
+        format.nBlockAlign as usize
+    } else {
+        channels * sample_bytes
+    };
+    if frame < channels * sample_bytes || raw.len() % frame != 0 {
         return Err("unexpected capture buffer size".into());
     }
     let frames = raw.len() / frame;
@@ -422,6 +426,20 @@ mod tests {
             "32-bit PCM sample decoded as {} (expected about {expected})",
             out[0]
         );
+    }
+
+    #[test]
+    fn block_align_sets_frame_stride_when_provided() {
+        let f = WAVEFORMATEX {
+            nChannels: 2,
+            nSamplesPerSec: SAMPLE_RATE,
+            wBitsPerSample: 32,
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nBlockAlign: 8, // 2 channels * 4 bytes
+            ..Default::default()
+        };
+        let raw = vec![0u8; 8 * 10]; // 10 frames
+        assert!(convert_mix(&raw, &f, SampleKind::Float).is_ok());
     }
 
     /// `sample_kind` reads the sub-format GUID for WAVE_FORMAT_EXTENSIBLE, so a

@@ -37,9 +37,6 @@ pub struct CpalAudio;
 
 impl CpalAudio {
     pub fn new() -> Result<Self, String> {
-        // Touching the host once at startup warms the audio stack, which is
-        // as close to the standby trick as cpal allows.
-        let _ = cpal::default_host();
         Ok(Self)
     }
 }

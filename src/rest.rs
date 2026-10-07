@@ -198,13 +198,31 @@ pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> 
         Some((a, p)) => (a, format!("/{}", p.trim_start_matches('/'))),
         None => (rest, String::new()),
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() => (
-            h.to_string(),
-            p.parse::<u16>()
-                .map_err(|_| format!("bad port in BASE_URL: {url}"))?,
-        ),
-        _ => (authority.to_string(), if secure { 443 } else { 80 }),
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .ok_or_else(|| format!("unclosed IPv6 bracket in BASE_URL: {url}"))?;
+        let ip = &authority[1..end];
+        let after = &authority[end + 1..];
+        let port = if let Some(port_str) = after.strip_prefix(':') {
+            port_str
+                .parse::<u16>()
+                .map_err(|_| format!("bad port in BASE_URL: {url}"))?
+        } else if secure {
+            443
+        } else {
+            80
+        };
+        (ip.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => (
+                h.to_string(),
+                p.parse::<u16>()
+                    .map_err(|_| format!("bad port in BASE_URL: {url}"))?,
+            ),
+            _ => (authority.to_string(), if secure { 443 } else { 80 }),
+        }
     };
     Ok((host, port, secure, path))
 }
@@ -306,6 +324,20 @@ mod tests {
         assert_eq!(port, 8000);
         assert!(!secure);
         assert_eq!(path, "");
+
+        // IPv6 literal with port and path
+        let (host, port, secure, path) = parse_base_url("https://[::1]:8443/custom").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8443);
+        assert!(secure);
+        assert_eq!(path, "/custom");
+
+        // IPv6 literal without explicit port
+        let (host, port, secure, path) = parse_base_url("http://[fe80::1]/").unwrap();
+        assert_eq!(host, "fe80::1");
+        assert_eq!(port, 80);
+        assert!(!secure);
+        assert_eq!(path, "/");
     }
 
     #[test]
