@@ -110,7 +110,15 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
     }
 
     let scheme = if secure { "wss" } else { "ws" };
-    Ok(format!("{scheme}://{host}:{port}{path}"))
+    // parse_base_url returns IPv6 literals unbracketed (WinHttpConnect wants
+    // them that way); a URL authority must bracket them again or the URI is
+    // invalid.
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!("{scheme}://{authority}:{port}{path}"))
 }
 
 /// The Authorization header value for this config: Deepgram wants `Token`,
@@ -358,6 +366,20 @@ mod tests {
             "{url}"
         );
         assert!(url.contains("&keyterm=Kubernetes"), "nova-3 uses keyterm: {url}");
+    }
+
+    #[test]
+    fn an_ipv6_base_url_is_rebracketed_in_the_listen_url() {
+        // parse_base_url yields the bare literal, which is what WinHTTP wants,
+        // but a URL authority must bracket it: the Unix transport rejects the
+        // unbracketed form, so the session never connects.
+        let mut cfg = test_cfg();
+        cfg.base_url = "https://[::1]:8443".into();
+        let url = listen_url(&cfg).expect("a bracketed IPv6 base URL parses");
+        assert!(
+            url.starts_with("wss://[::1]:8443/v1/listen?"),
+            "the authority must bracket the IPv6 literal: {url}"
+        );
     }
 
     /// A BASE_URL that is present but unparseable must be an error, not a
