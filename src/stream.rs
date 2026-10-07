@@ -65,9 +65,13 @@ pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
 /// The provider's listen endpoint for this config: base URL from the config
 /// (or the Deepgram default), the model and format parameters, language and
 /// keywords. Pure, so the wire contract is testable without a socket.
-fn listen_url(cfg: &Config) -> String {
-    let (host, port, secure, base_path) = crate::rest::parse_base_url(&cfg.base_url)
-        .unwrap_or_else(|_| ("api.deepgram.com".to_string(), 443, true, String::new()));
+///
+/// An unparseable `BASE_URL` is an error, exactly as it is on the REST path
+/// (`rest::endpoint_url`): the config is only defaulted when it is EMPTY, so a
+/// present-but-broken value must fail closed rather than silently point the
+/// session - and the user's API key - at Deepgram.
+fn listen_url(cfg: &Config) -> Result<String, String> {
+    let (host, port, secure, base_path) = crate::rest::parse_base_url(&cfg.base_url)?;
 
     let prefix = if !base_path.is_empty() {
         base_path
@@ -106,7 +110,15 @@ fn listen_url(cfg: &Config) -> String {
     }
 
     let scheme = if secure { "wss" } else { "ws" };
-    format!("{scheme}://{host}:{port}{path}")
+    // parse_base_url returns IPv6 literals unbracketed (WinHttpConnect wants
+    // them that way); a URL authority must bracket them again or the URI is
+    // invalid.
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!("{scheme}://{authority}:{port}{path}"))
 }
 
 /// The Authorization header value for this config: Deepgram wants `Token`,
@@ -162,7 +174,7 @@ pub fn run_stream(
     cancelled: &Arc<AtomicBool>,
     rx: Receiver<Vec<i16>>,
 ) -> Result<String, String> {
-    let url = listen_url(cfg);
+    let url = listen_url(cfg)?;
     let auth_value = auth_value(cfg);
     let auth_header = ("Authorization", auth_value.as_str());
 
@@ -271,9 +283,14 @@ pub fn run_stream(
         }
     }
 
-    // Drain all remaining audio packets accumulated in rx before closing
-    while let Ok(packet_i16) = rx.try_recv() {
-        let _ = ws.send_binary(&pcm_bytes(&packet_i16));
+    // Drain all remaining audio packets accumulated in rx before closing -
+    // unless the session was cancelled: a cancel is a hard discard (the same
+    // rule dictate_rest enforces before its upload), so the queued tail must
+    // not be shipped to the provider after the user said stop.
+    if !cancelled.load(Ordering::SeqCst) {
+        while let Ok(packet_i16) = rx.try_recv() {
+            let _ = ws.send_binary(&pcm_bytes(&packet_i16));
+        }
     }
 
     // Signal close to Deepgram
@@ -339,7 +356,7 @@ mod tests {
         // The wire must name SAMPLE_RATE, not a literal: this is the rate the
         // capture engine resamples to, and a mismatch transcribes as garbage
         // with no error anywhere.
-        let url = listen_url(&test_cfg());
+        let url = listen_url(&test_cfg()).expect("the default base URL parses");
         assert!(
             url.contains(&format!("sample_rate={SAMPLE_RATE}")),
             "the wire must carry the constant rate: {url}"
@@ -349,6 +366,61 @@ mod tests {
             "{url}"
         );
         assert!(url.contains("&keyterm=Kubernetes"), "nova-3 uses keyterm: {url}");
+    }
+
+    #[test]
+    fn an_ipv6_base_url_is_rebracketed_in_the_listen_url() {
+        // parse_base_url yields the bare literal, which is what WinHTTP wants,
+        // but a URL authority must bracket it: the Unix transport rejects the
+        // unbracketed form, so the session never connects.
+        let mut cfg = test_cfg();
+        cfg.base_url = "https://[::1]:8443".into();
+        let url = listen_url(&cfg).expect("a bracketed IPv6 base URL parses");
+        // Drive the real Unix consumer of this string - the same
+        // `IntoClientRequest` the transport calls at unix_http.rs:210 - rather
+        // than only matching a prefix: the fix exists because that parser
+        // rejects an unbracketed authority, so the parse succeeding here IS
+        // the behavior under test. The parser lives behind the Unix target
+        // gate, so this arm runs where it matters (Linux/macOS) and on Windows
+        // the prefix check still pins the shape.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use tungstenite::client::IntoClientRequest;
+            let request = url
+                .as_str()
+                .into_client_request()
+                .unwrap_or_else(|e| panic!("the Unix transport must accept {url}: {e}"));
+            assert_eq!(request.uri().host(), Some("[::1]"));
+            assert_eq!(request.uri().port_u16(), Some(8443));
+        }
+        assert!(
+            url.starts_with("wss://[::1]:8443/v1/listen?"),
+            "the authority must bracket the IPv6 literal: {url}"
+        );
+    }
+
+    /// A BASE_URL that is present but unparseable must be an error, not a
+    /// silent redirect to Deepgram: the config is only defaulted when it is
+    /// empty, so a typo would otherwise send the audio AND the user's API key
+    /// to a provider they did not ask for. REST already fails closed here.
+    #[test]
+    fn an_unparseable_base_url_is_refused_not_redirected_to_deepgram() {
+        let mut cfg = test_cfg();
+        cfg.base_url = "localhost:8000".into(); // no scheme
+        let err = listen_url(&cfg).expect_err("a scheme-less base URL must not parse");
+        assert!(
+            err.contains("BASE_URL"),
+            "the error must name the config key that is wrong: {err}"
+        );
+        // A well-formed custom endpoint is still honoured verbatim, which is
+        // what makes the refusal above a guard rather than a restriction.
+        let mut cfg = test_cfg();
+        cfg.base_url = "https://stt.corp/deepgram".into();
+        let url = listen_url(&cfg).expect("a well-formed custom base URL parses");
+        assert!(
+            url.starts_with("wss://stt.corp:443/deepgram?"),
+            "a configured path is used verbatim: {url}"
+        );
     }
 
     #[test]

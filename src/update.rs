@@ -136,6 +136,14 @@ fn asset_name_from_url(url: &str) -> Result<String, String> {
 /// not hex, and the asset it names - the exe, in the current layout - would read
 /// as unlisted. The producer this reads does not emit one, so this is about the
 /// format being total rather than about any release that exists.
+///
+/// The producer is .github/actions/package-release/action.yml: its Windows
+/// branch writes exactly this format by hand (lowercase hex, two spaces, LF,
+/// no BOM) and its Unix branch wraps `sha256sum`/`shasum -a 256` in text mode.
+/// The two sides of this contract are pinned by tests against literals, not
+/// against a file the action wrote - so a change to either side must find and
+/// re-justify the other. This comment is the pointer that makes that search
+/// possible.
 fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
     let sums = sums.strip_prefix('\u{feff}').unwrap_or(sums);
     for line in sums.lines() {
@@ -379,6 +387,15 @@ fn current_exe() -> Result<PathBuf, String> {
 /// single-instance mutex, which the app itself already holds.
 pub const FINISH_UPDATE_ARG: &str = "--finish-update";
 
+/// Argument that asks a freshly swapped-in exe to relaunch itself as the
+/// tray app after the installing process exits.
+///
+/// Both ends live on opposite sides of the update/app boundary (`update.rs`
+/// spawns it, `windows_app::main` parses it), so it is a const for the same
+/// reason `FINISH_UPDATE_ARG` is: a bare literal on both sides means a rename
+/// on one side silently breaks install recovery and the tray Restart item.
+pub const RESTART_ARG: &str = "--restart";
+
 /// Prefix of the recovery helper's copy of this exe in the temp directory.
 ///
 /// The helper needs an image name of its own because it is a second copy of
@@ -432,7 +449,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // --restart hands the hotkey and the single-instance mutex over cleanly, and
     // exiting here releases them from this side too - the new image takes this
     // exe's path, so the old process must not keep running the renamed one.
-    if let Err(e) = Command::new(&exe).arg("--restart").spawn() {
+    if let Err(e) = Command::new(&exe).arg(RESTART_ARG).spawn() {
         let _ = fs::rename(&old, &exe);
         let _ = helper.kill();
         reap_helpers();
@@ -521,7 +538,7 @@ pub fn finish_install(install: Option<&Path>) {
     }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
-    if let Err(e) = Command::new(exe).arg("--restart").spawn() {
+    if let Err(e) = Command::new(exe).arg(RESTART_ARG).spawn() {
         crate::windows_app::log(&format!("update helper: cannot start the new exe ({e})"));
         return;
     }

@@ -14,9 +14,9 @@
 //     it is pinned behind a boundary with tests that assert the redirect
 //     contract the updater depends on.
 //   - `audio`: the standby-engine latency property has to survive the port.
-//   - `input`: Windows SendInput, X11 XTest and macOS CGEventTap differ in what
-//     they can do at all (macOS needs a permission grant; Wayland needs a
-//     portal), not just in how they are called.
+//   - `input`: Windows SendInput, X11 XTest and macOS CoreGraphics events
+//     differ in what they can do at all (macOS needs a permission grant;
+//     Wayland needs a portal), not just in how they are called.
 //
 // Everything else - the tray, global hotkeys, the single-instance guard, the
 // autostart entry, the orb's window plumbing - stays a per-platform module
@@ -25,7 +25,7 @@
 // own sake.
 
 pub mod audio;
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod cli;
 pub mod http;
 pub mod input;

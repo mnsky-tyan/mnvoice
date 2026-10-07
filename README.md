@@ -122,7 +122,8 @@ system tray icon
     -> Open config          (opens mnvoice.env in Notepad)
     -> Open keywords        (opens keywords.txt in Notepad)
     -> Restart              (frees the hotkey and starts fresh)
-    -> Stop & transcribe
+    -> Dictate              (starts a dictation; "Stop & transcribe" while recording,
+                             "Transcribing..." disabled while a session finishes)
     -> Exit
 ```
 
@@ -186,13 +187,15 @@ CANCEL_KEY=Escape
 ```
 
 Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win` (also accepted: `Option`, `Control`, `Windows`, `Super`, `Cmd`)  
-Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`/`Caps`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`
+Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`/`Caps`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`  
+The word `none` is how either key is disabled: with `HOTKEY=none` no toggle key is registered and dictation moves to the tray menu's **Dictate** item; with `CANCEL_KEY=none` there is no way to discard a recording mid-speech (the CLI has no cancel key on any platform). These settings need a loaded config - if the config itself fails to load (a missing API key, for example), the defaults apply instead.
 
 Examples:
 ```ini
 HOTKEY=Ctrl+Shift+D
 HOTKEY=F9
 HOTKEY=Win+Space
+HOTKEY=none
 CANCEL_KEY=none
 ```
 
@@ -258,7 +261,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `MODEL` | `nova-3` / `whisper-large-v3-turbo` | Model identifier (default depends on `PROTOCOL`) |
 | `BASE_URL` | provider default | Custom endpoint, port, or reverse proxy |
 | `LANGUAGE` | `en` | Language code, or `auto` for detection |
-| `HOTKEY` | `Alt+Space` | Trigger hotkey. See Keybindings above for syntax. |
+| `HOTKEY` | `Alt+Space` | Trigger hotkey. See Keybindings above for syntax; `none` disables it (tray menu only). |
 | `CANCEL_KEY` | `Escape` | Discard the recording mid-speech (`none` to disable) |
 | `FILLER_WORDS` | `0` | `0` strips "uh"/"um"/"erm", `1` keeps them verbatim |
 | `KEYWORDS` | - | Comma-separated vocabulary hints. `keywords.txt` beside the exe is auto-loaded too. |

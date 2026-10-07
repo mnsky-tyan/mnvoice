@@ -40,7 +40,10 @@ struct X11Injector {
 
 impl Injector for X11Injector {
     fn type_text(&self, text: &str) -> Result<(), String> {
-        let mut slot = self.enigo.lock().unwrap();
+        let mut slot = self
+            .enigo
+            .lock()
+            .map_err(|_| "text injection lock poisoned".to_string())?;
         if slot.is_none() {
             *slot = Some(Enigo::new(&Settings::default()).map_err(|e| {
                 format!("cannot initialise input injection ({e}); is an X display available?")

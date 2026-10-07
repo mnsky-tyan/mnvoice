@@ -9,13 +9,49 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows::core::GUID;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 
+const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
+    GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+/// How the mix format encodes one sample, resolved from the format tag alone
+/// (for `WAVE_FORMAT_EXTENSIBLE`, from its sub-format GUID). The bit width
+/// never decides this: a 32-bit stream is plain integer PCM unless the tag
+/// says float, and treating width as the tiebreaker silently returned
+/// `f32::from_le_bytes` for integer samples.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SampleKind {
+    Int,
+    Float,
+}
+
+fn sample_kind(format: &WAVEFORMATEX, mix_ptr: *const WAVEFORMATEX) -> Result<SampleKind, String> {
+    match format.wFormatTag {
+        WAVE_FORMAT_PCM => Ok(SampleKind::Int),
+        WAVE_FORMAT_IEEE_FLOAT => Ok(SampleKind::Float),
+        WAVE_FORMAT_EXTENSIBLE => {
+            // The sub-format GUID lives after the base WAVEFORMATEX; GetMixFormat
+            // allocates the full WAVEFORMATEXTENSIBLE, so the pointer is wide
+            // enough to read it.
+            let ext = unsafe { &*(mix_ptr as *const WAVEFORMATEXTENSIBLE) };
+            match ext.SubFormat {
+                KSDATAFORMAT_SUBTYPE_PCM => Ok(SampleKind::Int),
+                KSDATAFORMAT_SUBTYPE_IEEE_FLOAT => Ok(SampleKind::Float),
+                other => Err(format!("unsupported mix sub-format: {other:?}")),
+            }
+        }
+        other => Err(format!("unsupported mix format tag: {other}")),
+    }
+}
 
 pub use crate::platform::audio::SAMPLE_RATE;
-use crate::platform::audio::{resample_linear, SilenceWindows};
+use crate::platform::audio::{resample_linear, SilenceWindows, I16_SCALE};
 
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
@@ -67,6 +103,7 @@ struct EngineState {
     client: IAudioClient,
     capture_client: IAudioCaptureClient,
     format: WAVEFORMATEX,
+    kind: SampleKind,
     mix_ptr: *mut WAVEFORMATEX,
 }
 
@@ -95,6 +132,13 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
         .GetMixFormat()
         .map_err(|e| format!("GetMixFormat ({e})"))?;
     let format = *mix_ptr;
+    let kind = match sample_kind(&format, mix_ptr) {
+        Ok(kind) => kind,
+        Err(e) => {
+            unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
+            return Err(e);
+        }
+    };
 
     client
         .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None)
@@ -108,6 +152,7 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
         client,
         capture_client,
         format,
+        kind,
         mix_ptr,
     })
 }
@@ -174,7 +219,7 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result.
-            let converted = convert_mix(bytes, &engine.format);
+            let converted = convert_mix(bytes, &engine.format, engine.kind);
             engine
                 .capture_client
                 .ReleaseBuffer(frames)
@@ -204,9 +249,10 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
         while sample_buf.len() >= 640 {
             let chunk: Vec<i16> = sample_buf.drain(..640).collect();
 
-            // Compute RMS for Voice Activity Detection
-            let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
-            let rms = (sum_sq / chunk.len() as f64).sqrt();
+            // Compute RMS for Voice Activity Detection. The metric is shared
+            // with the Unix engines (platform::audio::rms_of) so a threshold
+            // means the same thing on every platform.
+            let rms = crate::platform::audio::rms_of(&chunk);
 
             // Advance the voice-activity windows by the audio the chunk
             // carries (see platform::audio::audio_ms), not by loop ticks.
@@ -232,18 +278,40 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     Ok(())
 }
 
-fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
+fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Vec<i16>, String> {
     let channels = format.nChannels as usize;
     let rate = format.nSamplesPerSec as usize;
     let bits = format.wBitsPerSample as usize;
-    let is_float = format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT as u16 || bits == 32;
+    let is_float = kind == SampleKind::Float;
     let sample_bytes = bits / 8;
     if sample_bytes == 0 || channels == 0 {
         return Err("invalid mix format".into());
     }
 
-    let frame = channels * sample_bytes;
-    if frame == 0 || raw.len() % frame != 0 {
+    // The read width below MUST be derived from sample_bytes, not assumed:
+    // the catch-all used to read four bytes for every non-16-bit format, so a
+    // 24-bit or 8-bit mix (or 16-bit float) read past the buffer and panicked
+    // on the last sample - and with the release profile's panic = "abort"
+    // that is the whole process dying, not one capture thread. Anything this
+    // function cannot represent exactly is an Err, never a best-effort read.
+    let supported = if is_float {
+        sample_bytes == 4
+    } else {
+        sample_bytes == 2 || sample_bytes == 4
+    };
+    if !supported {
+        return Err(format!(
+            "unsupported mix format: {bits}-bit {} (expected 16-bit PCM, 32-bit PCM, or float32)",
+            if is_float { "float" } else { "PCM" }
+        ));
+    }
+
+    let frame = if format.nBlockAlign > 0 {
+        format.nBlockAlign as usize
+    } else {
+        channels * sample_bytes
+    };
+    if frame < channels * sample_bytes || raw.len() % frame != 0 {
         return Err("unexpected capture buffer size".into());
     }
     let frames = raw.len() / frame;
@@ -257,7 +325,7 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
             let v = if is_float {
                 f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]])
             } else if sample_bytes == 2 {
-                i16::from_le_bytes([raw[off], raw[off + 1]]) as f32 / 32768.0
+                i16::from_le_bytes([raw[off], raw[off + 1]]) as f32 / I16_SCALE
             } else {
                 i32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]) as f32
                     / 2147483648.0
@@ -269,4 +337,138 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
 
     let step = rate as f64 / SAMPLE_RATE as f64;
     Ok(resample_linear(&mono, step))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mix format this converter cannot represent must be an Err, never a
+    /// best-effort read: the old catch-all read four bytes for every
+    /// non-16-bit format, so a 24-bit or 8-bit mix panicked on the last
+    /// sample - and with the release profile's panic = "abort" that is the
+    /// whole process dying. WAVEFORMATEX is field-for-field what WASAPI
+    /// hands over; only the fields convert_mix reads are populated.
+    #[test]
+    fn an_unsupported_mix_width_is_an_err_not_an_overread() {
+        let mut f = WAVEFORMATEX {
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            ..Default::default()
+        };
+
+        // 24-bit PCM: sample_bytes == 3, not float. The old code read four
+        // bytes per three-byte sample and panicked at the buffer end.
+        f.wBitsPerSample = 24;
+        f.wFormatTag = WAVE_FORMAT_PCM;
+        let raw = vec![0u8; 3 * 2 * 10]; // 10 stereo 24-bit frames
+        assert!(
+            convert_mix(&raw, &f, SampleKind::Int).is_err(),
+            "24-bit must be refused"
+        );
+
+        // 8-bit PCM: same catch-all, same over-read.
+        f.wBitsPerSample = 8;
+        let raw = vec![0u8; 2 * 10]; // 10 stereo 8-bit frames
+        assert!(
+            convert_mix(&raw, &f, SampleKind::Int).is_err(),
+            "8-bit must be refused"
+        );
+
+        // 16-bit float: is_float but sample_bytes == 2 - the old code read
+        // four bytes per two-byte sample.
+        f.wBitsPerSample = 16;
+        f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        let raw = vec![0u8; 2 * 2 * 10];
+        assert!(
+            convert_mix(&raw, &f, SampleKind::Float).is_err(),
+            "16-bit float must be refused"
+        );
+
+        // The supported formats still convert: 16-bit PCM and float32.
+        f.wFormatTag = WAVE_FORMAT_PCM;
+        f.wBitsPerSample = 16;
+        let raw = vec![0u8; 2 * 2 * 10];
+        assert!(
+            convert_mix(&raw, &f, SampleKind::Int).is_ok(),
+            "16-bit PCM must convert"
+        );
+        f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        f.wBitsPerSample = 32;
+        let raw = vec![0u8; 4 * 2 * 10];
+        assert!(
+            convert_mix(&raw, &f, SampleKind::Float).is_ok(),
+            "float32 must convert"
+        );
+    }
+
+    /// The sample kind comes from the format tag, never from the bit width: a
+    /// 32-bit PCM mix decodes as integer, exactly as its guard advertises. The
+    /// old `bits == 32` heuristic forced every 32-bit stream onto the float
+    /// decoder, so integer PCM 0x3f800000 (about +0.496 full scale) came back
+    /// as 1.0 with no error.
+    #[test]
+    fn a_32bit_pcm_mix_decodes_as_integer_not_float() {
+        let f = WAVEFORMATEX {
+            nChannels: 1,
+            nSamplesPerSec: SAMPLE_RATE,
+            wBitsPerSample: 32,
+            wFormatTag: WAVE_FORMAT_PCM,
+            ..Default::default()
+        };
+
+        let raw = [0x00u8, 0x00, 0x80, 0x3f];
+        let out = convert_mix(&raw, &f, SampleKind::Int).expect("32-bit PCM must convert");
+        assert_eq!(out.len(), 1);
+        let expected = 0x3f80_0000i32 as f32 / 2147483648.0 * i16::MAX as f32;
+        assert!(
+            (out[0] as f32 - expected).abs() < 1.0,
+            "32-bit PCM sample decoded as {} (expected about {expected})",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn block_align_sets_frame_stride_when_provided() {
+        let f = WAVEFORMATEX {
+            nChannels: 2,
+            nSamplesPerSec: SAMPLE_RATE,
+            wBitsPerSample: 32,
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nBlockAlign: 8, // 2 channels * 4 bytes
+            ..Default::default()
+        };
+        let raw = vec![0u8; 8 * 10]; // 10 frames
+        assert!(convert_mix(&raw, &f, SampleKind::Float).is_ok());
+    }
+
+    /// `sample_kind` reads the sub-format GUID for WAVE_FORMAT_EXTENSIBLE, so a
+    /// float mix delivered in that shape is not mistaken for integer PCM, and
+    /// an unknown sub-format is an Err rather than a best-effort read.
+    #[test]
+    fn extensible_mixes_resolve_their_sub_format() {
+        let mut ext = WAVEFORMATEXTENSIBLE::default();
+        ext.Format.nChannels = 2;
+        ext.Format.nSamplesPerSec = 48000;
+        ext.Format.wBitsPerSample = 32;
+        ext.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+
+        ext.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        assert_eq!(
+            sample_kind(&ext.Format, &ext as *const _ as *const WAVEFORMATEX).unwrap(),
+            SampleKind::Float
+        );
+
+        ext.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        assert_eq!(
+            sample_kind(&ext.Format, &ext as *const _ as *const WAVEFORMATEX).unwrap(),
+            SampleKind::Int
+        );
+
+        ext.SubFormat = GUID::from_u128(0xdead_beef_dead_beef_dead_beef_dead_beef);
+        assert!(
+            sample_kind(&ext.Format, &ext as *const _ as *const WAVEFORMATEX).is_err(),
+            "unknown sub-format must be refused"
+        );
+    }
 }

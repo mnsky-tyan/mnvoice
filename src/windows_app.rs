@@ -24,7 +24,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
@@ -35,6 +35,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_WORKER: u32 = WM_APP + 2;
+
+pub const NO_SPEECH: &str = "No speech detected";
 
 /// Resource id of the icon embedded by build.rs via assets/mnvoice.ico.
 const IDI_APP: PCWSTR = PCWSTR(1 as *const u16);
@@ -54,7 +56,7 @@ unsafe fn app_icon() -> HICON {
 
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_ESC: i32 = 2;
-const IDM_STOP: usize = 1;
+const IDM_DICTATE: usize = 1;
 const IDM_EXIT: usize = 2;
 const IDM_STARTUP: usize = 3;
 const IDM_RESTART: usize = 4;
@@ -126,11 +128,36 @@ struct App {
     hwnd: HWND,
     state: State,
     config: Option<config::Config>,
+    /// This session's flags. FRESH ARCS PER SESSION, never reset in place: a
+    /// stale worker from a cancelled session holds its own clones, so its
+    /// cancelled flag stays set forever (its streaming flush can never type
+    /// into a newer session) and its outcome lands in an orphaned slot the UI
+    /// handler skips by construction. Resetting shared flags instead let a
+    /// cancel-then-quick-restart type the old session's leftover words into
+    /// the new one and let the stale worker tear the new session's UI down.
     stop: Arc<AtomicBool>,
     /// Set by the cancel key. Once set, the streaming reader types nothing
     /// further and the final flush is skipped, so a cancel really discards.
     cancelled: Arc<AtomicBool>,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
+    /// Monotonically increasing session generation id. Passed via WPARAM in
+    /// WM_APP_WORKER so messages from cancelled/superseded sessions are
+    /// rejected by the window procedure before touching state.
+    session_id: usize,
+    /// The toggle hotkey's display spelling, computed once at startup (the
+    /// "none" disabled spelling, the configured one, or the default when the
+    /// config did not load). Every tip names this same value: deriving the
+    /// spelling from `config` at the call sites made a config that failed to
+    /// load fall back to the default text while the key actually registered
+    /// (or failed to) was a different one.
+    hotkey_str: String,
+    /// Whether the toggle hotkey is available as configured: true when it
+    /// registered, and true for HOTKEY=none (disabled on purpose is the
+    /// configured state - nothing is missing). False means registration
+    /// FAILED, and the tip must keep saying so: the first idle tip used to
+    /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
+    /// dictate" for a key that does nothing.
+    hotkey_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -180,7 +207,7 @@ pub fn main() {
     if finish_pending_install(&args) {
         return;
     }
-    if args.iter().any(|a| a == "--restart") {
+    if args.iter().any(|a| a == update::RESTART_ARG) {
         // Graceful self-heal: terminate any running instance, wait for it to
         // release the global hotkey, then continue starting fresh.
         kill_running_instances();
@@ -238,18 +265,21 @@ pub fn main() {
         // so the window, the hotkey and the tray never wait on its spawns.
         thread::spawn(migrate_autostart);
 
-        let Some(hwnd) = create_tray_window(hinstance, config, audio_engine) else {
+        let Some(hwnd) = create_tray_window(hinstance, config, hk_str.clone(), audio_engine) else {
             return;
         };
-        let hotkey_ok = register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str);
-        if hotkey_ok {
-            add_tray(hwnd, &format!("mnvoice - idle ({hk_str})"));
+        // HOTKEY=none disables the toggle registration entirely; the tray
+        // menu's Dictate item is then the only start and stop control (vk == 0
+        // is the disabled sentinel). A disabled control is not a failed one,
+        // so the tip may still say where dictation moved.
+        let hotkey_ok = if hk_vk == 0 {
+            log("hotkey disabled (HOTKEY=none); use the tray menu to dictate");
+            true
         } else {
-            add_tray(
-                hwnd,
-                &format!("mnvoice - HOTKEY {hk_str} UNAVAILABLE (in use by another app)"),
-            );
-        }
+            register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
+        };
+        app_ref(hwnd).hotkey_ok = hotkey_ok;
+        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok));
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -341,7 +371,11 @@ fn hotkey_of(config: &Option<config::Config>) -> (HOT_KEY_MODIFIERS, u32, String
                 c.hotkey_str.clone(),
             )
         })
-        .unwrap_or((MOD_ALT | MOD_NOREPEAT, 0x20, "Alt+Space".to_string()))
+        .unwrap_or((
+            HOT_KEY_MODIFIERS(config::DEFAULT_HOTKEY_MOD),
+            config::DEFAULT_HOTKEY_VK,
+            config::DEFAULT_HOTKEY_STR.to_string(),
+        ))
 }
 
 /// Registers the window class once per process. A second registration is
@@ -369,11 +403,13 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
 fn create_tray_window(
     hinstance: HINSTANCE,
     config: Option<config::Config>,
+    hotkey_str: String,
     audio_engine: audio::AudioEngine,
 ) -> Option<HWND> {
     unsafe {
         let init = Box::into_raw(Box::new(AppInit {
             config,
+            hotkey_str,
             instance: hinstance,
             audio_engine,
         }));
@@ -448,6 +484,7 @@ fn run_message_loop() {
 
 struct AppInit {
     config: Option<config::Config>,
+    hotkey_str: String,
     instance: HINSTANCE,
     audio_engine: audio::AudioEngine,
 }
@@ -466,8 +503,15 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
 
 /// The idle tray tip. It names the hotkey actually configured, not a
 /// hardcoded one: a user with KEYBIND=F9 must not be told to press Alt+Space.
-fn idle_tip(hotkey: Option<&str>) -> String {
-    format!("mnvoice - idle. {} to dictate.", hotkey.unwrap_or("Alt+Space"))
+/// A disabled hotkey (HOTKEY=none) says where the control moved, and an
+/// unregistered one (held by another app) keeps saying so - the first idle
+/// write used to erase the startup warning and advertise a dead key.
+fn idle_tip(hotkey: &str, hotkey_ok: bool) -> String {
+    match (hotkey, hotkey_ok) {
+        ("none", _) => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
+        (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
+        (hk, false) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
+    }
 }
 
 unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
@@ -518,6 +562,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     stop: Arc::new(AtomicBool::new(false)),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     outcome: Arc::new(Mutex::new(None)),
+                    session_id: 0,
+                    hotkey_str: init.hotkey_str,
+                    // The registration result arrives after WM_CREATE (the
+                    // hwnd did not exist yet); main sets the real value.
+                    hotkey_ok: true,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -551,9 +600,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
                     let tip = match app.state {
-                        State::Idle => {
-                            idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str()))
-                        }
+                        State::Idle => idle_tip(&app.hotkey_str, app.hotkey_ok),
                         State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
                         State::Transcribing => "mnvoice - transcribing...".to_string(),
                     };
@@ -563,6 +610,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_APP_WORKER => {
                 let app = app_ref(hwnd);
+                let msg_session = wparam.0;
+                if msg_session != app.session_id {
+                    // Stale outcome from an earlier session; ignore completely.
+                    return LRESULT(0);
+                }
                 let cancelled = app.cancelled.load(Ordering::SeqCst);
                 let outcome = app.outcome.lock().unwrap().take();
                 if let Some((ok, message)) = outcome {
@@ -572,12 +624,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    let _ = set_tray_tip(hwnd, "mnvoice - idle");
+                    let _ = set_tray_tip(hwnd, &idle_tip(&app.hotkey_str, app.hotkey_ok));
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
-                    // and must not be reported as a transcription.
+                    // and must not be reported as a transcription. On REST nothing
+                    // was typed either; on streaming, words committed before the
+                    // cancel are already in the document, so the line says what
+                    // cancel actually guarantees: the rest is discarded.
                     if cancelled {
-                        log("session cancelled, nothing typed");
+                        log("session cancelled, discarding the rest");
                     } else if ok {
                         let preview: String = message.chars().take(200).collect();
                         log(&format!("transcribed: {preview}"));
@@ -601,11 +656,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         set_state(app, State::Idle);
                         PostQuitMessage(0);
                     }
-                    IDM_STOP => {
+                    IDM_DICTATE => {
                         let app = app_ref(hwnd);
-                        if app.state == State::Recording {
-                            toggle(app);
-                        }
+                        toggle(app);
                     }
                     IDM_STARTUP => {
                         // Toggle the logon task. The Run key is cleared as a side
@@ -674,8 +727,16 @@ fn toggle(app: &mut App) {
                 }
             }
 
-            app.stop.store(false, Ordering::SeqCst);
-            app.cancelled.store(false, Ordering::SeqCst);
+            // Fresh flags and a fresh outcome slot per session, never a reset:
+            // a stale worker from the cancelled session writes to arcs nothing
+            // reads anymore (its cancelled flag stays true, so its late flush
+            // cannot type, and its outcome lands in an orphaned slot the UI
+            // handler skips) and can no longer tear the new session down.
+            app.session_id = app.session_id.wrapping_add(1);
+            let session_id = app.session_id;
+            app.stop = Arc::new(AtomicBool::new(false));
+            app.cancelled = Arc::new(AtomicBool::new(false));
+            app.outcome = Arc::new(Mutex::new(None));
             let stop = app.stop.clone();
             let cancelled = app.cancelled.clone();
             let outcome = app.outcome.clone();
@@ -684,7 +745,17 @@ fn toggle(app: &mut App) {
 
             // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
             let worker_cfg = cfg.clone();
-            thread::spawn(move || worker(stop, cancelled, worker_cfg, outcome, hwnd_bits, audio_engine));
+            thread::spawn(move || {
+                worker(
+                    session_id,
+                    stop,
+                    cancelled,
+                    worker_cfg,
+                    outcome,
+                    hwnd_bits,
+                    audio_engine,
+                )
+            });
             set_state(app, State::Recording);
 
             // Summon the orb last, once cancel is already live.
@@ -725,11 +796,12 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - idle") };
+    let _ = unsafe { set_tray_tip(app.hwnd, &idle_tip(&app.hotkey_str, app.hotkey_ok)) };
     log("recording cancelled");
 }
 
 fn worker(
+    session_id: usize,
     stop: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cfg: config::Config,
@@ -743,13 +815,18 @@ fn worker(
     let max_seconds = cfg.max_seconds;
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
-    let capture_done_rx = audio_engine.capture_to_channel(
-        stop_audio,
-        max_seconds,
-        cfg.vad_silence_ms,
-        cfg.vad_rms_threshold,
-        tx,
-    );
+    // The outer Err means the request could not even be queued (the engine is
+    // gone); the original code ignored that case and so does this - it is not
+    // a capture failure the user can act on.
+    let capture_done = audio_engine
+        .capture_to_channel(
+            stop_audio,
+            max_seconds,
+            cfg.vad_silence_ms,
+            cfg.vad_rms_threshold,
+            tx,
+        )
+        .ok();
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
     let mut result = match cfg.protocol {
@@ -758,7 +835,7 @@ fn worker(
                 Ok(text) => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
-                        (false, "No speech detected".into())
+                        (false, NO_SPEECH.into())
                     } else {
                         (true, text)
                     }
@@ -774,26 +851,57 @@ fn worker(
             while let Ok(chunk) = rx.recv() {
                 samples.extend_from_slice(&chunk);
             }
-            match rest::dictate_rest(&cfg, &samples) {
-                Ok(text) if text.is_empty() => (false, "No speech detected".into()),
-                Ok(text) => (true, text),
-                Err(e) => (false, e),
+            // A capture failure is reported BEFORE the buffer is uploaded or
+            // typed: the CLI returns on the capture error first, and typing a
+            // transcript the caller is about to disown is the inconsistency
+            // this arm used to have with it. A cancelled session is the same
+            // case - dictate_rest refuses to type it, and there is no reason
+            // to upload it either.
+            let capture_err = capture_done.as_ref().and_then(|done| match done.recv() {
+                Ok(Err(e)) => Some(e),
+                _ => None,
+            });
+            match capture_err {
+                Some(e) => (false, e),
+                None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
+                    Ok(text) if text.is_empty() => (false, NO_SPEECH.into()),
+                    Ok(text) => (true, text),
+                    Err(e) => (false, e),
+                },
             }
         }
     };
 
-    if let Ok(rx) = capture_done_rx {
+    // Streaming leaves the capture report unread until here; the REST arm above
+    // has already consumed it (a second recv sees a closed channel and no-ops).
+    if let Some(rx) = capture_done {
         if let Ok(Err(e)) = rx.recv() {
             result = (false, e);
         }
     }
     *outcome.lock().unwrap() = Some(result);
-    let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
+    let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(session_id), LPARAM(0)) };
+}
+
+/// The tray menu's single dictate/stop item for a given session state.
+///
+/// One item carries every direction: with HOTKEY=none this is the only way to
+/// start a dictation, and it must never be a grayed-out stop item while idle.
+/// The label and enablement follow the state so the single action stays
+/// honest: Transcribing has no click action at all (toggle's arm is a
+/// deliberate no-op), so it shows a disabled status label rather than an
+/// enabled "Dictate" that would silently do nothing. Pure so the mapping is
+/// testable without a live window.
+fn dictate_item(state: State) -> (&'static str, bool) {
+    match state {
+        State::Idle => ("Dictate", true),
+        State::Recording => ("Stop && transcribe", true),
+        State::Transcribing => ("Transcribing...", false),
+    }
 }
 
 unsafe fn show_menu(hwnd: HWND) {
     let app = app_ref(hwnd);
-    let recording = app.state == State::Recording;
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
         Err(_) => return,
@@ -810,9 +918,16 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART, w!("Restart"));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, IDM_STOP, w!("Stop && transcribe"));
-    if !recording {
-        let _ = EnableMenuItem(menu, IDM_STOP as u32, MF_GRAYED);
+    let (dictate_label, dictate_clickable) = dictate_item(app.state);
+    let dictate_label_wide = wide(dictate_label);
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        IDM_DICTATE,
+        PCWSTR(dictate_label_wide.as_ptr()),
+    );
+    if !dictate_clickable {
+        let _ = EnableMenuItem(menu, IDM_DICTATE as u32, MF_GRAYED);
     }
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
 
@@ -1176,6 +1291,8 @@ fn open_companion_file(name: &str, stub: &str) {
     let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
 }
 
+static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// Ask GitHub whether a newer release exists. `quiet` suppresses the
 /// "up to date" balloon so the periodic background check stays silent.
 ///
@@ -1183,7 +1300,24 @@ fn open_companion_file(name: &str, stub: &str) {
 /// must not freeze. Installation only ever happens when idle, because swapping
 /// the exe mid-dictation would lose the transcript in flight.
 pub(crate) fn check_for_updates_async(quiet: bool) {
+    if UPDATE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        if !quiet {
+            balloon("Update in progress", "an update check is already running");
+        }
+        return;
+    }
     thread::spawn(move || {
+        struct InFlightGuard;
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                UPDATE_IN_FLIGHT.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = InFlightGuard;
+
         // The check can take seconds and installs take longer; from here on a
         // manual check narrates every stage, because a tray button that goes
         // silent for twenty seconds reads as broken, not as busy.
@@ -1279,10 +1413,13 @@ fn balloon(title: &str, body: &str) {
     }
 }
 
-/// Relaunch this exe with --restart so a fresh instance takes over, then exit.
+/// Relaunch this exe with the restart argument so a fresh instance takes over,
+/// then exit.
 fn relaunch_for_restart() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(&exe).arg("--restart").spawn();
+        let _ = std::process::Command::new(&exe)
+            .arg(update::RESTART_ARG)
+            .spawn();
     }
     unsafe { PostQuitMessage(0) };
 }
@@ -1391,11 +1528,59 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_of_uses_config_defaults_when_config_is_none() {
+        let (mods, vk, s) = hotkey_of(&None);
+        assert_eq!(mods.0, config::DEFAULT_HOTKEY_MOD);
+        assert_eq!(vk, config::DEFAULT_HOTKEY_VK);
+        assert_eq!(s, config::DEFAULT_HOTKEY_STR);
+    }
+
+    #[test]
+    fn the_tray_dictate_item_matches_the_session_state() {
+        // The single tray item must be honest about the one action it offers:
+        // idle starts a dictation, recording stops it, and while a session is
+        // finishing there is no click action (toggle's Transcribing arm is a
+        // no-op), so it is shown disabled rather than as an enabled "Dictate"
+        // that silently does nothing.
+        assert_eq!(dictate_item(State::Idle), ("Dictate", true));
+        assert_eq!(dictate_item(State::Recording), ("Stop && transcribe", true));
+        assert_eq!(
+            dictate_item(State::Transcribing),
+            ("Transcribing...", false)
+        );
+    }
+
+    #[test]
     fn the_idle_tray_tip_names_the_configured_hotkey() {
         // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
         // no config yet the documented default is what the tip names.
-        assert_eq!(idle_tip(Some("F9")), "mnvoice - idle. F9 to dictate.");
-        assert_eq!(idle_tip(None), "mnvoice - idle. Alt+Space to dictate.");
+        assert_eq!(idle_tip("F9", true), "mnvoice - idle. F9 to dictate.");
+        assert_eq!(
+            idle_tip("Alt+Space", true),
+            "mnvoice - idle. Alt+Space to dictate."
+        );
+        // A hotkey that never registered keeps saying so: the first idle
+        // write used to erase the startup UNAVAILABLE warning. This holds for
+        // the default spelling too, which is what a config that failed to
+        // load leaves the app running on.
+        assert_eq!(
+            idle_tip("F9", false),
+            "mnvoice - idle. HOTKEY F9 UNAVAILABLE (in use by another app)"
+        );
+        assert_eq!(
+            idle_tip("Alt+Space", false),
+            "mnvoice - idle. HOTKEY Alt+Space UNAVAILABLE (in use by another app)"
+        );
+        // HOTKEY=none moved the control to the tray; the tip says where, and
+        // the deliberately disabled key is not reported as a failed one.
+        assert_eq!(
+            idle_tip("none", true),
+            "mnvoice - idle. Hotkey disabled - use the tray menu."
+        );
+        assert_eq!(
+            idle_tip("none", false),
+            "mnvoice - idle. Hotkey disabled - use the tray menu."
+        );
     }
 
     #[test]

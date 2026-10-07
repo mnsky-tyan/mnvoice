@@ -331,6 +331,14 @@ impl WebSocket for UnixSocket {
     }
 
     fn close(&self) {
+        // Bound the close-frame write: the trait promises shutdown "without
+        // waiting for the peer", and a peer that stopped reading could block
+        // send/flush forever - which would also park the shutdown below, and
+        // with it the caller's reader join. Two seconds is far more than a
+        // two-byte close frame needs; the socket dies right after either way.
+        let _ = self
+            .shutdown
+            .set_write_timeout(Some(Duration::from_secs(2)));
         if let Ok(mut ws) = self.socket.lock() {
             // A close frame asks the server to shut down; the reply arrives on
             // whichever thread reads next. We do not wait for it - the caller

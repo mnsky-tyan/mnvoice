@@ -115,7 +115,20 @@ fn watch_recording(
         }
         match capture_done.try_recv() {
             Ok(result) => return (result, opened.elapsed()),
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            // Disconnected means the capture thread died WITHOUT reporting:
+            // the sender only lives as long as the thread. Waiting longer can
+            // never help - this used to spin here forever, while the tray
+            // treats the same case as "no error" and moves on. Fail like any
+            // other capture failure instead.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return (
+                    Err("audio capture ended unexpectedly".into()),
+                    opened.elapsed(),
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
         }
     }
 }
@@ -171,14 +184,17 @@ fn dictate(
 
     println!("recording... (Enter to stop)");
 
+    // The CLI has no cancel key (Enter stops and transcribes), so this flag is
+    // never set here; it exists so the REST path takes the same contract as
+    // the tray and the streaming path instead of a special-cased signature.
+    let cancelled = Arc::new(AtomicBool::new(false));
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
-            let cancelled = Arc::new(AtomicBool::new(false));
             let (text, recorded) =
                 transcribe_while_recording(&stop, rx, &capture_done, lines, |stop, rx| {
                     crate::stream::run_stream(cfg, stop, &cancelled, rx)
                 });
-            println!("stopped ({}s of audio)", recorded.as_secs());
+            println!("stopped ({}s elapsed)", recorded.as_secs());
             text?
         }
         config::Protocol::Rest => {
@@ -189,7 +205,7 @@ fn dictate(
             }
             captured?;
             println!("stopped ({}s of audio)", samples.len() / SAMPLE_RATE as usize);
-            crate::rest::dictate_rest(cfg, &samples)?
+            crate::rest::dictate_rest(cfg, &samples, &cancelled)?
         }
     };
 
