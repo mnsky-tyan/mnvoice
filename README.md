@@ -122,7 +122,8 @@ system tray icon
     -> Open config          (opens mnvoice.env in Notepad)
     -> Open keywords        (opens keywords.txt in Notepad)
     -> Restart              (frees the hotkey and starts fresh)
-    -> Dictate              (starts a dictation; reads "Stop & transcribe" while recording)
+    -> Dictate              (starts a dictation; "Stop & transcribe" while recording,
+                             "Transcribing..." disabled while a session finishes)
     -> Exit
 ```
 

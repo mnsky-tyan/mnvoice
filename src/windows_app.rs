@@ -856,7 +856,6 @@ fn worker(
 
 unsafe fn show_menu(hwnd: HWND) {
     let app = app_ref(hwnd);
-    let recording = app.state == State::Recording;
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
         Err(_) => return,
@@ -875,13 +874,19 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     // One item, both directions: with HOTKEY=none this is the only way to
     // start a dictation, and it must never be a grayed-out stop item while
-    // idle. Its label follows the state so the single action is legible.
-    let dictate_label = if recording {
-        w!("Stop && transcribe")
-    } else {
-        w!("Dictate")
+    // idle. Its label and enablement follow the state so the single action
+    // stays honest: Transcribing has no click action at all (toggle's arm is
+    // a deliberate no-op), so it shows a disabled status label rather than an
+    // enabled "Dictate" that would silently do nothing.
+    let (dictate_label, dictate_clickable) = match app.state {
+        State::Idle => (w!("Dictate"), true),
+        State::Recording => (w!("Stop && transcribe"), true),
+        State::Transcribing => (w!("Transcribing..."), false),
     };
     let _ = AppendMenuW(menu, MF_STRING, IDM_DICTATE, dictate_label);
+    if !dictate_clickable {
+        let _ = EnableMenuItem(menu, IDM_DICTATE as u32, MF_GRAYED);
+    }
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
 
     let mut pt = POINT::default();
