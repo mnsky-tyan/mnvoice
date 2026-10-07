@@ -854,6 +854,23 @@ fn worker(
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(0), LPARAM(0)) };
 }
 
+/// The tray menu's single dictate/stop item for a given session state.
+///
+/// One item carries every direction: with HOTKEY=none this is the only way to
+/// start a dictation, and it must never be a grayed-out stop item while idle.
+/// The label and enablement follow the state so the single action stays
+/// honest: Transcribing has no click action at all (toggle's arm is a
+/// deliberate no-op), so it shows a disabled status label rather than an
+/// enabled "Dictate" that would silently do nothing. Pure so the mapping is
+/// testable without a live window.
+fn dictate_item(state: State) -> (&'static str, bool) {
+    match state {
+        State::Idle => ("Dictate", true),
+        State::Recording => ("Stop && transcribe", true),
+        State::Transcribing => ("Transcribing...", false),
+    }
+}
+
 unsafe fn show_menu(hwnd: HWND) {
     let app = app_ref(hwnd);
     let menu = match CreatePopupMenu() {
@@ -872,18 +889,14 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART, w!("Restart"));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    // One item, both directions: with HOTKEY=none this is the only way to
-    // start a dictation, and it must never be a grayed-out stop item while
-    // idle. Its label and enablement follow the state so the single action
-    // stays honest: Transcribing has no click action at all (toggle's arm is
-    // a deliberate no-op), so it shows a disabled status label rather than an
-    // enabled "Dictate" that would silently do nothing.
-    let (dictate_label, dictate_clickable) = match app.state {
-        State::Idle => (w!("Dictate"), true),
-        State::Recording => (w!("Stop && transcribe"), true),
-        State::Transcribing => (w!("Transcribing..."), false),
-    };
-    let _ = AppendMenuW(menu, MF_STRING, IDM_DICTATE, dictate_label);
+    let (dictate_label, dictate_clickable) = dictate_item(app.state);
+    let dictate_label_wide = wide(dictate_label);
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        IDM_DICTATE,
+        PCWSTR(dictate_label_wide.as_ptr()),
+    );
     if !dictate_clickable {
         let _ = EnableMenuItem(menu, IDM_DICTATE as u32, MF_GRAYED);
     }
@@ -1462,6 +1475,18 @@ mod tests {
         assert!(autostart_starting(AutostartState::RunValueEnabled));
         assert!(!autostart_starting(AutostartState::RunValueDisabled));
         assert!(!autostart_starting(AutostartState::NoRunValue));
+    }
+
+    #[test]
+    fn the_tray_dictate_item_matches_the_session_state() {
+        // The single tray item must be honest about the one action it offers:
+        // idle starts a dictation, recording stops it, and while a session is
+        // finishing there is no click action (toggle's Transcribing arm is a
+        // no-op), so it is shown disabled rather than as an enabled "Dictate"
+        // that silently does nothing.
+        assert_eq!(dictate_item(State::Idle), ("Dictate", true));
+        assert_eq!(dictate_item(State::Recording), ("Stop && transcribe", true));
+        assert_eq!(dictate_item(State::Transcribing), ("Transcribing...", false));
     }
 
     #[test]
