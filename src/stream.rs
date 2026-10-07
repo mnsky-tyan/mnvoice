@@ -376,6 +376,23 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.base_url = "https://[::1]:8443".into();
         let url = listen_url(&cfg).expect("a bracketed IPv6 base URL parses");
+        // Drive the real Unix consumer of this string - the same
+        // `IntoClientRequest` the transport calls at unix_http.rs:210 - rather
+        // than only matching a prefix: the fix exists because that parser
+        // rejects an unbracketed authority, so the parse succeeding here IS
+        // the behavior under test. The parser lives behind the Unix target
+        // gate, so this arm runs where it matters (Linux/macOS) and on Windows
+        // the prefix check still pins the shape.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use tungstenite::client::IntoClientRequest;
+            let request = url
+                .as_str()
+                .into_client_request()
+                .unwrap_or_else(|e| panic!("the Unix transport must accept {url}: {e}"));
+            assert_eq!(request.uri().host(), Some("[::1]"));
+            assert_eq!(request.uri().port_u16(), Some(8443));
+        }
         assert!(
             url.starts_with("wss://[::1]:8443/v1/listen?"),
             "the authority must bracket the IPv6 literal: {url}"
