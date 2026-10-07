@@ -24,7 +24,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
 };
 use std::os::windows::process::CommandExt;
 use windows::Win32::UI::Shell::{
@@ -610,7 +610,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_APP_WORKER => {
                 let app = app_ref(hwnd);
-                let msg_session = wparam.0 as usize;
+                let msg_session = wparam.0;
                 if msg_session != app.session_id {
                     // Stale outcome from an earlier session; ignore completely.
                     return LRESULT(0);
@@ -745,7 +745,17 @@ fn toggle(app: &mut App) {
 
             // Worker immediately captures audio via pre-initialized standby engine & connects WebSocket
             let worker_cfg = cfg.clone();
-            thread::spawn(move || worker(session_id, stop, cancelled, worker_cfg, outcome, hwnd_bits, audio_engine));
+            thread::spawn(move || {
+                worker(
+                    session_id,
+                    stop,
+                    cancelled,
+                    worker_cfg,
+                    outcome,
+                    hwnd_bits,
+                    audio_engine,
+                )
+            });
             set_state(app, State::Recording);
 
             // Summon the orb last, once cancel is already live.
