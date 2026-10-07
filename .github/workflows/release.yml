@@ -23,6 +23,14 @@ on:
 permissions:
   contents: write
 
+# One release ref at a time: a second run aimed at the same ref (say, a hand
+# dispatch on a tag while the push run is live) queues instead of interleaving
+# its publish steps with the first run's. The three platform jobs of a single
+# run are unaffected - they share one run and keep running in parallel.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   windows:
     # A bare vX.Y.Z tag is the legacy Windows shape - every release before the
@@ -43,7 +51,10 @@ jobs:
       # the version it names must be the crate's. Replaces the three copies of
       # this check that used to live here.
       - name: Verify the release tag
-        if: startsWith(github.ref, 'refs/tags/')
+        # Publish authority needs BOTH a real tag push and a tag ref: a
+        # workflow_dispatch can be started on a tag ref, and a ref check alone
+        # would then let all three jobs publish one release concurrently.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: ./.github/actions/verify-release-tag
         with:
           tag: ${{ github.ref_name }}
@@ -86,7 +97,10 @@ jobs:
       # nothing under the Node 24 runtime, and verifies each asset over the
       # REST API after upload.
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
+        # Publish authority needs BOTH a real tag push and a tag ref: a
+        # workflow_dispatch can be started on a tag ref, and a ref check alone
+        # would then let all three jobs publish one release concurrently.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: ./.github/actions/publish-release
         with:
           tag: ${{ github.ref_name }}
@@ -110,7 +124,10 @@ jobs:
       # the version it names must be the crate's. Replaces the three copies of
       # this check that used to live here.
       - name: Verify the release tag
-        if: startsWith(github.ref, 'refs/tags/')
+        # Publish authority needs BOTH a real tag push and a tag ref: a
+        # workflow_dispatch can be started on a tag ref, and a ref check alone
+        # would then let all three jobs publish one release concurrently.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: ./.github/actions/verify-release-tag
         with:
           tag: ${{ github.ref_name }}
@@ -150,7 +167,10 @@ jobs:
           sidecar: mnvoice-linux-x64.sha256
 
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
+        # Publish authority needs BOTH a real tag push and a tag ref: a
+        # workflow_dispatch can be started on a tag ref, and a ref check alone
+        # would then let all three jobs publish one release concurrently.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: ./.github/actions/publish-release
         with:
           tag: ${{ github.ref_name }}
@@ -173,7 +193,10 @@ jobs:
       # the version it names must be the crate's. Replaces the three copies of
       # this check that used to live here.
       - name: Verify the release tag
-        if: startsWith(github.ref, 'refs/tags/')
+        # Publish authority needs BOTH a real tag push and a tag ref: a
+        # workflow_dispatch can be started on a tag ref, and a ref check alone
+        # would then let all three jobs publish one release concurrently.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: ./.github/actions/verify-release-tag
         with:
           tag: ${{ github.ref_name }}
@@ -203,7 +226,10 @@ jobs:
           sidecar: mnvoice-macos-arm64.sha256
 
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
+        # Publish authority needs BOTH a real tag push and a tag ref: a
+        # workflow_dispatch can be started on a tag ref, and a ref check alone
+        # would then let all three jobs publish one release concurrently.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: ./.github/actions/publish-release
         with:
           tag: ${{ github.ref_name }}

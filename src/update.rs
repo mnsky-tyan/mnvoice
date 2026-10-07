@@ -136,6 +136,14 @@ fn asset_name_from_url(url: &str) -> Result<String, String> {
 /// not hex, and the asset it names - the exe, in the current layout - would read
 /// as unlisted. The producer this reads does not emit one, so this is about the
 /// format being total rather than about any release that exists.
+///
+/// The producer is .github/actions/package-release/action.yml: its Windows
+/// branch writes exactly this format by hand (lowercase hex, two spaces, LF,
+/// no BOM) and its Unix branch wraps `sha256sum`/`shasum -a 256` in text mode.
+/// The two sides of this contract are pinned by tests against literals, not
+/// against a file the action wrote - so a change to either side must find and
+/// re-justify the other. This comment is the pointer that makes that search
+/// possible.
 fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
     let sums = sums.strip_prefix('\u{feff}').unwrap_or(sums);
     for line in sums.lines() {

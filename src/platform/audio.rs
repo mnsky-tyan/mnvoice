@@ -17,6 +17,14 @@ use std::sync::Arc;
 /// Every backend delivers this rate; providers are configured to expect it.
 pub const SAMPLE_RATE: u32 = 16_000;
 
+/// The f32 scale for 16-bit PCM: `i16::MIN` maps to exactly -1.0, and the
+/// missing +32768th step costs half a count of headroom at the top. Every
+/// conversion in the crate shares this one constant (the WAV reader, the
+/// Windows engine, the cpal callback), so a sample captured on one platform
+/// means the same level everywhere - the two engines once divided by
+/// different constants here, which is the drift this exists to prevent.
+pub const I16_SCALE: f32 = 32768.0;
+
 /// A session that has heard no speech at all ends itself after this long, so
 /// an accidental hotkey press does not hold the microphone hostage until
 /// `max_seconds`. Both engines enforce it.
@@ -185,7 +193,7 @@ mod tests {
 
     /// The energy metric both engines hand the silence detector: silence is
     /// 0.0 (never NaN, which would poison every comparison against the
-    /// threshold), full scale is half of i16::MAX for a square wave, and the
+    /// threshold), a full-scale square wave's RMS is its amplitude, and the
     /// result is the same value the two engines used to compute separately.
     #[test]
     fn the_shared_rms_metric_is_defined_for_every_chunk() {

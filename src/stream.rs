@@ -275,9 +275,14 @@ pub fn run_stream(
         }
     }
 
-    // Drain all remaining audio packets accumulated in rx before closing
-    while let Ok(packet_i16) = rx.try_recv() {
-        let _ = ws.send_binary(&pcm_bytes(&packet_i16));
+    // Drain all remaining audio packets accumulated in rx before closing -
+    // unless the session was cancelled: a cancel is a hard discard (the same
+    // rule dictate_rest enforces before its upload), so the queued tail must
+    // not be shipped to the provider after the user said stop.
+    if !cancelled.load(Ordering::SeqCst) {
+        while let Ok(packet_i16) = rx.try_recv() {
+            let _ = ws.send_binary(&pcm_bytes(&packet_i16));
+        }
     }
 
     // Signal close to Deepgram

@@ -2,9 +2,10 @@ name: Verify release tag
 description: >-
   The single owner of the tag-shape rule for a release: a tag must be exactly
   vX.Y.Z or vX.Y.Z-<one platform segment>, and the version it names must equal
-  both the crate version (Cargo.toml) and the mnvoice package version in
-  Cargo.lock, which the bump must move with it. The publisher (this workflow)
-  accepts exactly that set,
+  the crate version in Cargo.toml - and, enforced here at this publish gate
+  (the one place a release is born, and the only place that needs to enforce
+  it), the mnvoice package version in Cargo.lock, which the bump must move
+  with. The publisher (this workflow) accepts exactly that set,
   and the consumer (the updater's tag_is_ours) recognizes the same shapes in
   the feed - a tag with a second segment (v0.1.21-rc1-win), or a platform
   this project does not publish (v0.1.21-android), fails here before anything

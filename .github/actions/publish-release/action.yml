@@ -22,10 +22,17 @@ runs:
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
+        # Inputs reach the script through the environment, never by string
+        # interpolation: "${{ inputs.tag }}" pastes caller-controlled text
+        # straight into the PowerShell source (the classic injection pattern),
+        # while an env read is always a plain value. The sibling
+        # verify-release-tag action sets the same example; do not revert this.
+        TAG: ${{ inputs.tag }}
+        FILES: ${{ inputs.files }}
       run: |
         $ErrorActionPreference = 'Stop'
-        $tag = "${{ inputs.tag }}"
-        $files = @("${{ inputs.files }}" -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $tag = $env:TAG
+        $files = @($env:FILES -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         foreach ($f in $files) {
           if (!(Test-Path $f)) { throw "$f was not produced" }
         }

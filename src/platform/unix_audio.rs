@@ -24,7 +24,7 @@
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
-use crate::platform::audio::{resample_linear, rms_of, Audio, SilenceWindows, SAMPLE_RATE};
+use crate::platform::audio::{resample_linear, rms_of, Audio, SilenceWindows, I16_SCALE, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -126,7 +126,7 @@ fn run_session(
                 push(
                     &data
                         .iter()
-                        .map(|s| *s as f32 / i16::MAX as f32)
+                        .map(|s| *s as f32 / I16_SCALE)
                         .collect::<Vec<f32>>(),
                 )
             },
@@ -147,6 +147,13 @@ fn run_session(
 
     let started = Instant::now();
     let mut silence = SilenceWindows::new();
+    // All three natural exits below `break` instead of returning directly, so
+    // the error slot gets ONE final read after the loop: an error cpal's worker
+    // records while the last tick is finishing its work (sending the chunk,
+    // observing the stop) must still surface - checking the slot only at the
+    // top of the loop let a failure that landed in that window be reported as
+    // a clean stop, and a manual stop is exactly when the user needs to hear
+    // that the device, not they, ended the recording.
     loop {
         thread::sleep(Duration::from_millis(20));
 
@@ -173,19 +180,28 @@ fn run_session(
         let rms = rms_of(&chunk);
 
         if !chunk.is_empty() && !hand_off(&tx, chunk) {
-            return Ok(());
+            break;
         }
 
         if stop.load(Ordering::SeqCst)
             || started.elapsed() >= Duration::from_secs(max_seconds as u64)
         {
-            return Ok(());
+            break;
         }
         if silence.advance(chunk_len, rms, vad_rms_threshold, vad_silence_ms) {
-            return Ok(());
+            break;
         }
     }
-    // `stream` drops here, which stops capture and joins the device thread.
+    // The last look before declaring success: cpal's error callback fires on
+    // its own thread, so a failure may have landed at any point this tick.
+    if let Ok(slot) = stream_error.lock() {
+        if let Some(e) = slot.as_ref() {
+            return Err(e.clone());
+        }
+    }
+    // `stream` drops as this scope ends, which stops capture and joins the
+    // device thread.
+    Ok(())
 }
 
 /// Mixes the interleaved frames in `buf` down to mono and leaves a partial

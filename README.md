@@ -258,7 +258,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `MODEL` | `nova-3` / `whisper-large-v3-turbo` | Model identifier (default depends on `PROTOCOL`) |
 | `BASE_URL` | provider default | Custom endpoint, port, or reverse proxy |
 | `LANGUAGE` | `en` | Language code, or `auto` for detection |
-| `HOTKEY` | `Alt+Space` | Trigger hotkey. See Keybindings above for syntax. |
+| `HOTKEY` | `Alt+Space` | Trigger hotkey. See Keybindings above for syntax; `none` disables it (tray menu only). |
 | `CANCEL_KEY` | `Escape` | Discard the recording mid-speech (`none` to disable) |
 | `FILLER_WORDS` | `0` | `0` strips "uh"/"um"/"erm", `1` keeps them verbatim |
 | `KEYWORDS` | - | Comma-separated vocabulary hints. `keywords.txt` beside the exe is auto-loaded too. |

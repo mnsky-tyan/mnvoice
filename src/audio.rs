@@ -15,7 +15,7 @@ use windows::Win32::System::Com::*;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
 pub use crate::platform::audio::SAMPLE_RATE;
-use crate::platform::audio::{resample_linear, SilenceWindows};
+use crate::platform::audio::{resample_linear, I16_SCALE, SilenceWindows};
 
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
@@ -258,7 +258,7 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
             let v = if is_float {
                 f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]])
             } else if sample_bytes == 2 {
-                i16::from_le_bytes([raw[off], raw[off + 1]]) as f32 / 32768.0
+                i16::from_le_bytes([raw[off], raw[off + 1]]) as f32 / I16_SCALE
             } else {
                 i32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]) as f32
                     / 2147483648.0

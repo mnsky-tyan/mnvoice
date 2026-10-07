@@ -126,11 +126,23 @@ struct App {
     hwnd: HWND,
     state: State,
     config: Option<config::Config>,
+    /// This session's flags. FRESH ARCS PER SESSION, never reset in place: a
+    /// stale worker from a cancelled session holds its own clones, so its
+    /// cancelled flag stays set forever (its streaming flush can never type
+    /// into a newer session) and its outcome lands in an orphaned slot the UI
+    /// handler skips by construction. Resetting shared flags instead let a
+    /// cancel-then-quick-restart type the old session's leftover words into
+    /// the new one and let the stale worker tear the new session's UI down.
     stop: Arc<AtomicBool>,
     /// Set by the cancel key. Once set, the streaming reader types nothing
     /// further and the final flush is skipped, so a cancel really discards.
     cancelled: Arc<AtomicBool>,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
+    /// Whether the toggle hotkey actually registered. False means the tip
+    /// must keep saying so: the first idle tip used to overwrite the startup
+    /// UNAVAILABLE warning with a cheerful "F9 to dictate" for a key that
+    /// does nothing.
+    hotkey_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -241,15 +253,16 @@ pub fn main() {
         let Some(hwnd) = create_tray_window(hinstance, config, audio_engine) else {
             return;
         };
-        let hotkey_ok = register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str);
-        if hotkey_ok {
-            add_tray(hwnd, &format!("mnvoice - idle ({hk_str})"));
+        // HOTKEY=none disables the toggle registration entirely (the tray menu
+        // starts and stops a dictation); vk == 0 is the disabled sentinel.
+        let hotkey_ok = if hk_vk == 0 {
+            log("hotkey disabled (HOTKEY=none); use the tray menu to dictate");
+            true
         } else {
-            add_tray(
-                hwnd,
-                &format!("mnvoice - HOTKEY {hk_str} UNAVAILABLE (in use by another app)"),
-            );
-        }
+            register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
+        };
+        app_ref(hwnd).hotkey_ok = hotkey_ok;
+        add_tray(hwnd, &idle_tip(Some(&hk_str), hotkey_ok));
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -466,8 +479,16 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
 
 /// The idle tray tip. It names the hotkey actually configured, not a
 /// hardcoded one: a user with KEYBIND=F9 must not be told to press Alt+Space.
-fn idle_tip(hotkey: Option<&str>) -> String {
-    format!("mnvoice - idle. {} to dictate.", hotkey.unwrap_or("Alt+Space"))
+/// A disabled hotkey (HOTKEY=none) says where the control moved, and an
+/// unregistered one (held by another app) keeps saying so - the first idle
+/// write used to erase the startup warning and advertise a dead key.
+fn idle_tip(hotkey: Option<&str>, hotkey_ok: bool) -> String {
+    match hotkey {
+        None => "mnvoice - idle. Alt+Space to dictate.".to_string(),
+        Some("none") => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
+        Some(hk) if hotkey_ok => format!("mnvoice - idle. {hk} to dictate."),
+        Some(hk) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
+    }
 }
 
 unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
@@ -518,6 +539,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     stop: Arc::new(AtomicBool::new(false)),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     outcome: Arc::new(Mutex::new(None)),
+                    // The registration result arrives after WM_CREATE (the
+                    // hwnd did not exist yet); main sets the real value.
+                    hotkey_ok: true,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -551,9 +575,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
                     let tip = match app.state {
-                        State::Idle => {
-                            idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str()))
-                        }
+                        State::Idle => idle_tip(
+                            app.config.as_ref().map(|c| c.hotkey_str.as_str()),
+                            app.hotkey_ok,
+                        ),
                         State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
                         State::Transcribing => "mnvoice - transcribing...".to_string(),
                     };
@@ -574,13 +599,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     set_state(app, State::Idle);
                     let _ = set_tray_tip(
                         hwnd,
-                        &idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str())),
+                        &idle_tip(
+                            app.config.as_ref().map(|c| c.hotkey_str.as_str()),
+                            app.hotkey_ok,
+                        ),
                     );
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
-                    // and must not be reported as a transcription.
+                    // and must not be reported as a transcription. On REST nothing
+                    // was typed either; on streaming, words committed before the
+                    // cancel are already in the document, so the line says what
+                    // cancel actually guarantees: the rest is discarded.
                     if cancelled {
-                        log("session cancelled, nothing typed");
+                        log("session cancelled, discarding the rest");
                     } else if ok {
                         let preview: String = message.chars().take(200).collect();
                         log(&format!("transcribed: {preview}"));
@@ -677,8 +708,14 @@ fn toggle(app: &mut App) {
                 }
             }
 
-            app.stop.store(false, Ordering::SeqCst);
-            app.cancelled.store(false, Ordering::SeqCst);
+            // Fresh flags and a fresh outcome slot per session, never a reset:
+            // a stale worker from the cancelled session writes to arcs nothing
+            // reads anymore (its cancelled flag stays true, so its late flush
+            // cannot type, and its outcome lands in an orphaned slot the UI
+            // handler skips) and can no longer tear the new session down.
+            app.stop = Arc::new(AtomicBool::new(false));
+            app.cancelled = Arc::new(AtomicBool::new(false));
+            app.outcome = Arc::new(Mutex::new(None));
             let stop = app.stop.clone();
             let cancelled = app.cancelled.clone();
             let outcome = app.outcome.clone();
@@ -731,7 +768,10 @@ fn cancel(app: &mut App) {
     let _ = unsafe {
         set_tray_tip(
             app.hwnd,
-            &idle_tip(app.config.as_ref().map(|c| c.hotkey_str.as_str())),
+            &idle_tip(
+                app.config.as_ref().map(|c| c.hotkey_str.as_str()),
+                app.hotkey_ok,
+            ),
         )
     };
     log("recording cancelled");
@@ -1425,8 +1465,19 @@ mod tests {
     fn the_idle_tray_tip_names_the_configured_hotkey() {
         // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
         // no config yet the documented default is what the tip names.
-        assert_eq!(idle_tip(Some("F9")), "mnvoice - idle. F9 to dictate.");
-        assert_eq!(idle_tip(None), "mnvoice - idle. Alt+Space to dictate.");
+        assert_eq!(idle_tip(Some("F9"), true), "mnvoice - idle. F9 to dictate.");
+        assert_eq!(idle_tip(None, true), "mnvoice - idle. Alt+Space to dictate.");
+        // A hotkey that never registered keeps saying so: the first idle
+        // write used to erase the startup UNAVAILABLE warning.
+        assert_eq!(
+            idle_tip(Some("F9"), false),
+            "mnvoice - idle. HOTKEY F9 UNAVAILABLE (in use by another app)"
+        );
+        // HOTKEY=none moved the control to the tray; the tip says where.
+        assert_eq!(
+            idle_tip(Some("none"), true),
+            "mnvoice - idle. Hotkey disabled - use the tray menu."
+        );
     }
 
     #[test]

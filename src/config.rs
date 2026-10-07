@@ -131,13 +131,22 @@ fn derive(raw: RawFields) -> Result<Config, String> {
     // The displayed spelling must name the pair that was actually registered:
     // an unparseable HOTKEY falls back to the default below, so echoing
     // "Foobar" back into the tray tip and the log would advertise a key that
-    // does nothing.
+    // does nothing. "none" disables the toggle hotkey outright - the same
+    // spelling, and the same zero-pair sentinel, that CANCEL_KEY=none uses
+    // below, so one word cannot mean "default" for one key and "off" for the
+    // other. Without a toggle hotkey the tray menu still starts and stops a
+    // dictation.
     let hotkey_input = raw.hotkey_str.trim().to_string();
-    let hotkey_parsed = parse_hotkey(&hotkey_input);
-    let hotkey = hotkey_parsed.unwrap_or((0x0001 | 0x4000, 0x20)); // MOD_ALT | MOD_NOREPEAT, VK_SPACE
-    let hotkey_actual_str = match (hotkey_input.is_empty(), hotkey_parsed) {
-        (false, Some(_)) => hotkey_input,
-        _ => "Alt+Space".to_string(),
+    let (hotkey, hotkey_actual_str) = if hotkey_input.eq_ignore_ascii_case("none") {
+        ((0, 0), "none".to_string())
+    } else {
+        let parsed = parse_hotkey(&hotkey_input);
+        let pair = parsed.unwrap_or((0x0001 | 0x4000, 0x20)); // MOD_ALT | MOD_NOREPEAT, VK_SPACE
+        let display = match (hotkey_input.is_empty(), parsed) {
+            (false, Some(_)) => hotkey_input,
+            _ => "Alt+Space".to_string(),
+        };
+        (pair, display)
     };
 
     let cancel_input = raw.cancel_key_str.trim().to_string();
@@ -363,8 +372,12 @@ impl RawFields {
     /// over its aliases whatever order the lines appear in, and an alias fills
     /// only a field nothing has set yet (a Deepgram-specific default
     /// overridable by a plain `API_KEY=`); every other field takes the last
-    /// line that names it. The environment pass runs after the file, so it
-    /// overrides anything the file set and is not subject to the guards.
+    /// line that names it. The one exception is `KEYWORDS`, which ACCUMULATES
+    /// across every line that names it and is never cleared - a `KEYWORDS=`
+    /// line in the file and a `KEYWORDS` variable in the environment are both
+    /// meant to contribute, and a test locks that. The environment pass runs
+    /// after the file, so it overrides anything the file set and is not
+    /// subject to the guards.
     fn set(&mut self, field: Field, k: &str, v: &str, from_file: bool) {
         let canonical_overrides = from_file && k == field.canonical();
         match field {
@@ -775,6 +788,22 @@ mod tests {
         assert_eq!(cfg.hotkey_str, "Alt+Space");
         assert_eq!(cfg.cancel_key, (0x4000, 0x1B));
         assert_eq!(cfg.cancel_key_str, "Escape");
+    }
+
+    /// "none" means the same thing for both keys: off. It used to disable
+    /// only CANCEL_KEY while HOTKEY=none silently registered the default
+    /// Alt+Space - one spelling, two meanings. The zero pair is the same
+    /// "register nothing" sentinel the cancel key uses.
+    #[test]
+    fn hotkey_none_disables_the_toggle_hotkey_like_cancel_none() {
+        let cfg = load_from("API_KEY=k\nHOTKEY=none\nCANCEL_KEY=none");
+        assert_eq!(cfg.hotkey, (0, 0), "the disabled sentinel pair");
+        assert_eq!(cfg.hotkey_str, "none");
+        assert_eq!(cfg.cancel_key, (0, 0));
+        assert_eq!(cfg.cancel_key_str, "none");
+        // Case-insensitive, like every other spelling.
+        let cfg = load_from("API_KEY=k\nHOTKEY=NONE");
+        assert_eq!(cfg.hotkey, (0, 0));
     }
 
     /// A key that parses keeps its spelling on screen, and "none" still
