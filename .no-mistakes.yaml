@@ -10,7 +10,7 @@ commands:
 # mnvoice.exe holds the `mnvoice-single-instance` mutex, so it must never be
 # stopped to free it.
 test:
-  notes: >-
+  instructions: >-
     The user's live mnvoice.exe runs continuously on this machine
     (C:\Users\tyanw\bin\mnvoice.exe). Do NOT kill, terminate, or replace any
     running mnvoice.exe process, and do not mutate the live bin/mnvoice.exe
