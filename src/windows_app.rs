@@ -39,6 +39,8 @@ const WM_APP_WORKER: u32 = WM_APP + 2;
 pub const NO_SPEECH: &str = "No speech detected";
 
 /// Resource id of the icon embedded by build.rs via assets/mnvoice.ico.
+/// MAKEINTRESOURCEW(1) in the Windows API is `1 as *const u16`.
+#[allow(clippy::manual_dangling_ptr)]
 const IDI_APP: PCWSTR = PCWSTR(1 as *const u16);
 
 /// Loads the embedded mnvoice icon. Falls back to the OS generic icon if the
@@ -390,7 +392,7 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
             hIcon: app_icon(),
             ..Default::default()
         };
-        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS.into() {
+        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS {
             log("RegisterClassW failed");
             return false;
         }
@@ -514,6 +516,16 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool) -> String {
     }
 }
 
+/// The tray tooltip for a given session state. Single-sourced so left-click
+/// polling and state transitions never disagree on tooltip text.
+fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool) -> String {
+    match state {
+        State::Idle => idle_tip(hotkey_str, hotkey_ok),
+        State::Recording => "mnvoice - listening (auto-stops on silence)".to_string(),
+        State::Transcribing => "mnvoice - transcribing...".to_string(),
+    }
+}
+
 unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let mut nid = tray_nid(hwnd, NIF_TIP | NIF_GUID);
     fill_wide(&mut nid.szTip, tip);
@@ -549,8 +561,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CREATE => {
                 let cs = &*(lparam.0 as *const CREATESTRUCTW);
                 let init = Box::from_raw(cs.lpCreateParams as *mut AppInit);
-                let color = init.config.as_ref().map(|c| c.orb_color).unwrap_or((1.0, 0.18, 0.58));
-                let fluid = init.config.as_ref().map(|c| c.orb_fluid_level).unwrap_or(0.75);
+                let color = init.config.as_ref().map(|c| c.orb_color).unwrap_or(crate::config::DEFAULT_ORB_COLOR);
+                let fluid = init.config.as_ref().map(|c| c.orb_fluid_level).unwrap_or(crate::config::DEFAULT_ORB_FLUID_LEVEL);
                 let orb = orb::Orb::new(init.instance, color, fluid).map_err(|e| {
                     log(&format!("orb init: {e}"));
                     e
@@ -599,12 +611,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
-                    let tip = match app.state {
-                        State::Idle => idle_tip(&app.hotkey_str, app.hotkey_ok),
-                        State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
-                        State::Transcribing => "mnvoice - transcribing...".to_string(),
-                    };
-                    let _ = set_tray_tip(hwnd, &tip);
+                    set_tray_tip(hwnd, &state_tip(app.state, &app.hotkey_str, app.hotkey_ok));
                 }
                 LRESULT(0)
             }
@@ -616,7 +623,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     return LRESULT(0);
                 }
                 let cancelled = app.cancelled.load(Ordering::SeqCst);
-                let outcome = app.outcome.lock().unwrap().take();
+                let outcome = app.outcome.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some((ok, message)) = outcome {
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     let _ = KillTimer(hwnd, TIMER_ORB);
@@ -624,7 +631,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    let _ = set_tray_tip(hwnd, &idle_tip(&app.hotkey_str, app.hotkey_ok));
+                    set_tray_tip(hwnd, &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok));
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription. On REST nothing
@@ -643,7 +650,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_COMMAND => {
-                let id = wparam.0 as usize;
+                let id = wparam.0;
                 match id {
                     IDM_EXIT => {
                         let _ = Shell_NotifyIconW(NIM_DELETE, &tray_nid(hwnd, Default::default()));
@@ -763,7 +770,7 @@ fn toggle(app: &mut App) {
                 orb.show(orb::OrbState::Recording);
             }
             let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
-            let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - listening (auto-stops on silence)") };
+            unsafe { set_tray_tip(app.hwnd, &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok)) };
             log("recording started");
         }
         State::Recording => {
@@ -773,7 +780,7 @@ fn toggle(app: &mut App) {
             if let Some(orb) = &mut app.orb {
                 orb.set_state(orb::OrbState::Transcribing);
             }
-            let _ = unsafe { set_tray_tip(app.hwnd, "mnvoice - transcribing...") };
+            unsafe { set_tray_tip(app.hwnd, &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok)) };
             log("recording stopped, transcribing");
         }
         State::Transcribing => {}
@@ -796,7 +803,7 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    let _ = unsafe { set_tray_tip(app.hwnd, &idle_tip(&app.hotkey_str, app.hotkey_ok)) };
+    unsafe { set_tray_tip(app.hwnd, &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok)) };
     log("recording cancelled");
 }
 
@@ -879,7 +886,7 @@ fn worker(
             result = (false, e);
         }
     }
-    *outcome.lock().unwrap() = Some(result);
+    *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(session_id), LPARAM(0)) };
 }
 
@@ -1634,5 +1641,21 @@ mod tests {
         });
         assert!(joiner.join().is_err(), "the probe panicked as intended");
         let _mutation = autostart_lock();
+    }
+
+    #[test]
+    fn the_tray_state_tip_reflects_session_state() {
+        assert_eq!(
+            state_tip(State::Idle, "Alt+Space", true),
+            "mnvoice - idle. Alt+Space to dictate."
+        );
+        assert_eq!(
+            state_tip(State::Recording, "Alt+Space", true),
+            "mnvoice - listening (auto-stops on silence)"
+        );
+        assert_eq!(
+            state_tip(State::Transcribing, "Alt+Space", true),
+            "mnvoice - transcribing..."
+        );
     }
 }

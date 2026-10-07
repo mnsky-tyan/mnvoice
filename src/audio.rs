@@ -311,7 +311,7 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
     } else {
         channels * sample_bytes
     };
-    if frame < channels * sample_bytes || raw.len() % frame != 0 {
+    if frame < channels * sample_bytes || !raw.len().is_multiple_of(frame) {
         return Err("unexpected capture buffer size".into());
     }
     let frames = raw.len() / frame;

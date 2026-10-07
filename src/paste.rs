@@ -58,3 +58,13 @@ pub fn type_text(text: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_text_returns_ok_without_injecting() {
+        assert_eq!(type_text(""), Ok(()));
+    }
+}

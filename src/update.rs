@@ -47,13 +47,13 @@ pub fn is_newer(a: &str, b: &str) -> bool {
         let cleaned = s.strip_prefix('v').unwrap_or(s);
         cleaned
             .split('.')
-            .filter_map(|p| {
+            .map(|p| {
                 p.trim()
                     .chars()
                     .take_while(|c| c.is_ascii_digit())
                     .collect::<String>()
                     .parse()
-                    .ok()
+                    .unwrap_or(0)
             })
             .collect()
     };
@@ -670,7 +670,7 @@ fn mark_checked_at(stamp: &Path) {
 /// Background self-update check. Called once from a temporary thread started
 /// at launch, so it can never delay startup. Only installs when idle - see
 /// the caller in main.rs.
-pub fn background_check_auto() {
+fn background_check_auto() {
     if !should_check_today() {
         return;
     }
@@ -754,6 +754,17 @@ mod tests {
         assert!(!is_newer("abc", "1.0.0"));
         assert!(!is_newer("", ""));
         assert!(is_newer("v2.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn malformed_middle_segment_does_not_shift_positions() {
+        // "0.x.5" parses segments [0, 0, 5], preserving the position of '5'
+        // at index 2 rather than dropping 'x' and shifting 5 to index 1 (minor).
+        // If 5 were shifted to index 1, it would compare 5 > 0 against "0.0.6"
+        // and falsely claim to be newer. With positional alignment preserved,
+        // it correctly compares index 2: 5 < 6.
+        assert!(!is_newer("0.x.5", "0.0.6"));
+        assert!(is_newer("0.x.5", "0.0.4"));
     }
 
     // --- reading the release feed -----------------------------------------

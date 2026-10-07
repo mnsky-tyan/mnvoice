@@ -162,7 +162,7 @@ jobs:
       # for every platform. The Unix sidecars are named after their asset -
       # SHA256SUMS is the Windows spelling, the only one update.rs's
       # CHECKSUMS_ASSET reads, and the README documents both.
-      - name: Package artifact
+      - name: Package artifacts
         uses: ./.github/actions/package-release
         with:
           binary: target/x86_64-unknown-linux-gnu/release/mnvoice
@@ -221,7 +221,7 @@ jobs:
       # The shared package action prints "<hash>  <name>" with two spaces, the
       # exact format the updater parses, using whichever sha256 spelling this
       # runner carries (see the Linux job for the naming note).
-      - name: Package artifact
+      - name: Package artifacts
         uses: ./.github/actions/package-release
         with:
           binary: target/aarch64-apple-darwin/release/mnvoice

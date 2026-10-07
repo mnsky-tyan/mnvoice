@@ -29,9 +29,11 @@ runs:
         # verify-release-tag action sets the same example; do not revert this.
         TAG: ${{ inputs.tag }}
         FILES: ${{ inputs.files }}
+        REPO: ${{ github.repository }}
       run: |
         $ErrorActionPreference = 'Stop'
         $tag = $env:TAG
+        $repo = $env:REPO
         $files = @($env:FILES -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         # Fail closed on an empty list: both verification loops below would
         # silently no-op and this step would report "confirmed assets" having
@@ -57,7 +59,7 @@ runs:
         # under. update.rs hardcodes that slug as literals in its URLs, so the
         # two are kept in step by hand: a fork must change BOTH for its own
         # binaries to update from it.
-        $json = curl -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" | Out-String
+        $json = curl -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/releases/tags/$tag" | Out-String
         if ($LASTEXITCODE -ne 0) { throw "could not read $tag from api.github.com (curl exit $LASTEXITCODE)" }
         $assets = @(($json | ConvertFrom-Json).assets.name)
         foreach ($need in $files) {

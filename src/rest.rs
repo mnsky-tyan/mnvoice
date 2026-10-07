@@ -60,8 +60,7 @@ pub fn parse_json_transcript(json: &str) -> Option<String> {
             let after_key = &json[key_pos + key.len()..];
             if let Some(colon_pos) = after_key.find(':') {
                 let after_colon = after_key[colon_pos + 1..].trim_start();
-                if after_colon.starts_with('"') {
-                    let s = &after_colon[1..];
+                if let Some(s) = after_colon.strip_prefix('"') {
                     let mut out = String::new();
                     let mut chars = s.chars();
                     while let Some(c) = chars.next() {
@@ -143,13 +142,20 @@ pub fn strip_disfluencies(text: &str) -> String {
 /// control surfaces state the rule the same way; it lives here because the
 /// Windows tray and the Unix terminal CLI would otherwise each keep their own
 /// copy and drift.
+/// True when a trailing space should be appended: trailing space is enabled
+/// and the typed text is non-empty. Single-sourced so REST and streaming
+/// agree by construction.
+pub fn trailing_space_due(trailing_space: bool, text: &str) -> bool {
+    trailing_space && !text.is_empty()
+}
+
 pub fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
     let text = if strip_fillers {
         strip_disfluencies(raw.trim())
     } else {
         raw.trim().to_string()
     };
-    let space = trailing_space && !text.is_empty();
+    let space = trailing_space_due(trailing_space, &text);
     (text, space)
 }
 
@@ -278,8 +284,8 @@ mod tests {
             max_seconds: 120,
             trailing_space: true,
             keywords: Vec::new(),
-            orb_color: (1.0, 0.18, 0.58),
-            orb_fluid_level: 0.75,
+            orb_color: crate::config::DEFAULT_ORB_COLOR,
+            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
             hotkey: (0x4001, 0x20),
             hotkey_str: "Alt+Space".into(),
             cancel_key: (0x4000, 0x1B),
@@ -409,6 +415,11 @@ mod tests {
     /// together in the focused window as "hello worldagain".
     #[test]
     fn trailing_space_appends_only_after_a_real_transcript() {
+        assert!(trailing_space_due(true, "hello"));
+        assert!(!trailing_space_due(true, ""));
+        assert!(!trailing_space_due(false, "hello"));
+        assert!(!trailing_space_due(false, ""));
+
         let (_, space) = rest_typing("hello world", true, true);
         assert!(space);
         let (_, space) = rest_typing("hello world", true, false);
