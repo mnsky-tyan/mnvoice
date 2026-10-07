@@ -115,7 +115,20 @@ fn watch_recording(
         }
         match capture_done.try_recv() {
             Ok(result) => return (result, opened.elapsed()),
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            // Disconnected means the capture thread died WITHOUT reporting:
+            // the sender only lives as long as the thread. Waiting longer can
+            // never help - this used to spin here forever, while the tray
+            // treats the same case as "no error" and moves on. Fail like any
+            // other capture failure instead.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return (
+                    Err("audio capture ended unexpectedly".into()),
+                    opened.elapsed(),
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
         }
     }
 }

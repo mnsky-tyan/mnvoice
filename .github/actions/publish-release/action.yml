@@ -33,6 +33,10 @@ runs:
         $ErrorActionPreference = 'Stop'
         $tag = $env:TAG
         $files = @($env:FILES -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        # Fail closed on an empty list: both verification loops below would
+        # silently no-op and this step would report "confirmed assets" having
+        # checked nothing. required:true does not enforce non-empty.
+        if ($files.Count -eq 0) { throw "no asset names were passed to publish-release" }
         foreach ($f in $files) {
           if (!(Test-Path $f)) { throw "$f was not produced" }
         }

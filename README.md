@@ -188,7 +188,7 @@ CANCEL_KEY=Escape
 
 Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win` (also accepted: `Option`, `Control`, `Windows`, `Super`, `Cmd`)  
 Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`/`Caps`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`  
-The word `none` is how either key is disabled: with `HOTKEY=none` no toggle key is registered and dictation moves to the tray menu's **Dictate** item; with `CANCEL_KEY=none` there is no way to discard a recording mid-speech (the CLI has no cancel key on any platform).
+The word `none` is how either key is disabled: with `HOTKEY=none` no toggle key is registered and dictation moves to the tray menu's **Dictate** item; with `CANCEL_KEY=none` there is no way to discard a recording mid-speech (the CLI has no cancel key on any platform). These settings need a loaded config - if the config itself fails to load (a missing API key, for example), the defaults apply instead.
 
 Examples:
 ```ini

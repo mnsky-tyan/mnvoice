@@ -148,12 +148,13 @@ fn run_session(
     let started = Instant::now();
     let mut silence = SilenceWindows::new();
     // All three natural exits below `break` instead of returning directly, so
-    // the error slot gets ONE final read after the loop: an error cpal's worker
-    // records while the last tick is finishing its work (sending the chunk,
-    // observing the stop) must still surface - checking the slot only at the
-    // top of the loop let a failure that landed in that window be reported as
-    // a clean stop, and a manual stop is exactly when the user needs to hear
-    // that the device, not they, ended the recording.
+    // the error slot gets ONE final read after the loop - and the stream is
+    // dropped before that read, so an error cpal's worker records while the
+    // last tick finishes OR while capture tears down must still surface.
+    // Checking the slot only at the top of the loop let a failure that landed
+    // in either window be reported as a clean stop, and a manual stop is
+    // exactly when the user needs to hear that the device, not they, ended
+    // the recording.
     loop {
         thread::sleep(Duration::from_millis(20));
 
@@ -193,14 +194,18 @@ fn run_session(
         }
     }
     // The last look before declaring success: cpal's error callback fires on
-    // its own thread, so a failure may have landed at any point this tick.
+    // its own thread - INCLUDING during teardown, because ALSA's Stream::drop
+    // wakes the device worker and joins it, and that worker can still invoke
+    // the error callback on its way out. Drop the stream FIRST so any
+    // teardown error is already in the slot when it is read; reading before
+    // the drop left a residual window where a failure that landed exactly
+    // here was swallowed and a clean Ok returned.
+    drop(stream);
     if let Ok(slot) = stream_error.lock() {
         if let Some(e) = slot.as_ref() {
             return Err(e.clone());
         }
     }
-    // `stream` drops as this scope ends, which stops capture and joins the
-    // device thread.
     Ok(())
 }
 

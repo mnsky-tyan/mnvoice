@@ -24,9 +24,12 @@ permissions:
   contents: write
 
 # One release ref at a time: a second run aimed at the same ref (say, a hand
-# dispatch on a tag while the push run is live) queues instead of interleaving
-# its publish steps with the first run's. The three platform jobs of a single
-# run are unaffected - they share one run and keep running in parallel.
+# dispatch on a tag while the push run is live) cannot interleave its publish
+# steps with the first run's. GitHub's default queue:single semantics apply:
+# at most one run waits here, and a newer pending run REPLACES an older
+# pending one (a force-replaced tag's stale run is dropped, which is what you
+# want); a run already in progress is never interrupted. The three platform
+# jobs of a single run share one run and keep running in parallel.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false

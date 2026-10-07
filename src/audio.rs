@@ -243,6 +243,19 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
         return Err("invalid mix format".into());
     }
 
+    // The read width below MUST be derived from sample_bytes, not assumed:
+    // the catch-all used to read four bytes for every non-16-bit format, so a
+    // 24-bit or 8-bit mix (or 16-bit float) read past the buffer and panicked
+    // on the last sample - and with the release profile's panic = "abort"
+    // that is the whole process dying, not one capture thread. Anything this
+    // function cannot represent exactly is an Err, never a best-effort read.
+    if (is_float && sample_bytes != 4) || (!is_float && sample_bytes != 2 && sample_bytes != 4) {
+        return Err(format!(
+            "unsupported mix format: {bits}-bit {} (expected 16-bit PCM, 32-bit PCM, or float32)",
+            if is_float { "float" } else { "PCM" }
+        ));
+    }
+
     let frame = channels * sample_bytes;
     if frame == 0 || raw.len() % frame != 0 {
         return Err("unexpected capture buffer size".into());
@@ -270,4 +283,51 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX) -> Result<Vec<i16>, String> {
 
     let step = rate as f64 / SAMPLE_RATE as f64;
     Ok(resample_linear(&mono, step))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mix format this converter cannot represent must be an Err, never a
+    /// best-effort read: the old catch-all read four bytes for every
+    /// non-16-bit format, so a 24-bit or 8-bit mix panicked on the last
+    /// sample - and with the release profile's panic = "abort" that is the
+    /// whole process dying. WAVEFORMATEX is field-for-field what WASAPI
+    /// hands over; only the fields convert_mix reads are populated.
+    #[test]
+    fn an_unsupported_mix_width_is_an_err_not_an_overread() {
+        let mut f = WAVEFORMATEX::default();
+        f.nChannels = 2;
+        f.nSamplesPerSec = 48000;
+
+        // 24-bit PCM: sample_bytes == 3, not float. The old code read four
+        // bytes per three-byte sample and panicked at the buffer end.
+        f.wBitsPerSample = 24;
+        f.wFormatTag = WAVE_FORMAT_PCM as u16;
+        let raw = vec![0u8; 3 * 2 * 10]; // 10 stereo 24-bit frames
+        assert!(convert_mix(&raw, &f).is_err(), "24-bit must be refused");
+
+        // 8-bit PCM: same catch-all, same over-read.
+        f.wBitsPerSample = 8;
+        let raw = vec![0u8; 1 * 2 * 10];
+        assert!(convert_mix(&raw, &f).is_err(), "8-bit must be refused");
+
+        // 16-bit float: is_float but sample_bytes == 2 - the old code read
+        // four bytes per two-byte sample.
+        f.wBitsPerSample = 16;
+        f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        let raw = vec![0u8; 2 * 2 * 10];
+        assert!(convert_mix(&raw, &f).is_err(), "16-bit float must be refused");
+
+        // The supported formats still convert: 16-bit PCM and float32.
+        f.wFormatTag = WAVE_FORMAT_PCM as u16;
+        f.wBitsPerSample = 16;
+        let raw = vec![0u8; 2 * 2 * 10];
+        assert!(convert_mix(&raw, &f).is_ok(), "16-bit PCM must convert");
+        f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        f.wBitsPerSample = 32;
+        let raw = vec![0u8; 4 * 2 * 10];
+        assert!(convert_mix(&raw, &f).is_ok(), "float32 must convert");
+    }
 }

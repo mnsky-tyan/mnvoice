@@ -1,18 +1,20 @@
 name: Verify release tag
 description: >-
-  The single owner of the tag-shape rule for a release: a tag must be exactly
-  vX.Y.Z or vX.Y.Z-<one platform segment>, and the version it names must equal
-  the crate version in Cargo.toml - and, enforced here at this publish gate
-  (the one place a release is born, and the only place that needs to enforce
-  it), the mnvoice package version in Cargo.lock, which the bump must move
-  with. The publisher (this workflow) accepts exactly that set,
-  and the consumer (the updater's tag_is_ours) recognizes the same shapes in
-  the feed - a tag with a second segment (v0.1.21-rc1-win), or a platform
-  this project does not publish (v0.1.21-android), fails here before anything
-  builds or publishes and is invisible to the updater once it is out.
-  Kept in one file on purpose: the rule used to be spelled in the job
-  selectors, three bash guards, build.rs and the updater, and the copies
-  disagreed on exactly the shapes this action rejects.
+  The single owner of the publish-gate check for a release: a tag must be
+  exactly vX.Y.Z or vX.Y.Z-<one platform segment>, and the version it names
+  must equal the crate version in Cargo.toml - and, enforced here at this
+  publish gate (the one place a release is born, and the only place that
+  needs to enforce it), the mnvoice package version in Cargo.lock, which the
+  bump must move with. The shape itself is deliberately spelled in a few
+  more places that must agree with this regex - the four trigger globs in
+  release.yml, the three job selectors, build.rs's looser filter, and the
+  updater's tag_is_ours - and this action is the last word among them: a tag
+  with a second segment (v0.1.21-rc1-win), or a platform this project does
+  not publish (v0.1.21-android), fails here before anything builds or
+  publishes and is invisible to the updater once it is out. Kept in one file
+  on purpose: the rule used to be spelled in the job selectors, three bash
+  guards, build.rs and the updater, and the copies disagreed on exactly the
+  shapes this action rejects.
 inputs:
   tag:
     required: true

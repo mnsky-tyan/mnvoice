@@ -145,10 +145,12 @@ struct App {
     /// load fall back to the default text while the key actually registered
     /// (or failed to) was a different one.
     hotkey_str: String,
-    /// Whether the toggle hotkey actually registered. False means the tip
-    /// must keep saying so: the first idle tip used to overwrite the startup
-    /// UNAVAILABLE warning with a cheerful "F9 to dictate" for a key that
-    /// does nothing.
+    /// Whether the toggle hotkey is available as configured: true when it
+    /// registered, and true for HOTKEY=none (disabled on purpose is the
+    /// configured state - nothing is missing). False means registration
+    /// FAILED, and the tip must keep saying so: the first idle tip used to
+    /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
+    /// dictate" for a key that does nothing.
     hotkey_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
