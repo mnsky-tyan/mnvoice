@@ -24,7 +24,9 @@
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
-use crate::platform::audio::{resample_linear, rms_of, Audio, SilenceWindows, I16_SCALE, SAMPLE_RATE};
+use crate::platform::audio::{
+    resample_linear, rms_of, Audio, SilenceWindows, I16_SCALE, SAMPLE_RATE,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};

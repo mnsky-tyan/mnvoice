@@ -828,12 +828,10 @@ fn worker(
             // this arm used to have with it. A cancelled session is the same
             // case - dictate_rest refuses to type it, and there is no reason
             // to upload it either.
-            let capture_err = capture_done
-                .as_ref()
-                .and_then(|done| match done.recv() {
-                    Ok(Err(e)) => Some(e),
-                    _ => None,
-                });
+            let capture_err = capture_done.as_ref().and_then(|done| match done.recv() {
+                Ok(Err(e)) => Some(e),
+                _ => None,
+            });
             match capture_err {
                 Some(e) => (false, e),
                 None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
@@ -1371,7 +1369,9 @@ fn balloon(title: &str, body: &str) {
 /// then exit.
 fn relaunch_for_restart() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(&exe).arg(update::RESTART_ARG).spawn();
+        let _ = std::process::Command::new(&exe)
+            .arg(update::RESTART_ARG)
+            .spawn();
     }
     unsafe { PostQuitMessage(0) };
 }
@@ -1488,7 +1488,10 @@ mod tests {
         // that silently does nothing.
         assert_eq!(dictate_item(State::Idle), ("Dictate", true));
         assert_eq!(dictate_item(State::Recording), ("Stop && transcribe", true));
-        assert_eq!(dictate_item(State::Transcribing), ("Transcribing...", false));
+        assert_eq!(
+            dictate_item(State::Transcribing),
+            ("Transcribing...", false)
+        );
     }
 
     #[test]
@@ -1496,7 +1499,10 @@ mod tests {
         // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
         // no config yet the documented default is what the tip names.
         assert_eq!(idle_tip("F9", true), "mnvoice - idle. F9 to dictate.");
-        assert_eq!(idle_tip("Alt+Space", true), "mnvoice - idle. Alt+Space to dictate.");
+        assert_eq!(
+            idle_tip("Alt+Space", true),
+            "mnvoice - idle. Alt+Space to dictate."
+        );
         // A hotkey that never registered keeps saying so: the first idle
         // write used to erase the startup UNAVAILABLE warning. This holds for
         // the default spelling too, which is what a config that failed to

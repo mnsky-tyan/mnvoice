@@ -16,8 +16,7 @@ use windows::Win32::System::Com::*;
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-const KSDATAFORMAT_SUBTYPE_PCM: GUID =
-    GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
@@ -52,7 +51,7 @@ fn sample_kind(format: &WAVEFORMATEX, mix_ptr: *const WAVEFORMATEX) -> Result<Sa
 }
 
 pub use crate::platform::audio::SAMPLE_RATE;
-use crate::platform::audio::{resample_linear, I16_SCALE, SilenceWindows};
+use crate::platform::audio::{resample_linear, SilenceWindows, I16_SCALE};
 
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
@@ -295,7 +294,12 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
     // on the last sample - and with the release profile's panic = "abort"
     // that is the whole process dying, not one capture thread. Anything this
     // function cannot represent exactly is an Err, never a best-effort read.
-    if (is_float && sample_bytes != 4) || (!is_float && sample_bytes != 2 && sample_bytes != 4) {
+    let supported = if is_float {
+        sample_bytes == 4
+    } else {
+        sample_bytes == 2 || sample_bytes == 4
+    };
+    if !supported {
         return Err(format!(
             "unsupported mix format: {bits}-bit {} (expected 16-bit PCM, 32-bit PCM, or float32)",
             if is_float { "float" } else { "PCM" }
@@ -343,14 +347,16 @@ mod tests {
     /// hands over; only the fields convert_mix reads are populated.
     #[test]
     fn an_unsupported_mix_width_is_an_err_not_an_overread() {
-        let mut f = WAVEFORMATEX::default();
-        f.nChannels = 2;
-        f.nSamplesPerSec = 48000;
+        let mut f = WAVEFORMATEX {
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            ..Default::default()
+        };
 
         // 24-bit PCM: sample_bytes == 3, not float. The old code read four
         // bytes per three-byte sample and panicked at the buffer end.
         f.wBitsPerSample = 24;
-        f.wFormatTag = WAVE_FORMAT_PCM as u16;
+        f.wFormatTag = WAVE_FORMAT_PCM;
         let raw = vec![0u8; 3 * 2 * 10]; // 10 stereo 24-bit frames
         assert!(
             convert_mix(&raw, &f, SampleKind::Int).is_err(),
@@ -359,7 +365,7 @@ mod tests {
 
         // 8-bit PCM: same catch-all, same over-read.
         f.wBitsPerSample = 8;
-        let raw = vec![0u8; 1 * 2 * 10];
+        let raw = vec![0u8; 2 * 10]; // 10 stereo 8-bit frames
         assert!(
             convert_mix(&raw, &f, SampleKind::Int).is_err(),
             "8-bit must be refused"
@@ -376,7 +382,7 @@ mod tests {
         );
 
         // The supported formats still convert: 16-bit PCM and float32.
-        f.wFormatTag = WAVE_FORMAT_PCM as u16;
+        f.wFormatTag = WAVE_FORMAT_PCM;
         f.wBitsPerSample = 16;
         let raw = vec![0u8; 2 * 2 * 10];
         assert!(
@@ -399,11 +405,13 @@ mod tests {
     /// as 1.0 with no error.
     #[test]
     fn a_32bit_pcm_mix_decodes_as_integer_not_float() {
-        let mut f = WAVEFORMATEX::default();
-        f.nChannels = 1;
-        f.nSamplesPerSec = SAMPLE_RATE;
-        f.wBitsPerSample = 32;
-        f.wFormatTag = WAVE_FORMAT_PCM as u16;
+        let f = WAVEFORMATEX {
+            nChannels: 1,
+            nSamplesPerSec: SAMPLE_RATE,
+            wBitsPerSample: 32,
+            wFormatTag: WAVE_FORMAT_PCM,
+            ..Default::default()
+        };
 
         let raw = [0x00u8, 0x00, 0x80, 0x3f];
         let out = convert_mix(&raw, &f, SampleKind::Int).expect("32-bit PCM must convert");
@@ -439,7 +447,7 @@ mod tests {
             SampleKind::Int
         );
 
-        ext.SubFormat = GUID::from_u128(0xdead_beef_dead_beef_dead_beefdeadbeef);
+        ext.SubFormat = GUID::from_u128(0xdead_beef_dead_beef_dead_beef_dead_beef);
         assert!(
             sample_kind(&ext.Format, &ext as *const _ as *const WAVEFORMATEX).is_err(),
             "unknown sub-format must be refused"
