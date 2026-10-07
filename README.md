@@ -122,7 +122,7 @@ system tray icon
     -> Open config          (opens mnvoice.env in Notepad)
     -> Open keywords        (opens keywords.txt in Notepad)
     -> Restart              (frees the hotkey and starts fresh)
-    -> Stop & transcribe
+    -> Dictate              (starts a dictation; reads "Stop & transcribe" while recording)
     -> Exit
 ```
 

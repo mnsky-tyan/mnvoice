@@ -54,7 +54,7 @@ unsafe fn app_icon() -> HICON {
 
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_ESC: i32 = 2;
-const IDM_STOP: usize = 1;
+const IDM_DICTATE: usize = 1;
 const IDM_EXIT: usize = 2;
 const IDM_STARTUP: usize = 3;
 const IDM_RESTART: usize = 4;
@@ -138,6 +138,13 @@ struct App {
     /// further and the final flush is skipped, so a cancel really discards.
     cancelled: Arc<AtomicBool>,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
+    /// The toggle hotkey's display spelling, computed once at startup (the
+    /// "none" disabled spelling, the configured one, or the default when the
+    /// config did not load). Every tip names this same value: deriving the
+    /// spelling from `config` at the call sites made a config that failed to
+    /// load fall back to the default text while the key actually registered
+    /// (or failed to) was a different one.
+    hotkey_str: String,
     /// Whether the toggle hotkey actually registered. False means the tip
     /// must keep saying so: the first idle tip used to overwrite the startup
     /// UNAVAILABLE warning with a cheerful "F9 to dictate" for a key that
@@ -250,11 +257,13 @@ pub fn main() {
         // so the window, the hotkey and the tray never wait on its spawns.
         thread::spawn(migrate_autostart);
 
-        let Some(hwnd) = create_tray_window(hinstance, config, audio_engine) else {
+        let Some(hwnd) = create_tray_window(hinstance, config, hk_str.clone(), audio_engine) else {
             return;
         };
-        // HOTKEY=none disables the toggle registration entirely (the tray menu
-        // starts and stops a dictation); vk == 0 is the disabled sentinel.
+        // HOTKEY=none disables the toggle registration entirely; the tray
+        // menu's Dictate item is then the only start and stop control (vk == 0
+        // is the disabled sentinel). A disabled control is not a failed one,
+        // so the tip may still say where dictation moved.
         let hotkey_ok = if hk_vk == 0 {
             log("hotkey disabled (HOTKEY=none); use the tray menu to dictate");
             true
@@ -262,7 +271,7 @@ pub fn main() {
             register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
         };
         app_ref(hwnd).hotkey_ok = hotkey_ok;
-        add_tray(hwnd, &idle_tip(Some(&hk_str), hotkey_ok));
+        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok));
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -382,11 +391,13 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
 fn create_tray_window(
     hinstance: HINSTANCE,
     config: Option<config::Config>,
+    hotkey_str: String,
     audio_engine: audio::AudioEngine,
 ) -> Option<HWND> {
     unsafe {
         let init = Box::into_raw(Box::new(AppInit {
             config,
+            hotkey_str,
             instance: hinstance,
             audio_engine,
         }));
@@ -461,6 +472,7 @@ fn run_message_loop() {
 
 struct AppInit {
     config: Option<config::Config>,
+    hotkey_str: String,
     instance: HINSTANCE,
     audio_engine: audio::AudioEngine,
 }
@@ -482,12 +494,11 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
 /// A disabled hotkey (HOTKEY=none) says where the control moved, and an
 /// unregistered one (held by another app) keeps saying so - the first idle
 /// write used to erase the startup warning and advertise a dead key.
-fn idle_tip(hotkey: Option<&str>, hotkey_ok: bool) -> String {
-    match hotkey {
-        None => "mnvoice - idle. Alt+Space to dictate.".to_string(),
-        Some("none") => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
-        Some(hk) if hotkey_ok => format!("mnvoice - idle. {hk} to dictate."),
-        Some(hk) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
+fn idle_tip(hotkey: &str, hotkey_ok: bool) -> String {
+    match (hotkey, hotkey_ok) {
+        ("none", _) => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
+        (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
+        (hk, false) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
     }
 }
 
@@ -539,6 +550,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     stop: Arc::new(AtomicBool::new(false)),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     outcome: Arc::new(Mutex::new(None)),
+                    hotkey_str: init.hotkey_str,
                     // The registration result arrives after WM_CREATE (the
                     // hwnd did not exist yet); main sets the real value.
                     hotkey_ok: true,
@@ -575,10 +587,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
                     let tip = match app.state {
-                        State::Idle => idle_tip(
-                            app.config.as_ref().map(|c| c.hotkey_str.as_str()),
-                            app.hotkey_ok,
-                        ),
+                        State::Idle => idle_tip(&app.hotkey_str, app.hotkey_ok),
                         State::Recording => "mnvoice - listening... (auto-stops on silence)".to_string(),
                         State::Transcribing => "mnvoice - transcribing...".to_string(),
                     };
@@ -597,13 +606,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    let _ = set_tray_tip(
-                        hwnd,
-                        &idle_tip(
-                            app.config.as_ref().map(|c| c.hotkey_str.as_str()),
-                            app.hotkey_ok,
-                        ),
-                    );
+                    let _ = set_tray_tip(hwnd, &idle_tip(&app.hotkey_str, app.hotkey_ok));
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription. On REST nothing
@@ -635,11 +638,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         set_state(app, State::Idle);
                         PostQuitMessage(0);
                     }
-                    IDM_STOP => {
+                    IDM_DICTATE => {
                         let app = app_ref(hwnd);
-                        if app.state == State::Recording {
-                            toggle(app);
-                        }
+                        toggle(app);
                     }
                     IDM_STARTUP => {
                         // Toggle the logon task. The Run key is cleared as a side
@@ -765,15 +766,7 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    let _ = unsafe {
-        set_tray_tip(
-            app.hwnd,
-            &idle_tip(
-                app.config.as_ref().map(|c| c.hotkey_str.as_str()),
-                app.hotkey_ok,
-            ),
-        )
-    };
+    let _ = unsafe { set_tray_tip(app.hwnd, &idle_tip(&app.hotkey_str, app.hotkey_ok)) };
     log("recording cancelled");
 }
 
@@ -880,10 +873,15 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART, w!("Restart"));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, IDM_STOP, w!("Stop && transcribe"));
-    if !recording {
-        let _ = EnableMenuItem(menu, IDM_STOP as u32, MF_GRAYED);
-    }
+    // One item, both directions: with HOTKEY=none this is the only way to
+    // start a dictation, and it must never be a grayed-out stop item while
+    // idle. Its label follows the state so the single action is legible.
+    let dictate_label = if recording {
+        w!("Stop && transcribe")
+    } else {
+        w!("Dictate")
+    };
+    let _ = AppendMenuW(menu, MF_STRING, IDM_DICTATE, dictate_label);
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
 
     let mut pt = POINT::default();
@@ -1465,17 +1463,28 @@ mod tests {
     fn the_idle_tray_tip_names_the_configured_hotkey() {
         // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
         // no config yet the documented default is what the tip names.
-        assert_eq!(idle_tip(Some("F9"), true), "mnvoice - idle. F9 to dictate.");
-        assert_eq!(idle_tip(None, true), "mnvoice - idle. Alt+Space to dictate.");
+        assert_eq!(idle_tip("F9", true), "mnvoice - idle. F9 to dictate.");
+        assert_eq!(idle_tip("Alt+Space", true), "mnvoice - idle. Alt+Space to dictate.");
         // A hotkey that never registered keeps saying so: the first idle
-        // write used to erase the startup UNAVAILABLE warning.
+        // write used to erase the startup UNAVAILABLE warning. This holds for
+        // the default spelling too, which is what a config that failed to
+        // load leaves the app running on.
         assert_eq!(
-            idle_tip(Some("F9"), false),
+            idle_tip("F9", false),
             "mnvoice - idle. HOTKEY F9 UNAVAILABLE (in use by another app)"
         );
-        // HOTKEY=none moved the control to the tray; the tip says where.
         assert_eq!(
-            idle_tip(Some("none"), true),
+            idle_tip("Alt+Space", false),
+            "mnvoice - idle. HOTKEY Alt+Space UNAVAILABLE (in use by another app)"
+        );
+        // HOTKEY=none moved the control to the tray; the tip says where, and
+        // the deliberately disabled key is not reported as a failed one.
+        assert_eq!(
+            idle_tip("none", true),
+            "mnvoice - idle. Hotkey disabled - use the tray menu."
+        );
+        assert_eq!(
+            idle_tip("none", false),
             "mnvoice - idle. Hotkey disabled - use the tray menu."
         );
     }

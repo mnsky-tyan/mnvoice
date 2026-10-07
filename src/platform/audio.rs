@@ -19,10 +19,12 @@ pub const SAMPLE_RATE: u32 = 16_000;
 
 /// The f32 scale for 16-bit PCM: `i16::MIN` maps to exactly -1.0, and the
 /// missing +32768th step costs half a count of headroom at the top. Every
-/// conversion in the crate shares this one constant (the WAV reader, the
-/// Windows engine, the cpal callback), so a sample captured on one platform
-/// means the same level everywhere - the two engines once divided by
-/// different constants here, which is the drift this exists to prevent.
+/// conversion from i16 to f32 in the crate shares this one constant (the
+/// Windows engine's `convert_mix` and the Unix cpal callback), so a sample
+/// captured on one platform means the same level everywhere - the two engines
+/// once divided by different constants here, which is the drift this exists to
+/// prevent. The f32-to-i16 direction is not covered: `resample_linear`
+/// multiplies by `i16::MAX`, the positive extreme of the target type.
 pub const I16_SCALE: f32 = 32768.0;
 
 /// A session that has heard no speech at all ends itself after this long, so
