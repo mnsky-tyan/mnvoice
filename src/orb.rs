@@ -387,7 +387,10 @@ fn render_gas_fluid(
                 add_light(&mut px, cr, cg, cb, body_int);
 
                 // Luminous filaments & tendrils
-                let filament = (gas_volume * 1.45 * (fluid_mult / crate::config::DEFAULT_ORB_FLUID_LEVEL) - 0.28).clamp(0.0, 1.0);
+                let filament =
+                    (gas_volume * 1.45 * (fluid_mult / crate::config::DEFAULT_ORB_FLUID_LEVEL)
+                        - 0.28)
+                        .clamp(0.0, 1.0);
                 let fil_r = (base_r + 0.3).min(1.0);
                 let fil_g = (base_g + 0.3).min(1.0);
                 let fil_b = (base_b + 0.3).min(1.0);

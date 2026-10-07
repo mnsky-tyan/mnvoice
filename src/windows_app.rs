@@ -561,12 +561,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CREATE => {
                 let cs = &*(lparam.0 as *const CREATESTRUCTW);
                 let init = Box::from_raw(cs.lpCreateParams as *mut AppInit);
-                let color = init.config.as_ref().map(|c| c.orb_color).unwrap_or(crate::config::DEFAULT_ORB_COLOR);
-                let fluid = init.config.as_ref().map(|c| c.orb_fluid_level).unwrap_or(crate::config::DEFAULT_ORB_FLUID_LEVEL);
-                let orb = orb::Orb::new(init.instance, color, fluid).map_err(|e| {
-                    log(&format!("orb init: {e}"));
-                    e
-                }).ok();
+                let color = init
+                    .config
+                    .as_ref()
+                    .map(|c| c.orb_color)
+                    .unwrap_or(crate::config::DEFAULT_ORB_COLOR);
+                let fluid = init
+                    .config
+                    .as_ref()
+                    .map(|c| c.orb_fluid_level)
+                    .unwrap_or(crate::config::DEFAULT_ORB_FLUID_LEVEL);
+                let orb = orb::Orb::new(init.instance, color, fluid)
+                    .map_err(|e| {
+                        log(&format!("orb init: {e}"));
+                        e
+                    })
+                    .ok();
                 let app = Box::into_raw(Box::new(App {
                     hwnd,
                     state: State::Idle,
@@ -631,7 +641,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    set_tray_tip(hwnd, &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok));
+                    set_tray_tip(
+                        hwnd,
+                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok),
+                    );
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription. On REST nothing
@@ -770,7 +783,12 @@ fn toggle(app: &mut App) {
                 orb.show(orb::OrbState::Recording);
             }
             let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
-            unsafe { set_tray_tip(app.hwnd, &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok)) };
+            unsafe {
+                set_tray_tip(
+                    app.hwnd,
+                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok),
+                )
+            };
             log("recording started");
         }
         State::Recording => {
@@ -780,7 +798,12 @@ fn toggle(app: &mut App) {
             if let Some(orb) = &mut app.orb {
                 orb.set_state(orb::OrbState::Transcribing);
             }
-            unsafe { set_tray_tip(app.hwnd, &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok)) };
+            unsafe {
+                set_tray_tip(
+                    app.hwnd,
+                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok),
+                )
+            };
             log("recording stopped, transcribing");
         }
         State::Transcribing => {}
@@ -803,7 +826,12 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    unsafe { set_tray_tip(app.hwnd, &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok)) };
+    unsafe {
+        set_tray_tip(
+            app.hwnd,
+            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok),
+        )
+    };
     log("recording cancelled");
 }
 
