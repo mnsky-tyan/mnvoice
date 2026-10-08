@@ -129,7 +129,11 @@ fn set_state(app: &mut App, state: State) {
 struct App {
     hwnd: HWND,
     state: State,
-    config: Option<config::Config>,
+    /// Shared, not owned: `toggle()` reads this on every push-to-talk, and
+    /// an owned `Config` meant deep-cloning the api key, the base URL and the
+    /// whole keywords list once per dictation. It is written once, in
+    /// WM_CREATE, and only ever read afterwards.
+    config: Option<Arc<config::Config>>,
     /// This session's flags. FRESH ARCS PER SESSION, never reset in place: a
     /// stale worker from a cancelled session holds its own clones, so its
     /// cancelled flag stays set forever (its streaming flush can never type
@@ -224,11 +228,15 @@ pub fn main() {
         InstanceClaim::Acquired(handle) => handle,
     };
     let config = load_config_or_log();
+    // Shared from here on: the tray window keeps it for the life of the app
+    // and every session reads it, so it is wrapped once instead of being
+    // deep-copied per dictation.
+    let config = config.map(Arc::new);
     let (hk_mod, hk_vk, hk_str) = hotkey_of(&config);
     let cancel_str = config
         .as_ref()
         .map(|c| c.cancel_key_str.clone())
-        .unwrap_or_else(|| "Escape".to_string());
+        .unwrap_or_else(|| config::DEFAULT_CANCEL_STR.to_string());
 
     log(&format!(
         "mnvoice v{} started (pid {}, protocol {:?}, model {}, hotkey: {}, cancel: {}, keywords: {})",
@@ -267,7 +275,9 @@ pub fn main() {
         // so the window, the hotkey and the tray never wait on its spawns.
         thread::spawn(migrate_autostart);
 
-        let Some(hwnd) = create_tray_window(hinstance, config, hk_str.clone(), audio_engine) else {
+        let Some(hwnd) =
+            create_tray_window(hinstance, config, hk_str.clone(), audio_engine)
+        else {
             return;
         };
         // HOTKEY=none disables the toggle registration entirely; the tray
@@ -363,7 +373,7 @@ fn load_config_or_log() -> Option<config::Config> {
 
 /// The hotkey pair and its display spelling, or the defaults when the
 /// config did not load.
-fn hotkey_of(config: &Option<config::Config>) -> (HOT_KEY_MODIFIERS, u32, String) {
+fn hotkey_of(config: &Option<Arc<config::Config>>) -> (HOT_KEY_MODIFIERS, u32, String) {
     config
         .as_ref()
         .map(|c| {
@@ -404,7 +414,7 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
 /// off. `None` means the app cannot start.
 fn create_tray_window(
     hinstance: HINSTANCE,
-    config: Option<config::Config>,
+    config: Option<Arc<config::Config>>,
     hotkey_str: String,
     audio_engine: audio::AudioEngine,
 ) -> Option<HWND> {
@@ -485,7 +495,7 @@ fn run_message_loop() {
 }
 
 struct AppInit {
-    config: Option<config::Config>,
+    config: Option<Arc<config::Config>>,
     hotkey_str: String,
     instance: HINSTANCE,
     audio_engine: audio::AudioEngine,
@@ -839,7 +849,7 @@ fn worker(
     session_id: usize,
     stop: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
-    cfg: config::Config,
+    cfg: Arc<config::Config>,
     outcome: Arc<Mutex<Option<(bool, String)>>>,
     hwnd_bits: usize,
     audio_engine: audio::AudioEngine,

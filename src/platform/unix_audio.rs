@@ -25,7 +25,7 @@
 //     transcriber consumer can never make the callback overrun.
 
 use crate::platform::audio::{
-    resample_linear, rms_of, Audio, SilenceWindows, I16_SCALE, SAMPLE_RATE,
+    resample_linear, resample_step, rms_of, Audio, SilenceWindows, I16_SCALE,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -85,7 +85,7 @@ fn run_session(
     // built-in input's nominal rate, is not) has to be resampled rather than
     // decimated, or the provider is told 16 kHz and handed audio running at
     // some other rate entirely.
-    let resample_step = in_rate as f64 / SAMPLE_RATE as f64;
+    let resample_step = resample_step(in_rate as u32);
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 

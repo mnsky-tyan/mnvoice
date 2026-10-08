@@ -14,7 +14,7 @@
 // at the 302 would download an HTML page and stage it as an executable. The
 // trait documents the contract; the test in `update.rs` pins it.
 
-use crate::platform::http::{Response, Transport, WebSocket};
+use crate::platform::http::{Response, Transport, WebSocket, MAX_RESPONSE_BYTES, USER_AGENT};
 use crate::rest::parse_base_url;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Networking::WinHttp::*;
@@ -195,7 +195,14 @@ impl WinHttpTransport {
     unsafe fn read_body(request: *mut std::ffi::c_void) -> Vec<u8> {
         let mut body = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
+        // Capped like the unix backend so the two keep one contract: a
+        // misbehaving server cannot stream an unbounded body into a process
+        // that is meant to stay responsive.
+        let cap = MAX_RESPONSE_BYTES as usize;
         loop {
+            if body.len() >= cap {
+                break;
+            }
             let mut read = 0u32;
             let ok = WinHttpReadData(
                 request,
@@ -206,7 +213,8 @@ impl WinHttpTransport {
             if ok.is_err() || read == 0 {
                 break;
             }
-            body.extend_from_slice(&chunk[..read as usize]);
+            let room = cap - body.len();
+            body.extend_from_slice(&chunk[..(read as usize).min(room)]);
         }
         body
     }
@@ -220,9 +228,7 @@ impl Transport for WinHttpTransport {
             let (handles, _) = Self::open("GET", url, (0, 15_000, 45_000))?;
             let request = handles.request();
 
-            let headers = wide(&format!(
-                "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
-            ));
+            let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: {USER_AGENT}\r\n"));
             let result = (|| {
                 // Headers go on before the send; anything added afterwards
                 // never reaches the wire. Trailing CRLF trimmed because
@@ -297,6 +303,10 @@ impl Transport for WinHttpTransport {
     }
 
     fn websocket(&self, url: &str, headers: &[(&str, &str)]) -> Result<Box<dyn WebSocket>, String> {
+        // WINHTTP_ADDREQ_FLAG_COOKIE, named rather than written as the bare
+        // literal 0x2000_0000 so the header flags this file passes read the
+        // same way as the WINHTTP_ADDREQ_FLAG_ADD used by get/post above.
+        const ADD_REQ_FLAG_COOKIE: u32 = 0x2000_0000;
         unsafe {
             // A streaming session is held open for the length of a dictation,
             // so there is no overall timeout and the socket carries no receive
@@ -322,7 +332,7 @@ impl Transport for WinHttpTransport {
                 let _ = WinHttpAddRequestHeaders(
                     request,
                     &headers_w[..headers_w.len() - 1],
-                    0x2000_0000,
+                    ADD_REQ_FLAG_COOKIE,
                 );
             }
 

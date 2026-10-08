@@ -41,6 +41,23 @@ pub fn current_version() -> String {
     crate::platform::version()
 }
 
+/// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
+///
+/// Both the "is it time to check" read and the stamp write read the clock, and
+/// they want *opposite* behaviour when it is degenerate, so the shared helper
+/// says which is which: 0 makes the read fail open (0 saturating-subtracted
+/// is never more than a day old, so a check happens - the safe direction),
+/// while the write stamps 0 and every later start then reads 0 and concludes a
+/// check is due. That is why `mark_checked_at` treats 0 as "do not record"
+/// instead of persisting a stamp that forces a check on every start until the
+/// clock is fixed.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// True when `a` is strictly newer than `b`, comparing dotted numeric parts.
 pub fn is_newer(a: &str, b: &str) -> bool {
     let parts = |s: &str| -> Vec<u32> {
@@ -440,8 +457,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     let old = match stage_and_swap(&bytes, &exe, &busy) {
         Ok(old) => old,
         Err(e) => {
-            let _ = helper.kill();
-            reap_helpers();
+            stop_helper(&mut helper);
             return Err(e);
         }
     };
@@ -451,13 +467,11 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // exe's path, so the old process must not keep running the renamed one.
     if let Err(e) = Command::new(&exe).arg(RESTART_ARG).spawn() {
         let _ = fs::rename(&old, &exe);
-        let _ = helper.kill();
-        reap_helpers();
+        stop_helper(&mut helper);
         return Err(format!("cannot start the new exe ({e})"));
     }
     crate::windows_app::log(&format!("updated to v{version}, relaunching"));
-    let _ = helper.kill();
-    reap_helpers();
+    stop_helper(&mut helper);
     std::process::exit(0);
 }
 
@@ -492,6 +506,21 @@ fn spawn_helper(exe: &Path) -> Result<std::process::Child, String> {
 /// its own pid, so a second install never has to share one.
 fn helper_copy_path() -> PathBuf {
     std::env::temp_dir().join(format!("{HELPER_IMAGE_PREFIX}{}.exe", std::process::id()))
+}
+
+/// Stop the recovery helper, then take its copy away.
+///
+/// `Child::kill` is `TerminateProcess` on Windows, which returns as soon as the
+/// termination is *requested*, not when the process is gone. Reaping the helper
+/// file straight after that races the dying process for its own image, so the
+/// wait comes first: once `wait` returns, the handle is released and the file is
+/// genuinely free. Without it the code asserts an invariant ("killed, so it can
+/// never repair") that the OS does not actually guarantee for a few microseconds
+/// after the call.
+fn stop_helper(helper: &mut std::process::Child) {
+    let _ = helper.kill();
+    let _ = helper.wait();
+    reap_helpers();
 }
 
 /// Take the helper copies left in the temp directory away. Best effort, like
@@ -642,10 +671,10 @@ fn should_check_at(stamp: &Path) -> bool {
     let Ok(last) = text.trim().parse::<u64>() else {
         return true;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // Fail open on a degenerate clock: now_secs() returns 0 before 1970,
+    // 0.saturating_sub(anything) is never more than a day, so a check runs -
+    // which is the safe direction to be wrong in.
+    let now = now_secs();
     now.saturating_sub(last) > 86_400
 }
 
@@ -660,10 +689,14 @@ fn mark_checked() {
 }
 
 fn mark_checked_at(stamp: &Path) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = now_secs();
+    if now == 0 {
+        // Clock before 1970: recording 0 would make every subsequent start
+        // read a zero stamp, compute an enormous elapsed time and check again,
+        // so the daily limit would never hold until the clock is corrected.
+        // Skipping the write leaves the previous stamp and its limit intact.
+        return;
+    }
     let _ = fs::write(stamp, now.to_string());
 }
 

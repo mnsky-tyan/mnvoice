@@ -38,9 +38,30 @@ runs:
         # Fail closed on an empty list: both verification loops below would
         # silently no-op and this step would report "confirmed assets" having
         # checked nothing. required:true does not enforce non-empty.
-        if ($files.Count -eq 0) { throw "no asset names were passed to publish-release" }
+        #
+        # Guards collect into $failed and are raised ONCE, not by `throw`. A
+        # terminating `throw` leaves PowerShell in a state that stops the rest
+        # of this same `run:` block, so throwing from a guard would skip the
+        # upload, the API cross-check and the confirmation line. And
+        # $ErrorActionPreference='Stop' does not close that hole: it governs
+        # cmdlet errors, not native ones - a failing `gh` or `curl` falls
+        # through to the next statement with only $LASTEXITCODE to show for it
+        # (measured on Windows PowerShell 5.1). Every native call below is
+        # therefore followed by an explicit $LASTEXITCODE check.
+        #
+        # The failures are reported with Write-Host, not Write-Error: under
+        # $ErrorActionPreference='Stop' a Write-Error is itself a terminating
+        # error, which would reintroduce exactly the behaviour being removed
+        # here. Write-Host plus an explicit `exit 1` reports every problem in
+        # one run and still fails the step.
+        $failed = @()
+        if ($files.Count -eq 0) { $failed += "no asset names were passed to publish-release" }
         foreach ($f in $files) {
-          if (!(Test-Path $f)) { throw "$f was not produced" }
+          if (!(Test-Path $f)) { $failed += "$f was not produced" }
+        }
+        if ($failed.Count -gt 0) {
+          foreach ($m in $failed) { Write-Host "ERROR: $m" -ForegroundColor Red }
+          exit 1
         }
         gh release view $tag *> $null
         if ($LASTEXITCODE -eq 0) {
@@ -48,7 +69,7 @@ runs:
         } else {
           gh release create $tag --title $tag --verify-tag @files
         }
-        if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
+        if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: gh release failed with exit code $LASTEXITCODE" -ForegroundColor Red; exit 1 }
         Write-Host "published $tag"
 
         # Belt and braces: an empty or partial release must never ship unnoticed.
@@ -60,11 +81,13 @@ runs:
         # two are kept in step by hand: a fork must change BOTH for its own
         # binaries to update from it.
         $json = curl -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/releases/tags/$tag" | Out-String
-        if ($LASTEXITCODE -ne 0) { throw "could not read $tag from api.github.com (curl exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: could not read $tag from api.github.com (curl exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
         $assets = @(($json | ConvertFrom-Json).assets.name)
-        foreach ($need in $files) {
-          if ($assets -notcontains $need) {
-            throw "release $tag is missing $need. Assets found: '$($assets -join ', ')"
-          }
+        $missing = @($files | Where-Object { $assets -notcontains $_ })
+        if ($missing.Count -gt 0) {
+          # One error naming everything absent, so a partial upload is
+          # diagnosed in a single run instead of one file per run.
+          Write-Host "ERROR: release $tag is missing $($missing -join ', '). Assets found: '$($assets -join ', ')'"
+          exit 1
         }
         Write-Host "confirmed assets on $tag"

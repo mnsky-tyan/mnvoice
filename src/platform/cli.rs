@@ -54,7 +54,21 @@ pub fn run() -> Result<(), String> {
     let (line_tx, lines) = mpsc::channel::<()>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
-        for _ in stdin.lock().lines() {
+        let mut lines = stdin.lock().lines();
+        // `lines()` yields Err for a line that is not valid UTF-8 as well as
+        // for a genuine read failure, and both used to end the loop silently,
+        // which closed the channel and ended the whole session: one stray
+        // non-ASCII byte pasted into the terminal looked exactly like Ctrl-D.
+        // The bad line is reported and skipped instead.
+        loop {
+            match lines.next() {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    eprintln!("mnvoice: ignoring unreadable input line ({e})");
+                    continue;
+                }
+                None => break,
+            }
             if line_tx.send(()).is_err() {
                 break;
             }

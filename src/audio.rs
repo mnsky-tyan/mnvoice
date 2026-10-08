@@ -50,8 +50,7 @@ fn sample_kind(format: &WAVEFORMATEX, mix_ptr: *const WAVEFORMATEX) -> Result<Sa
     }
 }
 
-pub use crate::platform::audio::SAMPLE_RATE;
-use crate::platform::audio::{resample_linear, SilenceWindows, I16_SCALE};
+use crate::platform::audio::{resample_linear, resample_step, SilenceWindows, I16_SCALE};
 
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
@@ -335,13 +334,14 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
         mono.push(acc / channels as f32);
     }
 
-    let step = rate as f64 / SAMPLE_RATE as f64;
+    let step = resample_step(rate as u32);
     Ok(resample_linear(&mono, step))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::audio::SAMPLE_RATE;
 
     /// A mix format this converter cannot represent must be an Err, never a
     /// best-effort read: the old catch-all read four bytes for every

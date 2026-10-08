@@ -13,6 +13,24 @@
 // explicit channels, and adding a reactor would put a scheduler between the
 // microphone and the socket for no benefit.
 
+/// The `User-Agent` every request identifies as.
+///
+/// It lives here, in the seam both backends implement, because the two
+/// implementations otherwise drift: WinHTTP only sends what the caller spells
+/// out, while ureq substitutes its own agent string when the caller sets none.
+/// A client that identifies itself differently per platform is a client whose
+/// server-side logs cannot be correlated.
+pub const USER_AGENT: &str = "mnvoice-update";
+
+/// Ceiling on a REST transcription response, in bytes.
+///
+/// The endpoint is user-configured, so this is a robustness bound rather than
+/// an attacker-facing one: a mistyped or hostile `BASE_URL` must not be able to
+/// stream an unbounded body into a process whose whole job is to stay
+/// responsive. A transcript is a few kilobytes; 8 MiB is far above any real
+/// one and far below anything that would strain the allocator.
+pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Response to a completed request. The status is carried rather than turned
 /// into an error here, because the callers disagree about which codes are
 /// interesting: the update path wants to say "HTTP 404" in its message, while

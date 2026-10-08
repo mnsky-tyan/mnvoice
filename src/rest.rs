@@ -199,10 +199,27 @@ pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> 
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("bad BASE_URL: {url}"))?;
-    let secure = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss");
+    // An allow-list, not a deny-list: anything that is not one of these four
+    // is refused rather than treated as cleartext. Treating "not https" as
+    // "plain http" silently downgrades a mistyped scheme - ftp:// or gopher://
+    // would parse fine and then post the transcript unencrypted to a host the
+    // user wrote believing it was secure.
+    let secure = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => true,
+        "http" | "ws" => false,
+        _ => return Err(format!("unsupported scheme {scheme}:// in BASE_URL (use http, https, ws or wss): {url}")),
+    };
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, format!("/{}", p.trim_start_matches('/'))),
         None => (rest, String::new()),
+    };
+    // Userinfo is stripped before the host/port split: `rsplit_once(':')` on
+    // "user:pass@host:8080" would otherwise hand back "user:pass@host" as the
+    // host, which no resolver can answer. The authority parser in the http
+    // crate drops userinfo the same way, so both ends now normalise alike.
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
     };
     let (host, port) = if authority.starts_with('[') {
         let end = authority
@@ -281,7 +298,7 @@ mod tests {
             model: "nova-3".into(),
             language: "en".into(),
             base_url: "https://127.0.0.1:1".into(),
-            max_seconds: 120,
+            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
             trailing_space: true,
             keywords: Vec::new(),
             orb_color: crate::config::DEFAULT_ORB_COLOR,
@@ -289,9 +306,9 @@ mod tests {
             hotkey: (0x4001, 0x20),
             hotkey_str: "Alt+Space".into(),
             cancel_key: (0x4000, 0x1B),
-            cancel_key_str: "Escape".into(),
-            vad_silence_ms: 3000,
-            vad_rms_threshold: 400.0,
+            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
+            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: true,
             auto_update: false,
         };
@@ -344,6 +361,61 @@ mod tests {
         assert_eq!(port, 80);
         assert!(!secure);
         assert_eq!(path, "/");
+    }
+
+    /// A scheme that is neither http(s) nor ws(s) used to parse as cleartext,
+    /// so a mistyped or hostile `BASE_URL` silently downgraded the transcript
+    /// to an unencrypted request instead of being refused.
+    #[test]
+    fn an_unsupported_scheme_is_refused_rather_than_downgraded_to_cleartext() {
+        for url in [
+            "ftp://api.deepgram.com",
+            "gopher://example.com/x",
+            "file:///etc/passwd",
+        ] {
+            let err = parse_base_url(url).unwrap_err();
+            assert!(
+                err.contains("unsupported scheme"),
+                "{url} was accepted or mis-reported: {err}"
+            );
+        }
+    }
+
+    /// The four schemes the app actually speaks must all still parse, and the
+    /// secure pair must still mark themselves secure.
+    #[test]
+    fn the_four_supported_schemes_all_parse() {
+        for (url, want_secure) in [
+            ("http://h:1/p", false),
+            ("https://h:1/p", true),
+            ("ws://h:1/p", false),
+            ("wss://h:1/p", true),
+        ] {
+            let (_, _, secure, path) = parse_base_url(url).unwrap();
+            assert_eq!(secure, want_secure, "{url}");
+            assert_eq!(path, "/p", "{url}");
+        }
+    }
+
+    /// `rsplit_once(':')` used to hand "user:pass@host" back as the host, so
+    /// credentials in the URL left the connector with an unresolvable name.
+    /// The userinfo is dropped before the host/port split, which also matches
+    /// what the http crate's authority parser does.
+    #[test]
+    fn credentials_in_the_url_are_stripped_before_the_host_is_split() {
+        let (host, port, _, _) = parse_base_url("https://user:pass@api.example.com:8443/p").unwrap();
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 8443);
+
+        let (host, port, _, _) = parse_base_url("http://token@api.example.com/p").unwrap();
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 80);
+
+        // Credentials in front of an IPv6 literal must not defeat the
+        // bracket handling either.
+        let (host, port, _, _) = parse_base_url("http://user@[::1]:8080/p").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
     }
 
     #[test]

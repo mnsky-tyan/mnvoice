@@ -183,6 +183,11 @@ pub fn run_stream(
 
     let full_transcript = Arc::new(Mutex::new(String::new()));
     let reader_done = Arc::new(AtomicBool::new(false));
+    // A transport failure mid-dictation is not a clean close, and the seam
+    // types `read` as a Result precisely so the two can be told apart. The
+    // message is kept here so the caller can report the real cause instead of
+    // telling the user they said nothing.
+    let read_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Capture this before the thread moves in, so the borrow cannot escape.
     let strip_fillers = cfg.strip_fillers;
@@ -192,6 +197,7 @@ pub fn run_stream(
     let stop_clone = stop.clone();
     let cancelled_clone = cancelled.clone();
     let reader_done_clone = reader_done.clone();
+    let read_error_clone = read_error.clone();
 
     let reader_thread = thread::spawn(move || {
         let mut typed_word_count = 0usize;
@@ -211,7 +217,15 @@ pub fn run_stream(
             let frame = match ws_reader.read() {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
-                Err(_) => break,
+                Err(e) => {
+                    // Keep it: a socket that dies mid-session would otherwise
+                    // be indistinguishable from silence, and the user is told
+                    // "no speech detected" for a provider fault.
+                    if let Ok(mut slot) = read_error_clone.lock() {
+                        *slot = Some(e);
+                    }
+                    break;
+                }
             };
             if frame.is_empty() {
                 break;
@@ -309,6 +323,15 @@ pub fn run_stream(
 
     let full_text = full_transcript.lock().unwrap().trim().to_string();
 
+    // A read that failed with nothing typed is a real failure and is reported
+    // as one. Once words have been typed the user already has their dictation,
+    // so the partial success stands and the error is not raised over it.
+    if full_text.is_empty() {
+        if let Some(e) = read_error.lock().unwrap().clone() {
+            return Err(format!("streaming transcription failed: {e}"));
+        }
+    }
+
     // Add trailing space if configured, but never on a cancelled session
     if crate::rest::trailing_space_due(cfg.trailing_space, &full_text)
         && !cancelled.load(Ordering::SeqCst)
@@ -337,7 +360,7 @@ mod tests {
             model: "nova-3".into(),
             language: "en".into(),
             base_url: "https://api.deepgram.com".into(),
-            max_seconds: 120,
+            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
             trailing_space: true,
             keywords: vec!["Kubernetes".into()],
             orb_color: crate::config::DEFAULT_ORB_COLOR,
@@ -345,9 +368,9 @@ mod tests {
             hotkey: (0x4001, 0x20),
             hotkey_str: "Alt+Space".into(),
             cancel_key: (0x4000, 0x1B),
-            cancel_key_str: "Escape".into(),
-            vad_silence_ms: 3000,
-            vad_rms_threshold: 400.0,
+            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
+            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: true,
             auto_update: false,
         }

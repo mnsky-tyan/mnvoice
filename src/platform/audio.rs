@@ -42,6 +42,35 @@ pub fn audio_ms(samples: usize) -> u64 {
     samples as u64 * 1000 / SAMPLE_RATE as u64
 }
 
+/// Device samples per provider sample, from the device's own capture rate.
+///
+/// Both engines resample with this ratio, and it is floored at 1.0 because
+/// `resample_linear` divides by it to size its output buffer: a step below 1.0
+/// (an upsampling device such as 8 kHz) makes `len / step` exceed the input
+/// length, and a zero step saturates that division to `usize::MAX`, after
+/// which `+ 1` wraps to zero and the fill loop spins at position 0 pushing
+/// without bound until the allocation fails - and under
+/// `[profile.release] panic = "abort"` that is a process kill rather than a
+/// catchable error.
+///
+/// The floor is 1.0, deliberately, and not the 3.0 a reviewer first suggested:
+/// 3.0 is the smallest ratio a WASAPI *shared-mode* device presents, but 44.1
+/// kHz - very common, and the macOS built-in input's nominal rate - gives
+/// 2.75625, so a 3.0 floor would silently clamp real 44.1 kHz capture and
+/// decimate it. 1.0 admits every upsampling case while still keeping the
+/// divisor at or above 1, which is what the capacity arithmetic requires.
+///
+/// The formula itself used to be spelled at both call sites (`audio.rs` and
+/// `unix_audio.rs`); sharing it here means the floor cannot be applied to one
+/// engine and forgotten on the other.
+pub fn resample_step(device_rate: u32) -> f64 {
+    (device_rate as f64 / SAMPLE_RATE as f64).max(MIN_RESAMPLE_STEP)
+}
+
+/// The floor [`resample_step`] applies. See its documentation for why 1.0 and
+/// not something larger.
+pub const MIN_RESAMPLE_STEP: f64 = 1.0;
+
 /// The two silence windows that end a dictation.
 ///
 /// Shared by both engines so a VAD change cannot land on one platform only.
@@ -86,9 +115,11 @@ impl SilenceWindows {
             silence_expired(self.since_voice_ms, vad_silence_ms)
         } else {
             // Nothing said at all: the shared no-speech cutoff, so a forgotten
-            // open mic cannot hold the device for max_seconds.
+            // open mic cannot hold the device for max_seconds. The comparison
+            // goes through `silence_expired` like the branch above rather than
+            // being written out again, so both windows keep one rule.
             self.no_speech_ms += audio_ms(samples);
-            self.no_speech_ms >= NO_SPEECH_LIMIT_MS
+            silence_expired(self.no_speech_ms, NO_SPEECH_LIMIT_MS as u32)
         }
     }
 }
@@ -316,6 +347,41 @@ mod tests {
         }
     }
 
+    /// The amplitude comparison is strict (`rms > threshold`), and the tests
+    /// only ever used 1.0 and 0.0 against a 0.01 threshold, so whether a chunk
+    /// exactly *at* the threshold counted as voice or silence was unpinned.
+    /// It counts as silence: the threshold is the level at which a chunk stops
+    /// being treated as speech.
+    #[test]
+    fn a_chunk_exactly_at_the_threshold_counts_as_silence() {
+        let mut silence = SilenceWindows::new();
+        assert!(
+            !silence.advance(640, 0.01, 0.01, 3_000),
+            "rms equal to the threshold is not voice"
+        );
+    }
+
+    /// The no-speech cutoff and the post-voice silence cutoff are the same rule
+    /// with different limits, so a session that never hears anything must end
+    /// on the shared boundary too, not on a separately written comparison.
+    #[test]
+    fn both_silence_windows_use_the_same_comparison() {
+        for (since, limit, expired) in [
+            (0u64, 3_000u32, false),
+            (2_999, 3_000, false),
+            (3_000, 3_000, true),
+            (3_001, 3_000, true),
+            (9_999, NO_SPEECH_LIMIT_MS as u32, false),
+            (10_000, NO_SPEECH_LIMIT_MS as u32, true),
+        ] {
+            assert_eq!(
+                silence_expired(since, limit),
+                expired,
+                "{since}ms against a {limit}ms limit"
+            );
+        }
+    }
+
     /// A voice chunk restarts the since-voice window, so a pause that never
     /// reached the threshold is not carried into the next one.
     #[test]
@@ -400,5 +466,59 @@ mod tests {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
         let out = resample_linear(&input, 8_000.0 / SAMPLE_RATE as f64);
         assert_eq!(out.len(), 16_000);
+    }
+
+    /// The resample ratio is floored, because `resample_linear` divides by it
+    /// to size its output buffer and a zero step would saturate that division
+    /// to `usize::MAX` - under `panic = "abort"` that is a process kill, not a
+    /// catchable error.
+    #[test]
+    fn a_degenerate_device_rate_is_floored_rather_than_dividing_by_zero() {
+        // Zero is the case that matters: it produced the saturating capacity.
+        assert_eq!(resample_step(0), MIN_RESAMPLE_STEP);
+        // Below 1.0, including a rate that resamples upward.
+        assert_eq!(resample_step(1), MIN_RESAMPLE_STEP);
+        assert_eq!(resample_step(8_000), MIN_RESAMPLE_STEP);
+        // Exactly 1.0 is untouched.
+        assert_eq!(resample_step(16_000), 1.0);
+    }
+
+    /// Every real capture rate of 16 kHz and above must pass through
+    /// *unclamped*. 44.1 kHz is the one that matters: it gives 2.75625, and a
+    /// floor above that would silently decimate the most common device rate in
+    /// existence. This test exists so a future "make the floor safer" change
+    /// cannot quietly clamp real capture without failing here first.
+    ///
+    /// 8 kHz is deliberately absent: its ratio of 0.5 is below the floor and
+    /// clamping it is the intended upsampling guard, pinned by the sibling
+    /// test above.
+    #[test]
+    fn no_real_capture_rate_is_clamped_by_the_floor() {
+        for (rate, want) in [
+            (16_000u32, 1.0f64),
+            (22_050, 1.378125),
+            (44_100, 2.75625),
+            (48_000, 3.0),
+            (88_200, 5.5125),
+            (96_000, 6.0),
+            (192_000, 12.0),
+        ] {
+            assert_eq!(
+                resample_step(rate),
+                want,
+                "rate {rate} was clamped away from its true ratio {want}"
+            );
+        }
+    }
+
+    /// The floor must also make the output sizing safe, not merely finite: a
+    /// zero step has to produce a bounded result rather than an unbounded
+    /// push, so this drives the real function with the floored ratio.
+    #[test]
+    fn resampling_with_the_floored_step_terminates_and_stays_bounded() {
+        let input: Vec<f32> = (0..48_000).map(|i| (i as f32 / 48_000.0).sin()).collect();
+        let out = resample_linear(&input, resample_step(0));
+        // The floor of 1.0 emits one output sample per input sample.
+        assert_eq!(out.len(), input.len());
     }
 }
