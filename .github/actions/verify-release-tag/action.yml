@@ -36,7 +36,7 @@ runs:
         # is GitHub's pre-release flag on a normal-shaped tag, not a second
         # tag segment.
         if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(win|linux|macos))?$ ]]; then
-          echo "::error file=.github/actions/verify-release-tag/action.yml::$tag is not a release shape (want vX.Y.Z or vX.Y.Z-{win,linux,macos})"
+          echo "::error::$tag is not a release shape (want vX.Y.Z or vX.Y.Z-{win,linux,macos})"
           echo "the updater recognizes exactly those tags; anything else is invisible to it once published"
           exit 1
         fi

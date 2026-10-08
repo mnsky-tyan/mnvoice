@@ -214,17 +214,11 @@ fn auto_update_from_file() -> Option<String> {
 /// one. `Some("")` means the key was present but empty, which is "off".
 pub fn parse_auto_update_text(text: &str) -> Option<String> {
     let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    parse(text, |k, v| {
+        if k.eq_ignore_ascii_case("AUTO_UPDATE") {
+            found = Some(v.to_string());
         }
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("AUTO_UPDATE") {
-                found = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
-            }
-        }
-    }
+    });
     found
 }
 
@@ -434,10 +428,14 @@ impl RawFields {
 /// only when the spelling matches nothing. The live tray/log path takes the
 /// pair straight from `cancel_key_with_display`, so a normal build reaches
 /// this only through its tests; it stays as the public spelling.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
     cancel_key_with_display(s).0
 }
+
+pub const DEFAULT_CANCEL_MOD: u32 = 0x4000; // MOD_NOREPEAT
+pub const DEFAULT_CANCEL_VK: u32 = 0x1B; // VK_ESCAPE
+pub const DEFAULT_CANCEL_STR: &str = "Escape";
 
 /// The cancel key to register plus the spelling to show for it, decided in
 /// one place: the display must never advertise a key other than the pair
@@ -446,16 +444,25 @@ pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
 fn cancel_key_with_display(s: &str) -> ((u32, u32), String) {
     let s = s.trim();
     if s.is_empty() {
-        return ((0x4000, 0x1B), "Escape".to_string());
+        return (
+            (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
+            DEFAULT_CANCEL_STR.to_string(),
+        );
     }
     if s.eq_ignore_ascii_case("none") {
         return ((0, 0), s.to_string());
     }
     match parse_hotkey(s) {
         Some(pair) => (pair, s.to_string()),
-        None => ((0x4000, 0x1B), "Escape".to_string()),
+        None => (
+            (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
+            DEFAULT_CANCEL_STR.to_string(),
+        ),
     }
 }
+
+pub const DEFAULT_ORB_COLOR: (f32, f32, f32) = (1.0, 0.18, 0.58);
+pub const DEFAULT_ORB_FLUID_LEVEL: f32 = 0.75;
 
 /// Parses color from preset name or hex `#RRGGBB` / `RRGGBB`.
 /// Returns RGB float triple in range `0.0..=1.0`.
@@ -469,7 +476,7 @@ pub fn parse_color(s: &str) -> (f32, f32, f32) {
         "amber" | "orange" | "gold" => (1.0, 0.62, 0.05),
         "red" | "ruby" => (1.0, 0.22, 0.22),
         "white" | "silver" => (0.95, 0.95, 1.0),
-        "pink" | "hot_pink" | "magenta" => (1.0, 0.18, 0.58),
+        "pink" | "hot_pink" | "magenta" => DEFAULT_ORB_COLOR,
         _ => {
             let hex = s.trim_start_matches('#');
             if hex.len() == 6 {
@@ -482,7 +489,7 @@ pub fn parse_color(s: &str) -> (f32, f32, f32) {
                 }
             }
             // Default vibrant hot pink
-            (1.0, 0.18, 0.58)
+            DEFAULT_ORB_COLOR
         }
     }
 }
@@ -496,7 +503,7 @@ pub fn parse_fluid_level(s: &str) -> f32 {
             return val.clamp(0.05, 1.0);
         }
     }
-    0.75 // default
+    DEFAULT_ORB_FLUID_LEVEL // default
 }
 
 pub const DEFAULT_HOTKEY_MOD: u32 = 0x0001 | 0x4000; // MOD_ALT | MOD_NOREPEAT
@@ -578,6 +585,10 @@ mod tests {
         assert_eq!(parse_color("cyan"), (0.0, 0.95, 0.90));
         assert_eq!(parse_color("purple"), (0.68, 0.25, 0.98));
         assert_eq!(parse_color("emerald"), (0.12, 0.85, 0.45));
+        assert_eq!(parse_color("pink"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("hot_pink"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("magenta"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("not-a-color"), DEFAULT_ORB_COLOR);
         let (r, g, b) = parse_color("#FF2D78");
         assert!((r - 1.0).abs() < 0.01);
         assert!((g - 0.176).abs() < 0.01);

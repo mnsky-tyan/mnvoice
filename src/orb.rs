@@ -28,7 +28,7 @@ pub struct Orb {
     dc_mem: HDC,
     bitmap: HBITMAP,
     bits: *mut u32,
-    pub state: OrbState,
+    state: OrbState,
     frame: u32,
     visible: bool,
     color: (f32, f32, f32),
@@ -56,7 +56,7 @@ impl Orb {
         unsafe {
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(orb_wndproc),
-                hInstance: instance.into(),
+                hInstance: instance,
                 lpszClassName: ORB_CLASS_NAME,
                 ..Default::default()
             };
@@ -387,7 +387,10 @@ fn render_gas_fluid(
                 add_light(&mut px, cr, cg, cb, body_int);
 
                 // Luminous filaments & tendrils
-                let filament = (gas_volume * 1.45 * (fluid_mult / 0.75) - 0.28).clamp(0.0, 1.0);
+                let filament =
+                    (gas_volume * 1.45 * (fluid_mult / crate::config::DEFAULT_ORB_FLUID_LEVEL)
+                        - 0.28)
+                        .clamp(0.0, 1.0);
                 let fil_r = (base_r + 0.3).min(1.0);
                 let fil_g = (base_g + 0.3).min(1.0);
                 let fil_b = (base_b + 0.3).min(1.0);
@@ -448,7 +451,13 @@ mod tests {
     #[test]
     fn test_render_surfaces_are_opaque_and_coloured() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(10, &mut buf, false, (1.0, 0.18, 0.58), 0.75);
+        render_gas_fluid(
+            10,
+            &mut buf,
+            false,
+            crate::config::DEFAULT_ORB_COLOR,
+            crate::config::DEFAULT_ORB_FLUID_LEVEL,
+        );
 
         let opaque = buf.iter().filter(|&&p| ((p >> 24) & 0xFF) > 200).count();
         assert!(opaque > 150, "orb must have visible opaque pixels, got {opaque}");
@@ -469,7 +478,13 @@ mod tests {
     #[test]
     fn test_render_recording_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(10, &mut buf, false, (1.0, 0.18, 0.58), 0.75);
+        render_gas_fluid(
+            10,
+            &mut buf,
+            false,
+            crate::config::DEFAULT_ORB_COLOR,
+            crate::config::DEFAULT_ORB_FLUID_LEVEL,
+        );
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
         assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }
@@ -477,7 +492,13 @@ mod tests {
     #[test]
     fn test_render_loading_non_empty() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(10, &mut buf, true, (1.0, 0.18, 0.58), 0.75);
+        render_gas_fluid(
+            10,
+            &mut buf,
+            true,
+            crate::config::DEFAULT_ORB_COLOR,
+            crate::config::DEFAULT_ORB_FLUID_LEVEL,
+        );
         let non_zero = buf.iter().filter(|&&p| p != 0).count();
         assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }

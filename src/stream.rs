@@ -310,7 +310,9 @@ pub fn run_stream(
     let full_text = full_transcript.lock().unwrap().trim().to_string();
 
     // Add trailing space if configured, but never on a cancelled session
-    if cfg.trailing_space && !full_text.is_empty() && !cancelled.load(Ordering::SeqCst) {
+    if crate::rest::trailing_space_due(cfg.trailing_space, &full_text)
+        && !cancelled.load(Ordering::SeqCst)
+    {
         input::type_text(" ");
     }
 
@@ -338,8 +340,8 @@ mod tests {
             max_seconds: 120,
             trailing_space: true,
             keywords: vec!["Kubernetes".into()],
-            orb_color: (1.0, 0.18, 0.58),
-            orb_fluid_level: 0.75,
+            orb_color: crate::config::DEFAULT_ORB_COLOR,
+            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
             hotkey: (0x4001, 0x20),
             hotkey_str: "Alt+Space".into(),
             cancel_key: (0x4000, 0x1B),
