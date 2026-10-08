@@ -10,7 +10,7 @@ use crate::platform::audio::SAMPLE_RATE;
 use crate::platform::{audio, unix_audio};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,31 +52,41 @@ pub fn run() -> Result<(), String> {
     // main loop a line at a time. A dictation therefore never runs with the
     // lock held, and the "Enter again" control reads through the same channel.
     let (line_tx, lines) = mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut lines = stdin.lock().lines();
-        // `lines()` yields Err for a line that is not valid UTF-8 as well as
-        // for a genuine read failure, and both used to end the loop silently,
-        // which closed the channel and ended the whole session: one stray
-        // non-ASCII byte pasted into the terminal looked exactly like Ctrl-D.
-        // The bad line is reported and skipped instead.
-        loop {
-            match lines.next() {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => {
-                    eprintln!("mnvoice: ignoring unreadable input line ({e})");
-                    continue;
-                }
-                None => break,
-            }
-            if line_tx.send(()).is_err() {
-                break;
-            }
-        }
-    });
+    // The lock moves with the lines, because `Lines` borrows it and the
+    // reader has to own both for the life of the process.
+    let stdin = std::io::stdin();
+    let mut locked = stdin.lock().lines();
+    std::thread::spawn(move || forward_lines(&mut locked, &line_tx));
 
     dictation_loop(&lines, || dictate(&cfg, &engine, &lines))?;
     Ok(())
+}
+
+/// Forwards every line `source` yields as one "Enter" on `line_tx`.
+///
+/// Stdin is unreadable in two ways, and they need opposite answers. A line
+/// that is not valid UTF-8 arrives as `InvalidData`, and `Lines::next` has
+/// already consumed it through its newline, so the next line starts clean: it
+/// is reported and skipped, because ending the session on it would let one
+/// stray non-ASCII byte pasted into the terminal look exactly like Ctrl-D.
+/// A read failure consumes nothing, so retrying it returns the same error
+/// immediately and forever; that ends the loop, which closes `line_tx` and
+/// reaches `dictation_loop`'s quit path.
+fn forward_lines<R: BufRead>(source: &mut std::io::Lines<R>, line_tx: &Sender<()>) {
+    loop {
+        match source.next() {
+            Some(Ok(_)) => {}
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                eprintln!("mnvoice: ignoring unreadable input line ({e})");
+                continue;
+            }
+            Some(Err(_)) => break,
+            None => break,
+        }
+        if line_tx.send(()).is_err() {
+            break;
+        }
+    }
 }
 
 /// Runs dictations until stdin closes.
@@ -234,6 +244,7 @@ fn dictate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::Mutex;
 
     /// The transcriber has to consume the microphone while it is still
@@ -409,6 +420,76 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(attempts, 0);
+    }
+
+    /// A byte that is not valid UTF-8 must cost one line, not the session.
+    /// `Lines::next` consumes the offending line through its newline before it
+    /// validates the UTF-8, so the Enter the user presses after the bad line
+    /// has to reach the dictation loop exactly as it would have.
+    #[test]
+    fn an_unreadable_line_costs_only_itself() {
+        // One bad byte in the middle: \xff is not valid UTF-8 in any position.
+        let raw: &[u8] = b"first\n\xff broken\nsecond\n";
+        let (tx, rx) = mpsc::channel::<()>();
+        let mut lines = (&raw[..]).lines();
+        forward_lines(&mut lines, &tx);
+        drop(tx);
+
+        // Two good lines, and the channel closing is the third: the bad line
+        // between them was skipped rather than ending the session.
+        assert!(rx.recv().is_ok(), "the line before the bad one was lost");
+        assert!(rx.recv().is_ok(), "the line after the bad one was lost");
+        assert!(rx.recv().is_err(), "the reader did not finish");
+    }
+
+    /// A read failure consumes nothing, so it must end the reader rather than
+    /// be retried: an identical error every iteration is a spin that never
+    /// closes the channel, and so never quits the session.
+    #[test]
+    fn a_failing_read_ends_the_reader_instead_of_spinning() {
+        /// Hands over one good line, then an endless supply of failures - what
+        /// EIO, or a closed descriptor, does to every later `next()`. `lines()`
+        /// asks the buffer for bytes and reads up to a newline out of them, so
+        /// the double answers at `fill_buf`.
+        struct Broken {
+            sent: bool,
+        }
+        impl BufRead for Broken {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                if !self.sent {
+                    self.sent = true;
+                    return Ok(b"\n");
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "device gone",
+                ))
+            }
+            fn consume(&mut self, _amt: usize) {}
+        }
+        // `BufRead` is a supertrait of `Read`, and the line reader never calls
+        // through to it; the failure belongs to `fill_buf` above.
+        impl Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!("lines() takes its bytes from fill_buf")
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let mut lines = std::io::BufRead::lines(Broken { sent: false });
+        std::thread::spawn(move || forward_lines(&mut lines, &tx));
+
+        // The one good line arrives, and then the channel closes. A reader that
+        // retried the failing read forever would do neither, so these two
+        // waits are what a spin fails on rather than a hang.
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the one good line still has to reach the dictation loop"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_err(),
+            "a failing read must end the reader, not spin on it"
+        );
     }
 
     /// A line that arrives while a dictation is transcribing is stale by the

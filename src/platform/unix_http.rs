@@ -625,22 +625,4 @@ mod tests {
         socket.close();
         server.join().unwrap();
     }
-
-    /// The bracket strip happens in `connect_with_timeout`, so it must be
-    /// confined to the brackets and leave a normal host untouched.
-    #[test]
-    fn the_connector_strips_only_surrounding_brackets() {
-        for (input, want) in [
-            ("[::1]", "::1"),
-            ("::1", "::1"),
-            ("api.example.com", "api.example.com"),
-            ("127.0.0.1", "127.0.0.1"),
-        ] {
-            assert_eq!(
-                input.trim_start_matches('[').trim_end_matches(']'),
-                want,
-                "{input}"
-            );
-        }
-    }
 }

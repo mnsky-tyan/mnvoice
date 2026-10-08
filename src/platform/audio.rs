@@ -44,32 +44,35 @@ pub fn audio_ms(samples: usize) -> u64 {
 
 /// Device samples per provider sample, from the device's own capture rate.
 ///
-/// Both engines resample with this ratio, and it is floored at 1.0 because
-/// `resample_linear` divides by it to size its output buffer: a step below 1.0
-/// (an upsampling device such as 8 kHz) makes `len / step` exceed the input
-/// length, and a zero step saturates that division to `usize::MAX`, after
-/// which `+ 1` wraps to zero and the fill loop spins at position 0 pushing
-/// without bound until the allocation fails - and under
-/// `[profile.release] panic = "abort"` that is a process kill rather than a
-/// catchable error.
+/// Both engines resample with this ratio, and it passes through unclamped,
+/// because the ratio carries the rate correction in both directions: a device
+/// slower than the provider rate has to come out *longer* than it went in for
+/// the audio to run at the rate the request declares. 8 kHz narrowband is 0.5
+/// and doubles the sample count, and clamping it to pass-through would hand
+/// the provider 16 kHz-labelled audio running at 8 kHz - a transcript an octave
+/// out, with nothing anywhere reporting a problem. The ratio must stay under
+/// 2.75625 for the same reason from the other side: that is 44.1 kHz, very
+/// common and the macOS built-in input's nominal rate.
 ///
-/// The floor is 1.0, deliberately, and not the 3.0 a reviewer first suggested:
-/// 3.0 is the smallest ratio a WASAPI *shared-mode* device presents, but 44.1
-/// kHz - very common, and the macOS built-in input's nominal rate - gives
-/// 2.75625, so a 3.0 floor would silently clamp real 44.1 kHz capture and
-/// decimate it. 1.0 admits every upsampling case while still keeping the
-/// divisor at or above 1, which is what the capacity arithmetic requires.
+/// The one rate that cannot be resampled is 0, because `resample_linear`
+/// divides by this to size its output buffer: `len / 0.0` saturates to
+/// `usize::MAX`, after which `+ 1` wraps to zero and the fill loop spins at
+/// position 0 pushing without bound until the allocation fails - and under
+/// `[profile.release] panic = "abort"` that is a process kill rather than a
+/// catchable error. A ratio below 1 is not that case, so the guard is the rate
+/// itself, not a floor on the ratio. A rate-less device passes its samples
+/// through one-for-one, the only honest answer when nothing says how fast it
+/// ran.
 ///
 /// The formula itself used to be spelled at both call sites (`audio.rs` and
-/// `unix_audio.rs`); sharing it here means the floor cannot be applied to one
+/// `unix_audio.rs`); sharing it here means the guard cannot be applied to one
 /// engine and forgotten on the other.
 pub fn resample_step(device_rate: u32) -> f64 {
-    (device_rate as f64 / SAMPLE_RATE as f64).max(MIN_RESAMPLE_STEP)
+    if device_rate == 0 {
+        return 1.0;
+    }
+    device_rate as f64 / SAMPLE_RATE as f64
 }
-
-/// The floor [`resample_step`] applies. See its documentation for why 1.0 and
-/// not something larger.
-pub const MIN_RESAMPLE_STEP: f64 = 1.0;
 
 /// The two silence windows that end a dictation.
 ///
@@ -430,7 +433,7 @@ mod tests {
     #[test]
     fn a_44100hz_second_resamples_to_the_provider_rate() {
         let input: Vec<f32> = (0..44_100).map(|i| i as f32 / 44_100.0).collect();
-        let out = resample_linear(&input, 44_100.0 / SAMPLE_RATE as f64);
+        let out = resample_linear(&input, resample_step(44_100));
         assert!(
             (out.len() as i64 - SAMPLE_RATE as i64).abs() <= 2,
             "one second of 44.1 kHz audio produced {} samples",
@@ -443,10 +446,9 @@ mod tests {
     /// beyond quantisation is the resampler mangling the waveform.
     #[test]
     fn resampling_preserves_the_waveform() {
-        let rate = 44_100.0;
         let n = 44_100usize;
         let input: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let step = rate / SAMPLE_RATE as f64;
+        let step = resample_step(44_100);
         let out = resample_linear(&input, step);
         let worst = out
             .iter()
@@ -461,41 +463,44 @@ mod tests {
 
     /// A device slower than the provider rate is upsampled rather than
     /// clamped to pass-through, so the provider still receives its own rate.
+    /// This drives the ratio through `resample_step`, the way both engines do,
+    /// so a change there cannot leave the length the provider gets unpinned.
     #[test]
     fn an_8000hz_device_is_upsampled_to_the_provider_rate() {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
-        let out = resample_linear(&input, 8_000.0 / SAMPLE_RATE as f64);
+        let out = resample_linear(&input, resample_step(8_000));
         assert_eq!(out.len(), 16_000);
     }
 
-    /// The resample ratio is floored, because `resample_linear` divides by it
-    /// to size its output buffer and a zero step would saturate that division
-    /// to `usize::MAX` - under `panic = "abort"` that is a process kill, not a
-    /// catchable error.
+    /// A device that reports no rate at all cannot be resampled: the zero step
+    /// saturates `resample_linear`'s output-length division to `usize::MAX`,
+    /// and under `panic = "abort"` the resulting unbounded push is a process
+    /// kill, not a catchable error. The guard has to make the *result*
+    /// bounded, so this drives the real function rather than only the ratio.
     #[test]
-    fn a_degenerate_device_rate_is_floored_rather_than_dividing_by_zero() {
-        // Zero is the case that matters: it produced the saturating capacity.
-        assert_eq!(resample_step(0), MIN_RESAMPLE_STEP);
-        // Below 1.0, including a rate that resamples upward.
-        assert_eq!(resample_step(1), MIN_RESAMPLE_STEP);
-        assert_eq!(resample_step(8_000), MIN_RESAMPLE_STEP);
-        // Exactly 1.0 is untouched.
-        assert_eq!(resample_step(16_000), 1.0);
+    fn a_device_reporting_no_rate_passes_its_samples_through() {
+        assert_eq!(resample_step(0), 1.0);
+        let input: Vec<f32> = (0..48_000)
+            .map(|i| (i as f64 / 48_000.0).sin() as f32)
+            .collect();
+        let out = resample_linear(&input, resample_step(0));
+        assert_eq!(out.len(), input.len());
     }
 
-    /// Every real capture rate of 16 kHz and above must pass through
-    /// *unclamped*. 44.1 kHz is the one that matters: it gives 2.75625, and a
-    /// floor above that would silently decimate the most common device rate in
-    /// existence. This test exists so a future "make the floor safer" change
-    /// cannot quietly clamp real capture without failing here first.
+    /// Every real capture rate must keep its true ratio, in *both* directions.
+    /// This test exists so a future "clamp it to be safer" change cannot
+    /// quietly break real capture without failing here first.
     ///
-    /// 8 kHz is deliberately absent: its ratio of 0.5 is below the floor and
-    /// clamping it is the intended upsampling guard, pinned by the sibling
-    /// test above.
+    /// 8 kHz is the one below the provider rate that matters: its 0.5 ratio is
+    /// what turns an 8 kHz headset into audio the 16 kHz request can describe,
+    /// and clamping it to pass-through is that octave bug, not a safeguard.
+    /// 44.1 kHz is the one above it that matters, at 2.75625, so a clamp has to
+    /// stay under both of those.
     #[test]
-    fn no_real_capture_rate_is_clamped_by_the_floor() {
+    fn no_capture_rate_is_clamped_away_from_its_true_ratio() {
         for (rate, want) in [
-            (16_000u32, 1.0f64),
+            (8_000u32, 0.5f64),
+            (16_000, 1.0),
             (22_050, 1.378125),
             (44_100, 2.75625),
             (48_000, 3.0),
@@ -509,16 +514,5 @@ mod tests {
                 "rate {rate} was clamped away from its true ratio {want}"
             );
         }
-    }
-
-    /// The floor must also make the output sizing safe, not merely finite: a
-    /// zero step has to produce a bounded result rather than an unbounded
-    /// push, so this drives the real function with the floored ratio.
-    #[test]
-    fn resampling_with_the_floored_step_terminates_and_stays_bounded() {
-        let input: Vec<f32> = (0..48_000).map(|i| (i as f32 / 48_000.0).sin()).collect();
-        let out = resample_linear(&input, resample_step(0));
-        // The floor of 1.0 emits one output sample per input sample.
-        assert_eq!(out.len(), input.len());
     }
 }

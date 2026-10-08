@@ -45,12 +45,11 @@ pub fn current_version() -> String {
 ///
 /// Both the "is it time to check" read and the stamp write read the clock, and
 /// they want *opposite* behaviour when it is degenerate, so the shared helper
-/// says which is which: 0 makes the read fail open (0 saturating-subtracted
-/// is never more than a day old, so a check happens - the safe direction),
-/// while the write stamps 0 and every later start then reads 0 and concludes a
-/// check is due. That is why `mark_checked_at` treats 0 as "do not record"
-/// instead of persisting a stamp that forces a check on every start until the
-/// clock is fixed.
+/// says which is which: 0 makes the read fail CLOSED (0 saturating-subtracted
+/// is never more than a day old, so no check happens until the clock is fixed),
+/// while the write skips its stamp, which leaves the previous stamp and its
+/// daily limit intact. Skipping is what stops a pre-1970 clock from stamping 0
+/// and re-checking on every start until it is corrected.
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -671,9 +670,9 @@ fn should_check_at(stamp: &Path) -> bool {
     let Ok(last) = text.trim().parse::<u64>() else {
         return true;
     };
-    // Fail open on a degenerate clock: now_secs() returns 0 before 1970,
-    // 0.saturating_sub(anything) is never more than a day, so a check runs -
-    // which is the safe direction to be wrong in.
+    // Fail closed on a degenerate clock: now_secs() returns 0 before 1970,
+    // 0.saturating_sub(anything) is never more than a day, so no check runs -
+    // a pre-1970 clock pauses the updater until it is corrected.
     let now = now_secs();
     now.saturating_sub(last) > 86_400
 }
