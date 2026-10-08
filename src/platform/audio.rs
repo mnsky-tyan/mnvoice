@@ -48,11 +48,13 @@ pub fn audio_ms(samples: usize) -> u64 {
 /// because the ratio carries the rate correction in both directions: a device
 /// slower than the provider rate has to come out *longer* than it went in for
 /// the audio to run at the rate the request declares. 8 kHz narrowband is 0.5
-/// and doubles the sample count, and clamping it to pass-through would hand
-/// the provider 16 kHz-labelled audio running at 8 kHz - a transcript an octave
-/// out, with nothing anywhere reporting a problem. The ratio must stay under
-/// 2.75625 for the same reason from the other side: that is 44.1 kHz, very
-/// common and the macOS built-in input's nominal rate.
+/// and doubles the sample count, and flooring it to pass-through would hand
+/// the provider 16 kHz-labelled audio running at 8 kHz - a transcript an
+/// octave out, with nothing anywhere reporting a problem. A floor hurts from
+/// the other side too: 44.1 kHz gives 2.75625 and is very common and the
+/// macOS built-in input's nominal rate, so a floor at 1.0, at 2.75625, at
+/// 8 kHz's 0.5, or at the 3.0 a reviewer first proposed all silently decimate
+/// real capture.
 ///
 /// The one rate that cannot be resampled is 0, because `resample_linear`
 /// divides by this to size its output buffer: `len / 0.0` saturates to
@@ -493,9 +495,9 @@ mod tests {
     ///
     /// 8 kHz is the one below the provider rate that matters: its 0.5 ratio is
     /// what turns an 8 kHz headset into audio the 16 kHz request can describe,
-    /// and clamping it to pass-through is that octave bug, not a safeguard.
-    /// 44.1 kHz is the one above it that matters, at 2.75625, so a clamp has to
-    /// stay under both of those.
+    /// and flooring it to pass-through is that octave bug, not a safeguard.
+    /// 44.1 kHz is the one above it that matters, at 2.75625, so no floor
+    /// between the two - 0.5, 1.0, 2.75625 or 3.0 - may come back.
     #[test]
     fn no_capture_rate_is_clamped_away_from_its_true_ratio() {
         for (rate, want) in [
