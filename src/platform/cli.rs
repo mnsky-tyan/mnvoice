@@ -48,15 +48,17 @@ pub fn run() -> Result<(), String> {
     println!();
 
     // Stdin's lock is process-wide and not reentrant, so it gets exactly one
-    // owner: this thread holds it for the life of the process and hands the
-    // main loop a line at a time. A dictation therefore never runs with the
+    // owner: the reader thread takes it for the life of the process and hands
+    // the main loop a line at a time. A dictation therefore never runs with the
     // lock held, and the "Enter again" control reads through the same channel.
+    // The lock has to be taken on this side of the spawn, because
+    // `StdinLock` is a `MutexGuard` and cannot be sent to another thread.
     let (line_tx, lines) = mpsc::channel::<()>();
-    // The lock moves with the lines, because `Lines` borrows it and the
-    // reader has to own both for the life of the process.
-    let stdin = std::io::stdin();
-    let mut locked = stdin.lock().lines();
-    std::thread::spawn(move || forward_lines(&mut locked, &line_tx));
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        forward_lines(&mut lines, &line_tx);
+    });
 
     dictation_loop(&lines, || dictate(&cfg, &engine, &lines))?;
     Ok(())
