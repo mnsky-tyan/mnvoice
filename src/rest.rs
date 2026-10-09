@@ -543,4 +543,116 @@ mod tests {
             assert!(!is_disfluency(w), "{w} is an affirmative, not a filler");
         }
     }
+
+    /// The two response ceilings must be different ceilings, not one shared
+    /// number: a transcript is a few kilobytes and a release executable is
+    /// several megabytes, and the intent requires the asset path to keep
+    /// headroom the transcript path does not. This drives the real Windows
+    /// transport (`transcribe` -> `WinHttpTransport::post` -> the capped
+    /// `read_body`) against a loopback server that answers with more bytes than
+    /// `MAX_TRANSCRIPT_BYTES`, and asserts the body really was clipped there.
+    ///
+    /// It is deliberately not a test of truncation *silently* happening - that
+    /// behaviour was reviewed and declined - but of the two bounds being
+    /// distinct, which is what the split was for.
+    #[test]
+    fn a_transcript_response_is_bounded_by_the_transcript_ceiling() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        // One byte past the transcript ceiling, and nowhere near the asset one.
+        let body_len = crate::platform::http::MAX_TRANSCRIPT_BYTES as usize + 1;
+        assert!(
+            body_len < crate::platform::http::MAX_ASSET_BYTES as usize,
+            "the fixture only makes sense while the ceilings differ"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+            // Consume the whole request, head and body, before answering. If the
+            // server answers while WinHTTP is still sending its multipart body,
+            // the client's own write can fail and the read sees a reset instead
+            // of the response - which would make this test measure the wrong
+            // thing entirely.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let want: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut got = 0usize;
+            let mut sink = [0u8; 16 * 1024];
+            while got < want {
+                match stream.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got += n,
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            // A JSON body whose first characters are a valid transcript, then
+            // padding: an uncapped read would return all of it.
+            let prefix = b"{\"text\":\"ok\"}";
+            if stream.write_all(prefix).is_err() {
+                return;
+            }
+            let pad = vec![b' '; body_len - prefix.len()];
+            let _ = stream.write_all(&pad);
+            let _ = stream.flush();
+        });
+
+        let cfg = Config {
+            protocol: crate::config::Protocol::Rest,
+            api_key: "tok".into(),
+            model: "whisper-1".into(),
+            language: "en".into(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
+            trailing_space: true,
+            keywords: Vec::new(),
+            orb_color: crate::config::DEFAULT_ORB_COLOR,
+            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
+            hotkey: (0x4001, 0x20),
+            hotkey_str: "Alt+Space".into(),
+            cancel_key: (0x4000, 0x1B),
+            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
+            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
+            strip_fillers: false,
+            auto_update: false,
+        };
+
+        // Drive the same seam `transcribe` drives, so the body length the
+        // transport actually buffered is observable: an uncapped read would
+        // return `body_len`, a capped one exactly the ceiling.
+        let url = endpoint_url(&cfg.base_url).unwrap();
+        let response = crate::platform::http::NativeTransport
+            .post(&url, Some("Bearer tok"), "multipart/form-data; boundary=x", b"x")
+            .expect("the request itself succeeds");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body.len() as u64,
+            crate::platform::http::MAX_TRANSCRIPT_BYTES,
+            "the transcript path must stop at its own ceiling"
+        );
+        let _ = server.join();
+    }
 }

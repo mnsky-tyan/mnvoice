@@ -481,10 +481,14 @@ impl WebSocket for WinHttpSocket {
 /// honouring it. paste.rs owns the mechanics - one unicode event per
 /// character with a 2 ms gap so no target window's message queue drops
 /// characters - and stays the single source of that behaviour.
+// Only named by `platform_injector`, which is compiled out under tests in
+// favour of the recorder, so a test build has no other reference to them.
+#[cfg_attr(test, allow(dead_code))]
 pub struct SendInputInjector;
 
 /// The process-wide instance, registered as the global injector at startup by
 /// the Windows app shell.
+#[cfg_attr(test, allow(dead_code))]
 pub static SEND_INPUT_INJECTOR: SendInputInjector = SendInputInjector;
 
 impl crate::platform::input::Injector for SendInputInjector {
