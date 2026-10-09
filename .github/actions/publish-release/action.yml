@@ -80,7 +80,17 @@ runs:
         # under. update.rs hardcodes that slug as literals in its URLs, so the
         # two are kept in step by hand: a fork must change BOTH for its own
         # binaries to update from it.
-        $json = curl -sS -f -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/releases/tags/$tag" | Out-String
+        # The auth header goes on stdin, not the command line. `-H
+        # "Authorization: Bearer $token"` puts the secret in the native
+        # process's argv, where any process listing on the runner can read it;
+        # `--config -` keeps it off argv entirely. This is the same standard the
+        # comments above set for inputs, applied to the one value that is a
+        # credential rather than a parameter.
+        $curlConfig = @(
+          "header = `"Authorization: Bearer $env:GH_TOKEN`""
+          "header = `"Accept: application/vnd.github+json`""
+        ) -join "`n"
+        $json = $curlConfig | curl -sS -f --config - "https://api.github.com/repos/$repo/releases/tags/$tag" | Out-String
         if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: could not read $tag from api.github.com (curl exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
         $assets = @(($json | ConvertFrom-Json).assets.name)
         $missing = @($files | Where-Object { $assets -notcontains $_ })

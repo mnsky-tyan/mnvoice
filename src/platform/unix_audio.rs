@@ -98,18 +98,21 @@ fn run_session(
     let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let err_slot = Arc::clone(&stream_error);
     let err_fn = move |e| {
-        if let Ok(mut slot) = err_slot.lock() {
-            // First error wins: the first is the cause, later ones are noise.
-            if slot.is_none() {
-                *slot = Some(format!("audio stream error: {e}"));
-            }
+        // Poisoning is recovered, not treated as "no error": dropping the
+        // message here is what made a mid-session unplug look like a clean
+        // stop, which is the exact failure this slot exists to prevent.
+        let mut slot = err_slot.lock().unwrap_or_else(|e| e.into_inner());
+        // First error wins: the first is the cause, later ones are noise.
+        if slot.is_none() {
+            *slot = Some(format!("audio stream error: {e}"));
         }
     };
     let cb_buffer = Arc::clone(&buffer);
     let push = move |data: &[f32]| {
-        if let Ok(mut buf) = cb_buffer.lock() {
-            buf.extend_from_slice(data);
-        }
+        // Recovered rather than skipped: silently dropping frames here ends the
+        // session as "no speech detected" when the device is what stopped.
+        let mut buf = cb_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.extend_from_slice(data);
     };
 
     let stream = match supported.sample_format() {
@@ -159,7 +162,8 @@ fn run_session(
 
         // A device that failed mid-session stops delivering frames; report it
         // as the error it is rather than as a silent, successful timeout.
-        if let Ok(slot) = stream_error.lock() {
+        {
+            let slot = stream_error.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(e) = slot.as_ref() {
                 return Err(e.clone());
             }
@@ -200,10 +204,9 @@ fn run_session(
     // the drop left a residual window where a failure that landed exactly
     // here was swallowed and a clean Ok returned.
     drop(stream);
-    if let Ok(slot) = stream_error.lock() {
-        if let Some(e) = slot.as_ref() {
-            return Err(e.clone());
-        }
+    let slot = stream_error.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = slot.as_ref() {
+        return Err(e.clone());
     }
     Ok(())
 }
@@ -260,7 +263,7 @@ mod tests {
             "two whole frames should have been mixed down"
         );
         assert_eq!(
-            buffer.lock().unwrap().as_slice(),
+            buffer.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
             [0.25],
             "the leftover sample must stay for the next tick"
         );

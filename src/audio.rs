@@ -437,18 +437,52 @@ mod tests {
         );
     }
 
+    /// `nBlockAlign` must actually be consulted, not just present.
+    ///
+    /// The previous version of this test could not fail on the change it
+    /// named: it set `nBlockAlign: 8` on a 2-channel 32-bit format, and 8 is
+    /// exactly what the `channels * sample_bytes` fallback computes, so the
+    /// two branches agreed and the assertion held either way.
+    ///
+    /// A block align SMALLER than one frame is the case that separates them,
+    /// and it needs no floating-point comparison to be decisive: honoured, it
+    /// trips the "unexpected capture buffer size" guard; ignored, the fallback
+    /// stride reads the same bytes without complaint.
     #[test]
     fn block_align_sets_frame_stride_when_provided() {
-        let f = WAVEFORMATEX {
-            nChannels: 2,
-            nSamplesPerSec: SAMPLE_RATE,
-            wBitsPerSample: 32,
-            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
-            nBlockAlign: 8, // 2 channels * 4 bytes
-            ..Default::default()
+        let convert = |n_block_align: u16, bytes: usize| {
+            let f = WAVEFORMATEX {
+                nChannels: 2,
+                nSamplesPerSec: SAMPLE_RATE,
+                wBitsPerSample: 32,
+                wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+                nBlockAlign: n_block_align,
+                ..Default::default()
+            };
+            let raw = vec![0u8; bytes];
+            convert_mix(&raw, &f, SampleKind::Float)
         };
-        let raw = vec![0u8; 8 * 10]; // 10 frames
-        assert!(convert_mix(&raw, &f, SampleKind::Float).is_ok());
+
+        // One frame is 2 channels * 4 bytes = 8. A 4-byte block align claims
+        // half a frame, which cannot be read, and saying so is the whole point
+        // of consulting the field.
+        assert!(
+            convert(4, 40).is_err(),
+            "a block align below one frame must be rejected, not silently \
+             replaced by the channels * sample_bytes fallback"
+        );
+
+        // The fallback still works when the field is absent...
+        assert!(convert(0, 80).is_ok(), "nBlockAlign 0 must use the fallback");
+        // ...and so does a field that agrees with it.
+        assert!(convert(8, 80).is_ok(), "a matching block align must convert");
+
+        // A stride wider than one frame is padding the device inserted, and is
+        // accepted: only a stride too small to hold a frame is an error.
+        assert!(
+            convert(12, 120).is_ok(),
+            "a padded frame stride must still convert"
+        );
     }
 
     /// `sample_kind` reads the sub-format GUID for WAVE_FORMAT_EXTENSIBLE, so a

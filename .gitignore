@@ -12,3 +12,9 @@ words.txt
 # generated icon verification artifact
 assets/mnvoice-from-exe-32.png
 assets/mnvoice-preview-32.png
+
+# Dated codebase-review reports are working notes, not project documentation.
+# This was previously only in .git/info/exclude, which is per-clone and NOT
+# committed - so on any fresh clone the reports were committable and a routine
+# `git add -A` during a review round would have swept them into the branch.
+docs/reviews/

@@ -1008,11 +1008,10 @@ mod tests {
         let tag = newest_tag_for_this_platform(&feed).unwrap();
         let bare = tag.strip_prefix('v').unwrap_or(tag.as_str());
         let suffix = bare.split_once('-').map(|(_, s)| s);
-        if cfg!(windows) {
-            assert_eq!(suffix, Some("win"));
-        } else {
-            assert_eq!(suffix, Some(platform_release_suffix()));
-        }
+        // Straight through `platform_release_suffix`, not a `cfg!` branch
+        // against a literal: that spelling compared "win" with "win" on
+        // Windows, so the assertion held whatever the platform code did.
+        assert_eq!(suffix, Some(platform_release_suffix()));
         assert_eq!(parse_version_from_feed(&feed).as_deref(), Some("0.1.15"));
         assert_eq!(
             asset_url(tag.as_str()),
@@ -1753,13 +1752,21 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // Nothing that names the helper survives either, whatever pid it came
         // from: a copy left in the temp directory is debris the app did not
         // install and the user never asked for.
-        let leftovers = fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(HELPER_IMAGE_PREFIX))
-            .collect::<Vec<_>>();
-        assert!(leftovers.is_empty(), "helper copies left behind: {leftovers:?}");
+        //
+        // Scoped to THIS test's own helper, not every file in the temp
+        // directory. `reap_helpers` sweeps the whole directory by prefix, and
+        // so does a scan for leftovers, so an unscoped assertion is a race
+        // against every other test that touches a helper name and against any
+        // mnvoice running on the machine - it fails for reasons that have
+        // nothing to do with the swap under test. The sibling test at
+        // `stopping_the_helper_frees_its_image_before_reaping_it` avoids
+        // exactly this by not using a helper name; this one asserts on its
+        // own path instead, which is both narrower and stronger.
+        assert!(
+            !helper_copy.exists(),
+            "this test's own helper copy survived: {}",
+            helper_copy.display()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
