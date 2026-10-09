@@ -273,7 +273,8 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `ORB_COLOR` | `hot_pink` | Orb fluid color: preset name or `#RRGGBB` |
 | `ORB_FLUID_LEVEL` | `0.75` | Orb fill `0.05`-`1.0`, or `5%`-`100%` (values below the floor clamp to it) |
 
-Delete `mnvoice.env` at any time to fall back to every default above.
+Delete `mnvoice.env` at any time to fall back to every default above - but keep
+`API_KEY`, because without it nothing can be transcribed (see step 2).
 
 Each key also answers to its vendor aliases: `DEEPGRAM_API_KEY` /
 `GROQ_API_KEY` / `OPENAI_API_KEY` (and likewise `DEEPGRAM_MODEL`,

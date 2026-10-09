@@ -70,7 +70,7 @@ fn global() -> &'static dyn Injector {
     // a test must not do to the machine it runs on.
     #[cfg(test)]
     {
-        &recording::RECORDING_INJECTOR
+        &test_injector::TEST_INJECTOR
     }
     #[cfg(not(test))]
     {
@@ -118,16 +118,16 @@ pub fn type_text(text: &str) {
 /// text without the indirection. The injector stays because refusing to type is
 /// the point; the recording was not.
 #[cfg(test)]
-pub mod recording {
+pub mod test_injector {
     use super::Injector;
 
-    pub struct RecordingInjector;
+    pub struct TestInjector;
 
-    impl Injector for RecordingInjector {
+    impl Injector for TestInjector {
         fn type_text(&self, _text: &str) -> Result<(), String> {
             Ok(())
         }
     }
 
-    pub static RECORDING_INJECTOR: RecordingInjector = RecordingInjector;
+    pub static TEST_INJECTOR: TestInjector = TestInjector;
 }
