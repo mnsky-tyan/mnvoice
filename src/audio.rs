@@ -161,22 +161,31 @@ fn audio_worker_loop(request_rx: Receiver<CaptureRequest>) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
         // Pre-initialize WASAPI in standby state! (Paid once at startup)
-        let mut state: Option<EngineState> = init_wasapi().ok();
+        //
+        // The reason for the failure is kept, not discarded into a bool. A
+        // user whose Windows Audio service is stopped and a user with no
+        // microphone both land here, and the four messages init_wasapi builds
+        // are the only thing that tells them apart; collapsing them to None
+        // made both report "failed to initialize microphone".
+        let mut state = init_wasapi();
 
         while let Ok(req) = request_rx.recv() {
-            if state.is_none() {
-                state = init_wasapi().ok();
+            if state.is_err() {
+                state = init_wasapi();
             }
 
-            let res = if let Some(engine) = &mut state {
-                let r = run_session(engine, &req);
-                if r.is_err() {
-                    // Reset state on error so next session can re-init
-                    state = None;
+            let res = match state.as_mut() {
+                Ok(engine) => {
+                    let r = run_session(engine, &req);
+                    if r.is_err() {
+                        // Reset state on error so next session can re-init
+                        state = Err("previous session ended in error".into());
+                    }
+                    r
                 }
-                r
-            } else {
-                Err("failed to initialize microphone".into())
+                // The reason init_wasapi gave, not a generic one: it already
+                // names which of the four ways the backend refused.
+                Err(why) => Err(why.clone()),
             };
 
             let _ = req.done_tx.send(res);

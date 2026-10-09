@@ -259,12 +259,12 @@ pub fn main() {
         // left behind (the staged download and helper copies - the swap-aside
         // .old belongs to the just-updated handshake consumed just above) and
         // arm the periodic background check when AUTO_UPDATE=1.
-        // The fallback keeps updates armed when the config did not load, which
-        // is when a user is most likely stuck on an outdated build.
-        let auto_update = config
-            .as_ref()
-            .map(|c| c.auto_update)
-            .unwrap_or_else(config::auto_update_enabled);
+        // Deliberately not read off the Config: auto_update_enabled() is called
+        // directly. It stays readable when load() fails - a broken API key
+        // aborts the parse - and that is exactly when a user is most likely to
+        // be stuck on an outdated build, so the updater must not depend on a
+        // Config having parsed successfully.
+        let auto_update = config::auto_update_enabled();
         // Consume the just-updated handshake before anything else could
         // observe or remove the swap-aside image (the predicate deletes it as
         // it reads it, so this is also what makes the announcement at-most-once).

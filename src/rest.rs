@@ -3,7 +3,7 @@
 // Requests go through the platform transport seam: WinHTTP with the system cert store and
 // proxy settings on Windows, ureq with rustls (bundled roots) or native-tls elsewhere.
 
-use crate::config::Config;
+use crate::config::{auth_value, Config};
 use crate::platform::http::Transport;
 
 const BOUNDARY: &str = "mnvoiceboundary9f2a";
@@ -16,7 +16,7 @@ pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
 
     let response = crate::platform::http::NativeTransport.post(
         &url,
-        Some(&format!("Bearer {}", cfg.api_key)),
+        Some(&auth_value(&cfg.api_key, "Bearer")),
         &content_type,
         &body,
     )?;
@@ -310,7 +310,6 @@ mod tests {
             vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
             vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: true,
-            auto_update: false,
         };
         let out = dictate_rest(&cfg, &[0i16; 640], &cancelled);
         assert_eq!(out, Ok(String::new()));
@@ -669,7 +668,6 @@ mod tests {
             vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
             vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: false,
-            auto_update: false,
         };
 
         // Drive the same seam `transcribe` drives, so the body length the

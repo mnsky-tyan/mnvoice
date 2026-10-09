@@ -39,9 +39,6 @@ pub struct Config {
     /// Drop disfluencies (uh, um, erm). Streaming uses the provider's native
     /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
     pub strip_fillers: bool,
-    /// Install a newer published release automatically when one appears.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub auto_update: bool,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -163,7 +160,12 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         "1" | "true" | "on" | "yes" | "keep"
     );
 
-    // AUTO_UPDATE is read by auto_update_enabled() above, not from this pass.
+    // AUTO_UPDATE is not read from this pass at all, and `Config` deliberately
+    // carries no auto_update field: `auto_update_enabled()` is the single
+    // authority, because it must stay readable when load() has failed (a broken
+    // API key aborts the parse) and that is exactly when a user is most likely
+    // to be stuck on an outdated build. A field copy would be a second value
+    // that can disagree with the function it was copied from.
 
     Ok(Config {
         protocol,
@@ -183,16 +185,33 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         vad_silence_ms: raw.vad_silence_ms,
         vad_rms_threshold: raw.vad_rms_threshold,
         strip_fillers,
-        // Deliberately not parsed inline below: a broken API key aborts load(),
-        // and if AUTO_UPDATE were derived from the same pass the updater would
-        // silently go dark exactly when the config is least trustworthy.
-        auto_update: auto_update_enabled(),
     })
 }
 
 /// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
 /// the rest of the config being valid. `load()` fails outright on a missing API
 /// key, so this is what keeps a typo'd config from also silencing updates.
+/// The Authorization header value for a config, honouring either scheme.
+///
+/// `default_scheme` is what this transport uses when the key carries no scheme
+/// of its own: Deepgram wants `Token`, OpenAI-compatible endpoints want
+/// `Bearer`. Those defaults differ per transport and are NOT interchangeable -
+/// they are what the providers actually accept - so each caller passes its own
+/// and neither is silently changed.
+///
+/// What is shared is the pass-through: both transports are configured by one
+/// `API_KEY`, so a key the user already spelled `Token ...` must not be
+/// double-prefixed. A hardcoded `Bearer {}` on the REST path turned exactly
+/// that key into `Bearer Token xyz` and it was rejected there, while the same
+/// key worked for streaming.
+pub fn auth_value(api_key: &str, default_scheme: &str) -> String {
+    if api_key.starts_with("Token ") || api_key.starts_with("Bearer ") {
+        api_key.to_string()
+    } else {
+        format!("{default_scheme} {api_key}")
+    }
+}
+
 pub fn auto_update_enabled() -> bool {
     let mut raw = auto_update_from_file();
     // The real environment wins over the file beside the exe, matching load().

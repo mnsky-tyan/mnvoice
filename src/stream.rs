@@ -124,12 +124,9 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
 /// The Authorization header value for this config: Deepgram wants `Token`,
 /// OpenAI-compatible endpoints want `Bearer`; whatever the user already typed
 /// is passed through so either spelling works.
+/// The streaming scheme is `Token`, per Deepgram; see `config::auth_value`.
 fn auth_value(cfg: &Config) -> String {
-    if cfg.api_key.starts_with("Token ") || cfg.api_key.starts_with("Bearer ") {
-        cfg.api_key.clone()
-    } else {
-        format!("Token {}", cfg.api_key)
-    }
+    crate::config::auth_value(&cfg.api_key, "Token")
 }
 
 /// Types the words in `words[from..to]` at the cursor and appends them to the
@@ -159,7 +156,7 @@ fn commit_words(
     input::type_text(&to_type);
     *has_typed_any = true;
 
-    let mut full = full.lock().unwrap();
+    let mut full = full.lock().unwrap_or_else(|e| e.into_inner());
     if !full.is_empty() {
         full.push(' ');
     }
@@ -333,8 +330,8 @@ pub fn run_stream(
 
     let _ = reader_thread.join();
 
-    let full_text = full_transcript.lock().unwrap().trim().to_string();
-    let read_error = read_error.lock().unwrap().clone();
+    let full_text = full_transcript.lock().unwrap_or_else(|e| e.into_inner()).trim().to_string();
+    let read_error = read_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     // The configured trailing space is a side effect of a session that
     // produced words, and it must not depend on which way the session ended:
@@ -395,7 +392,6 @@ mod tests {
             vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
             vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: true,
-            auto_update: false,
         }
     }
 

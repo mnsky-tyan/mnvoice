@@ -328,13 +328,21 @@ impl Transport for WinHttpTransport {
             }
             // WinHTTP requires the Upgrade/Connection pair to be present before
             // the socket completes; the caller supplies auth headers only.
+            //
+            // The result is checked, exactly as the get and post paths check the
+            // same call: a header WinHTTP refuses (an API key carrying CR/LF, say
+            // - nothing validates that spelling upstream) used to be dropped
+            // silently, and the session then failed as a generic provider 401
+            // or as an unauthenticated socket that broke on every later send.
             if !header_text.is_empty() {
                 let headers_w = wide(&header_text);
-                let _ = WinHttpAddRequestHeaders(
+                if let Err(e) = WinHttpAddRequestHeaders(
                     request,
                     &headers_w[..headers_w.len() - 1],
                     WINHTTP_ADDREQ_FLAG_ADD,
-                );
+                ) {
+                    return Err(format!("WebSocket header rejected ({e})"));
+                }
             }
 
             // Every failure from here to the upgrade returns through the
