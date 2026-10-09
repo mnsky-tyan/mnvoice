@@ -164,11 +164,6 @@ struct App {
     /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
     /// dictate" for a key that does nothing.
     hotkey_ok: bool,
-    /// Whether a Config actually loaded. A broken or missing API key aborts
-    /// `config::load`, and the app still starts so the tray menu exists to fix
-    /// it from - which meant the hotkey silently did nothing with no
-    /// user-visible reason anywhere. The idle tip now says so.
-    has_config: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -280,16 +275,13 @@ pub fn main() {
         // so the window, the hotkey and the tray never wait on its spawns.
         thread::spawn(migrate_autostart);
 
-        // Read before `config` is moved into the window: a load() failure is
-        // exactly the state the idle tip has to report, and it is the reason
-        // dictation cannot start at all.
-        let cfg_ok = config.is_some();
+        // A load() failure is exactly the state the idle tip has to report,
+        // and it is the reason dictation cannot start at all.
         let Some(hwnd) =
             create_tray_window(hinstance, config, hk_str.clone(), audio_engine)
         else {
             return;
         };
-        app_ref(hwnd).has_config = cfg_ok;
         // HOTKEY=none disables the toggle registration entirely; the tray
         // menu's Dictate item is then the only start and stop control (vk == 0
         // is the disabled sentinel). A disabled control is not a failed one,
@@ -301,7 +293,7 @@ pub fn main() {
             register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
         };
         app_ref(hwnd).hotkey_ok = hotkey_ok;
-        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, cfg_ok));
+        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, app_ref(hwnd).config.is_some()));
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -615,7 +607,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // The registration result arrives after WM_CREATE (the
                     // hwnd did not exist yet); main sets the real value.
                     hotkey_ok: true,
-                    has_config: false,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -650,7 +641,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let app = app_ref(hwnd);
                     set_tray_tip(
                         hwnd,
-                        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.has_config),
+                        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                     );
                 }
                 LRESULT(0)
@@ -673,7 +664,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     set_state(app, State::Idle);
                     set_tray_tip(
                         hwnd,
-                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.has_config),
+                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                     );
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
@@ -816,7 +807,7 @@ fn toggle(app: &mut App) {
             unsafe {
                 set_tray_tip(
                     app.hwnd,
-                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok, app.has_config),
+                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                 )
             };
             log("recording started");
@@ -831,7 +822,7 @@ fn toggle(app: &mut App) {
             unsafe {
                 set_tray_tip(
                     app.hwnd,
-                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok, app.has_config),
+                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                 )
             };
             log("recording stopped, transcribing");
@@ -859,7 +850,7 @@ fn cancel(app: &mut App) {
     unsafe {
         set_tray_tip(
             app.hwnd,
-            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.has_config),
+            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
         )
     };
     log("recording cancelled");

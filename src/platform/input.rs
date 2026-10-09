@@ -62,12 +62,12 @@ fn platform_injector() -> &'static dyn Injector {
 /// backend, which is what lets the same streaming loop type on Windows, X11
 /// and macOS without a single cfg in its body.
 fn global() -> &'static dyn Injector {
-    // Under `cfg(test)` the recorder always wins, so a test that drives the
-    // real streaming loop never reaches the platform's global keyboard
-    // injection, whatever order the test binary happens to start its threads
-    // in. A test that does want the real thing has no reason to be here:
-    // typing into whatever window happens to be focused is exactly what a
-    // test must not do to the machine it runs on.
+    // Under `cfg(test)` the no-op test injector always wins, so a test that
+    // drives the real streaming loop never reaches the platform's global
+    // keyboard injection, whatever order the test binary happens to start its
+    // threads in. A test that does want the real thing has no reason to be
+    // here: typing into whatever window happens to be focused is exactly what
+    // a test must not do to the machine it runs on.
     #[cfg(test)]
     {
         &recording::RECORDING_INJECTOR

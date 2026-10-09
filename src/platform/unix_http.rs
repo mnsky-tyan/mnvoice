@@ -395,10 +395,11 @@ impl WebSocket for UnixSocket {
         let _ = self
             .shutdown
             .set_write_timeout(Some(Duration::from_secs(2)));
-        if let Ok(mut ws) = self.socket.lock() {
-            // A close frame asks the server to shut down; the reply arrives on
-            // whichever thread reads next. We do not wait for it - the caller
-            // means "stop now".
+        // A close frame asks the server to shut down; the reply arrives on
+        // whichever thread reads next. We do not wait for it - the caller
+        // means "stop now".
+        {
+            let mut ws = self.socket.lock().unwrap_or_else(|e| e.into_inner());
             let _ = ws.send(Message::Close(None));
             let _ = ws.flush();
         }

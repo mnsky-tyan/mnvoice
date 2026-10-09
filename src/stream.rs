@@ -229,9 +229,9 @@ pub fn run_stream(
                     if !reader_done_clone.load(Ordering::SeqCst)
                         && !stop_clone.load(Ordering::SeqCst)
                     {
-                        if let Ok(mut slot) = read_error_clone.lock() {
-                            *slot = Some(e);
-                        }
+                        let mut slot =
+                            read_error_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        *slot = Some(e);
                     }
                     break;
                 }
@@ -463,9 +463,9 @@ mod tests {
     /// The whole point of the connection-lost work: `run_stream` is driven
     /// against a real WebSocket peer on loopback that speaks Deepgram's
     /// framing, so the string the user is shown comes from the production
-    /// function and a real socket - not from a stub. `type_text` is a recorder
-    /// under `cfg(test)` (see `platform::input`), so this runs the real
-    /// streaming loop without touching the machine's keyboard.
+    /// function and a real socket - not from a stub. `type_text` is a no-op
+    /// test injector under `cfg(test)` (see `platform::input`), so this runs
+    /// the real streaming loop without touching the machine's keyboard.
     mod live_provider {
         use super::*;
         use crate::platform::audio::SAMPLE_RATE;

@@ -221,9 +221,7 @@ fn run_session(
 /// is not an option here: the realtime callback appends whatever the device
 /// handed it, so the tail has to be carried.
 fn take_frames(buffer: &Arc<Mutex<Vec<f32>>>, channels: usize) -> Vec<f32> {
-    let Ok(mut buf) = buffer.lock() else {
-        return Vec::new();
-    };
+    let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
     // Only whole frames leave the buffer, so what stays is by construction a
     // partial one.
     let whole = buf.len() / channels * channels;
