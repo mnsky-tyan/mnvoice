@@ -308,10 +308,6 @@ impl Transport for WinHttpTransport {
     }
 
     fn websocket(&self, url: &str, headers: &[(&str, &str)]) -> Result<Box<dyn WebSocket>, String> {
-        // WINHTTP_ADDREQ_FLAG_COOKIE, named rather than written as the bare
-        // literal 0x2000_0000 so the header flags this file passes read the
-        // same way as the WINHTTP_ADDREQ_FLAG_ADD used by get/post above.
-        const ADD_REQ_FLAG_COOKIE: u32 = 0x2000_0000;
         unsafe {
             // A streaming session is held open for the length of a dictation,
             // so there is no overall timeout and the socket carries no receive
@@ -337,7 +333,7 @@ impl Transport for WinHttpTransport {
                 let _ = WinHttpAddRequestHeaders(
                     request,
                     &headers_w[..headers_w.len() - 1],
-                    ADD_REQ_FLAG_COOKIE,
+                    WINHTTP_ADDREQ_FLAG_ADD,
                 );
             }
 
