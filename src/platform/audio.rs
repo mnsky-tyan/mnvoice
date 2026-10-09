@@ -129,10 +129,12 @@ impl SilenceWindows {
     }
 }
 
-/// Whether the silence detector ends a dictation that has heard speech.
+/// Whether a silence window of `since_voice_ms` has reached its limit.
 ///
-/// The threshold is the configured value itself, so `VAD_SILENCE_MS=0` stops
-/// on the first silent tick instead of switching the detector off.
+/// Both windows share this one comparison: the post-voice window against the
+/// configured `VAD_SILENCE_MS`, and the never-heard-speech window against
+/// [`NO_SPEECH_LIMIT_MS`]. The threshold is the limit itself, so a limit of 0
+/// stops on the first silent tick instead of switching the detector off.
 pub fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
     since_voice_ms >= vad_silence_ms as u64
 }

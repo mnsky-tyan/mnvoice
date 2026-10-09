@@ -445,8 +445,8 @@ pub const DEFAULT_MAX_SECONDS: u32 = 120;
 pub const DEFAULT_VAD_SILENCE_MS: u32 = 3000;
 
 /// The RMS level at or below which a chunk counts as silence. Deliberately a
-/// raw amplitude, not a percentage: the value is compared against the RMS the
-/// engines compute over f32 samples.
+/// raw amplitude, not a percentage: the value is compared against the RMS both
+/// engines compute over i16 samples (see `rms_of`), so the scale runs 0-32767.
 pub const DEFAULT_VAD_RMS_THRESHOLD: f64 = 400.0;
 
 /// The cancel key to register plus the spelling to show for it, decided in
