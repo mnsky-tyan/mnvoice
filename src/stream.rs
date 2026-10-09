@@ -322,14 +322,22 @@ pub fn run_stream(
     let _ = reader_thread.join();
 
     let full_text = full_transcript.lock().unwrap().trim().to_string();
+    let read_error = read_error.lock().unwrap().clone();
 
     // A read that failed with nothing typed is a real failure and is reported
     // as one. Once words have been typed the user already has their dictation,
-    // so the partial success stands and the error is not raised over it.
-    if full_text.is_empty() {
-        if let Some(e) = read_error.lock().unwrap().clone() {
+    // so it is kept - but the failure is still stated, in the text the caller
+    // shows, because a silent partial result reads as a complete one. The user
+    // pressed once and got half a sentence with no sign anything went wrong.
+    //
+    // No log line here: `windows_app` is Windows-only and this module compiles
+    // on all three targets, and the marker travels with the returned text,
+    // which every caller already reports.
+    if let Some(e) = read_error {
+        if full_text.is_empty() {
             return Err(format!("streaming transcription failed: {e}"));
         }
+        return Ok(format!("{full_text} [connection lost: {e}]"));
     }
 
     // Add trailing space if configured, but never on a cancelled session

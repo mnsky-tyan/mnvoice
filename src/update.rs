@@ -92,8 +92,20 @@ pub fn is_newer(a: &str, b: &str) -> bool {
 /// macOS ports share one redirect contract. A non-200 is an error here rather
 /// than a `Response`, because a 404 or 403 body must not be mistaken for a
 /// release that names no version, or for an executable missing its MZ header.
+/// A GET that is allowed to buffer a whole release asset.
+///
+/// The bound is the asset ceiling, not the transcript one: this function
+/// downloads an executable, which is an order of magnitude larger than a
+/// transcription response, and using the smaller bound here would truncate a
+/// legitimate download. A truncated exe then fails the checksum comparison
+/// with a message about tampering rather than about a cut-off body, so the
+/// ceiling is set where it cannot quietly bite.
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
-    let response = crate::platform::http::NativeTransport.get(url, accept)?;
+    let response = crate::platform::http::NativeTransport.get(
+        url,
+        accept,
+        crate::platform::http::MAX_ASSET_BYTES,
+    )?;
     if response.status != 200 {
         return Err(response.error_for_status("update request"));
     }

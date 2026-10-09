@@ -29,7 +29,18 @@ pub const USER_AGENT: &str = "mnvoice-update";
 /// stream an unbounded body into a process whose whole job is to stay
 /// responsive. A transcript is a few kilobytes; 8 MiB is far above any real
 /// one and far below anything that would strain the allocator.
-pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Ceiling on a downloaded release asset, in bytes.
+///
+/// Separate from [`MAX_TRANSCRIPT_BYTES`] because the two paths carry
+/// different things and want different bounds: a transcript is text of a few
+/// kilobytes, while this is a whole executable. The published binaries are
+/// 0.4 MB (Windows) to 2.1 MB (Linux), so 64 MiB leaves roughly 30x headroom
+/// for a larger future build while still refusing to buffer an endless body.
+/// Sharing one constant between the two would make whichever bound is larger
+/// the effective one for both, which is why they are named apart.
+pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Response to a completed request. The status is carried rather than turned
 /// into an error here, because the callers disagree about which codes are
@@ -104,7 +115,12 @@ pub trait Transport {
     /// Following the redirect is the contract, not an implementation detail. It
     /// is documented here so a future backend swap has to consciously preserve
     /// it, and asserted by a test against a real redirecting loopback endpoint.
-    fn get(&self, url: &str, accept: &str) -> Result<Response, String>;
+    ///
+    /// `max_bytes` bounds the buffered body. It is a parameter rather than a
+    /// constant because this one call serves two callers with very different
+    /// payloads - a JSON transcript and a whole release executable - and a
+    /// single bound would be whichever of theirs happened to be larger.
+    fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String>;
 
     /// A POST with a raw body. Used by the REST transcription fallback, which
     /// uploads a WAV as multipart/form-data.

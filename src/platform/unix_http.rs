@@ -21,7 +21,9 @@
 // Like the Windows transport, every call is stateless: open, complete, close.
 // A failed request cannot poison the next one.
 
-use crate::platform::http::{Response, Transport, WebSocket, MAX_RESPONSE_BYTES, USER_AGENT};
+use crate::platform::http::{
+    Response, Transport, WebSocket, MAX_ASSET_BYTES, MAX_TRANSCRIPT_BYTES, USER_AGENT,
+};
 use std::io::Read as _;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -92,14 +94,14 @@ fn agent_builder() -> Result<ureq::AgentBuilder, String> {
 // message and the transcribe path keys off the status itself. So status
 // errors are unpacked into a normal Response here, and only genuine transport
 // failures (DNS, TLS, connection refused) surface as Err.
-fn finish(resp: ureq::Response) -> Result<Response, String> {
+fn finish(resp: ureq::Response, max_bytes: u64) -> Result<Response, String> {
     // status() borrows, into_reader() consumes - so status comes first.
     let status = resp.status();
     let mut body = Vec::new();
     // Capped: ureq's own docs warn that an uncapped read_to_end "might return
     // enough bytes to exhaust available memory" when the server misbehaves.
     resp.into_reader()
-        .take(MAX_RESPONSE_BYTES)
+        .take(max_bytes)
         .read_to_end(&mut body)
         .map_err(|e| format!("reading response body failed ({e})"))?;
     Ok(Response { status, body })
@@ -145,7 +147,11 @@ fn download_agent() -> Result<&'static ureq::Agent, String> {
 }
 
 /// A GET with an `Accept` header. Redirects are followed - the contract.
-pub fn get(url: &str, accept: &str) -> Result<Response, String> {
+///
+/// `max_bytes` bounds the buffered body: the caller knows whether it asked for
+/// a JSON transcript or a release executable, and the two want different
+/// ceilings. See [`MAX_TRANSCRIPT_BYTES`] and [`MAX_ASSET_BYTES`].
+pub fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
     ensure_tls_ready();
     match download_agent()?
         .get(url)
@@ -153,8 +159,8 @@ pub fn get(url: &str, accept: &str) -> Result<Response, String> {
         .set("User-Agent", USER_AGENT)
         .call()
     {
-        Ok(resp) => finish(resp),
-        Err(ureq::Error::Status(_, resp)) => finish(resp),
+        Ok(resp) => finish(resp, max_bytes),
+        Err(ureq::Error::Status(_, resp)) => finish(resp, max_bytes),
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -173,8 +179,8 @@ pub fn post(
         req = req.set("Authorization", auth);
     }
     match req.send(body) {
-        Ok(resp) => finish(resp),
-        Err(ureq::Error::Status(_, resp)) => finish(resp),
+        Ok(resp) => finish(resp, MAX_TRANSCRIPT_BYTES),
+        Err(ureq::Error::Status(_, resp)) => finish(resp, MAX_TRANSCRIPT_BYTES),
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -311,8 +317,8 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
 pub struct UnixTransport;
 
 impl Transport for UnixTransport {
-    fn get(&self, url: &str, accept: &str) -> Result<Response, String> {
-        get(url, accept)
+    fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
+        get(url, accept, max_bytes)
     }
 
     fn post(
@@ -478,6 +484,9 @@ mod tests {
             .get(
                 &format!("http://{redirect_addr}/releases/download/v0.1.15/asset"),
                 "application/octet-stream",
+                // This request stands in for an asset download, so it takes the
+                // asset ceiling rather than the transcript one.
+                MAX_ASSET_BYTES,
             )
             .unwrap();
 

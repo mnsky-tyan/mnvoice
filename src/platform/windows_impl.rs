@@ -14,7 +14,9 @@
 // at the 302 would download an HTML page and stage it as an executable. The
 // trait documents the contract; the test in `update.rs` pins it.
 
-use crate::platform::http::{Response, Transport, WebSocket, MAX_RESPONSE_BYTES, USER_AGENT};
+use crate::platform::http::{
+    Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, USER_AGENT,
+};
 use crate::rest::parse_base_url;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Networking::WinHttp::*;
@@ -191,14 +193,17 @@ impl WinHttpTransport {
         status as u16
     }
 
-    /// Drain the body of an open response.
-    unsafe fn read_body(request: *mut std::ffi::c_void) -> Vec<u8> {
+    /// Drain the body of an open response, up to `max_bytes`.
+    ///
+    /// Capped like the unix backend so the two keep one contract: a misbehaving
+    /// server cannot stream an unbounded body into a process that is meant to
+    /// stay responsive. The bound is passed in rather than fixed here because
+    /// this one function serves both a JSON transcript and a release
+    /// executable.
+    unsafe fn read_body(request: *mut std::ffi::c_void, max_bytes: u64) -> Vec<u8> {
         let mut body = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
-        // Capped like the unix backend so the two keep one contract: a
-        // misbehaving server cannot stream an unbounded body into a process
-        // that is meant to stay responsive.
-        let cap = MAX_RESPONSE_BYTES as usize;
+        let cap = max_bytes as usize;
         loop {
             if body.len() >= cap {
                 break;
@@ -221,7 +226,7 @@ impl WinHttpTransport {
 }
 
 impl Transport for WinHttpTransport {
-    fn get(&self, url: &str, accept: &str) -> Result<Response, String> {
+    fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
@@ -241,7 +246,7 @@ impl Transport for WinHttpTransport {
                 WinHttpSendRequest(request, None, None, 0, 0, 0)?;
                 WinHttpReceiveResponse(request, std::ptr::null_mut())?;
                 let status = Self::status_of(request);
-                let body = Self::read_body(request);
+                let body = Self::read_body(request, max_bytes);
                 Ok::<Response, windows::core::Error>(Response { status, body })
             })();
 
@@ -288,7 +293,7 @@ impl Transport for WinHttpTransport {
                 )?;
                 WinHttpReceiveResponse(request, std::ptr::null_mut())?;
                 let status = Self::status_of(request);
-                let resp_body = Self::read_body(request);
+                let resp_body = Self::read_body(request, MAX_TRANSCRIPT_BYTES);
                 Ok::<Response, windows::core::Error>(Response {
                     status,
                     body: resp_body,
