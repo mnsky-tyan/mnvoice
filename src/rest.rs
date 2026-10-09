@@ -572,6 +572,12 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+            // A blocked write must not wedge the server thread: the client
+            // stops reading at its ceiling, so once the socket buffers fill the
+            // server can only make progress by giving up on the rest of the
+            // body. Without this bound the server can park in `write` forever
+            // while the client waits for bytes that will never come.
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(20)));
             // Consume the whole request, head and body, before answering. If the
             // server answers while WinHTTP is still sending its multipart body,
             // the client's own write can fail and the read sees a reset instead
@@ -614,9 +620,35 @@ mod tests {
             if stream.write_all(prefix).is_err() {
                 return;
             }
-            let pad = vec![b' '; body_len - prefix.len()];
-            let _ = stream.write_all(&pad);
+            // The padding is written in bounded chunks rather than one large
+            // `write_all`, so a full socket buffer surfaces as one failed
+            // chunk - which ends the loop - instead of an unbounded write. The
+            // write is expected to fail once the client has read its ceiling
+            // and stopped: "connection reset by peer" or a timed-out write here
+            // is the fixture working, not a fault. It is ignored on purpose.
+            let chunk = [b' '; 16 * 1024];
+            let mut left = body_len - prefix.len();
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if stream.write_all(&chunk[..n]).is_err() {
+                    break;
+                }
+                left -= n;
+            }
             let _ = stream.flush();
+            // Crucially, do NOT drop the connection here. The response body is
+            // one byte longer than the client will read, so closing first
+            // leaves an unread byte queued and the kernel answers the client's
+            // next read with RST - which ureq reports as a read error instead
+            // of the capped body this test is measuring. Holding the socket
+            // open until the client closes keeps the byte in flight so the
+            // read ends cleanly at the ceiling on every platform.
+            let mut drain = [0u8; 16 * 1024];
+            while let Ok(n) = stream.read(&mut drain) {
+                if n == 0 {
+                    break;
+                }
+            }
         });
 
         let cfg = Config {
