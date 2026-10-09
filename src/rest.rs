@@ -292,7 +292,8 @@ mod tests {
         // stopped short-circuiting, this call would attempt the network and
         // fail here instead of returning Ok, which is exactly the regression
         // this test exists to catch.
-        let cfg = crate::config::test_config();
+        let mut cfg = crate::config::test_config();
+        cfg.base_url = "https://127.0.0.1:1".to_string();
         let out = dictate_rest(&cfg, &[0i16; 640], &cancelled);
         assert_eq!(out, Ok(String::new()));
     }

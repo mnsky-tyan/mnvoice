@@ -188,9 +188,6 @@ fn derive(raw: RawFields) -> Result<Config, String> {
     })
 }
 
-/// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
-/// the rest of the config being valid. `load()` fails outright on a missing API
-/// key, so this is what keeps a typo'd config from also silencing updates.
 /// The Authorization header value for a config, honouring either scheme.
 ///
 /// `default_scheme` is what this transport uses when the key carries no scheme
@@ -212,6 +209,9 @@ pub fn auth_value(api_key: &str, default_scheme: &str) -> String {
     }
 }
 
+/// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
+/// the rest of the config being valid. `load()` fails outright on a missing API
+/// key, so this is what keeps a typo'd config from also silencing updates.
 pub fn auto_update_enabled() -> bool {
     let mut raw = auto_update_from_file();
     // The real environment wins over the file beside the exe, matching load().
