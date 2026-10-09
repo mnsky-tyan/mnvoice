@@ -36,13 +36,12 @@ pub struct Release {
 
 /// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
 ///
-/// Both the "is it time to check" read and the stamp write read the clock, and
-/// they want *opposite* behaviour when it is degenerate, so the shared helper
-/// says which is which: 0 makes the read fail CLOSED (0 saturating-subtracted
-/// is never more than a day old, so no check happens until the clock is fixed),
-/// while the write skips its stamp, which leaves the previous stamp and its
-/// daily limit intact. Skipping is what stops a pre-1970 clock from stamping 0
-/// and re-checking on every start until it is corrected.
+/// Both the "is it time to check" read and the stamp write read the clock
+/// through this, so the degenerate case has one meaning: 0 is the stamp a
+/// pre-1970 clock writes and the value the read compares against, and
+/// `0.saturating_sub(0)` is 0 - not more than a day - so the check runs once
+/// and then stays quiet until the clock is corrected. The two halves share
+/// that interpretation rather than each guessing at it.
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -694,13 +693,6 @@ fn mark_checked() {
 
 fn mark_checked_at(stamp: &Path) {
     let now = now_secs();
-    if now == 0 {
-        // Clock before 1970: recording 0 would make every subsequent start
-        // read a zero stamp, compute an enormous elapsed time and check again,
-        // so the daily limit would never hold until the clock is corrected.
-        // Skipping the write leaves the previous stamp and its limit intact.
-        return;
-    }
     let _ = fs::write(stamp, now.to_string());
 }
 
