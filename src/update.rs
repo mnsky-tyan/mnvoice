@@ -34,13 +34,6 @@ pub struct Release {
     pub sha256_url: String,
 }
 
-/// Version baked in at compile time: the release tag (`MNVOICE_TAG`, set by
-/// build.rs) parsed by the same `version_of_tag` the feed tags go through, so
-/// the updater compares like with like by construction.
-pub fn current_version() -> String {
-    crate::platform::version()
-}
-
 /// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
 ///
 /// Both the "is it time to check" read and the stamp write read the clock, and
@@ -1173,7 +1166,10 @@ mod tests {
             sent.contains("accept: application/atom+xml"),
             "request was: {sent}"
         );
-        assert!(sent.contains("user-agent: mnvoice-update"), "request was: {sent}");
+        assert!(
+            sent.contains(&format!("user-agent: {}", crate::platform::http::USER_AGENT).to_lowercase()),
+            "request was: {sent}"
+        );
     }
 
     #[test]

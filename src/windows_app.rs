@@ -1379,7 +1379,7 @@ pub(crate) fn check_for_updates_async(quiet: bool) {
                 return;
             }
         };
-        let current = update::current_version();
+        let current = platform::version();
         if !update::is_newer(&rel.version, &current) {
             log("mnvoice is up to date");
             if !quiet {

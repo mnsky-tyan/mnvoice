@@ -51,8 +51,9 @@ pub fn run() -> Result<(), String> {
     // owner: the reader thread takes it for the life of the process and hands
     // the main loop a line at a time. A dictation therefore never runs with the
     // lock held, and the "Enter again" control reads through the same channel.
-    // The lock has to be taken on this side of the spawn, because
-    // `StdinLock` is a `MutexGuard` and cannot be sent to another thread.
+    // The lock is taken inside the spawned thread because `StdinLock` is a
+    // `MutexGuard` and is not `Send`, so it cannot be moved there from the
+    // main thread; the reader constructs both the lock and its `Lines`.
     let (line_tx, lines) = mpsc::channel::<()>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();

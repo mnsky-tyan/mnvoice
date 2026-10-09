@@ -352,17 +352,46 @@ mod tests {
         }
     }
 
-    /// The amplitude comparison is strict (`rms > threshold`), and the tests
-    /// only ever used 1.0 and 0.0 against a 0.01 threshold, so whether a chunk
-    /// exactly *at* the threshold counted as voice or silence was unpinned.
-    /// It counts as silence: the threshold is the level at which a chunk stops
-    /// being treated as speech.
+    /// The amplitude comparison is strict (`rms > threshold`), so a chunk
+    /// exactly *at* the threshold is silence. Both branches of `advance`
+    /// return `false` for that single chunk, so the boundary only becomes
+    /// observable through which window it advances: treated as silence, it
+    /// feeds the no-speech window (`NO_SPEECH_LIMIT_MS`, 10 s); treated as
+    /// voice, it opens the post-voice window (`vad_silence_ms`, 3 s here).
+    /// Feeding the equality chunk and then only `vad_silence_ms` of quiet
+    /// therefore separates the two: the session must still be running, and
+    /// only the no-speech limit later ends it.
     #[test]
     fn a_chunk_exactly_at_the_threshold_counts_as_silence() {
         let mut silence = SilenceWindows::new();
+        let mut chunks = 1u64;
         assert!(
             !silence.advance(640, 0.01, 0.01, 3_000),
             "rms equal to the threshold is not voice"
+        );
+        // 75 chunks of 40 ms is exactly `vad_silence_ms`. Only a session that
+        // counted the equality chunk as voice ends here; a session that
+        // counted it as silence is still inside the no-speech window.
+        for tick in 0..75 {
+            chunks += 1;
+            assert!(
+                !silence.advance(640, 0.0, 0.01, 3_000),
+                "the equality chunk opened the post-voice window at tick {tick}"
+            );
+        }
+        // And the equality chunk really did count as silence, rather than
+        // being discarded: the no-speech limit arrives after it, not one
+        // chunk later.
+        loop {
+            chunks += 1;
+            if silence.advance(640, 0.0, 0.01, 3_000) {
+                break;
+            }
+            assert!(chunks < 1_000, "the no-speech limit never arrived");
+        }
+        assert_eq!(
+            chunks, 250,
+            "10 s of 40 ms chunks, counting the equality chunk"
         );
     }
 
