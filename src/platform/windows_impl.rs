@@ -442,8 +442,13 @@ impl WebSocket for WinHttpSocket {
     /// WinHTTP has no "read with timeout" call and the socket is opened with
     /// no receive timeout, so the receive blocks until a frame arrives, the
     /// peer closes, or the transport fails - the contract the trait
-    /// documents. Any nonzero result ends the read: from the streaming loop's
-    /// point of view a session that stopped delivering frames is over.
+    /// documents. The two ends are kept apart, because the streaming loop
+    /// reports a lost connection only when the read says so: a nonzero result
+    /// is a transport failure and becomes an `Err`, while a close frame
+    /// arrives as a zero-length read with a success result and becomes
+    /// `Ok(None)`. Collapsing the two would make a provider disconnect
+    /// indistinguishable from an orderly end, which is exactly the confusion
+    /// the trait's `Result` exists to prevent.
     fn read(&self) -> Result<Option<Vec<u8>>, String> {
         // Once a WinHTTP request is upgraded to a socket, its receive timeout
         // is fixed at what the session was configured with, and the pre-seam
@@ -460,11 +465,12 @@ impl WebSocket for WinHttpSocket {
                 &mut read,
                 &mut buf_type,
             );
-            // WinHTTP reports through a raw error code; zero means a frame
-            // arrived. A zero-length read is the close frame, which is the end
-            // of the stream, not an empty poll. Both are reported the same way
-            // the streaming loop always treated them: stop.
-            if result != 0 || read == 0 {
+            if result != 0 {
+                return Err(format!("websocket read failed (error {result})"));
+            }
+            // A zero-length read is the close frame, which is the end of the
+            // stream, not an empty poll.
+            if read == 0 {
                 return Ok(None);
             }
             buffer.truncate(read as usize);

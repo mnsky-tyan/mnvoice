@@ -330,6 +330,16 @@ pub fn run_stream(
     let full_text = full_transcript.lock().unwrap().trim().to_string();
     let read_error = read_error.lock().unwrap().clone();
 
+    // The configured trailing space is a side effect of a session that
+    // produced words, and it must not depend on which way the session ended:
+    // a lost connection after words were typed would otherwise be the one
+    // path that commits text without it.
+    if crate::rest::trailing_space_due(cfg.trailing_space, &full_text)
+        && !cancelled.load(Ordering::SeqCst)
+    {
+        input::type_text(" ");
+    }
+
     // A read that failed with nothing typed is a real failure and is reported
     // as one. Once words have been typed the user already has their dictation,
     // so it is kept - but the failure is still stated, in the text the caller
@@ -344,13 +354,6 @@ pub fn run_stream(
             return Err(format!("streaming transcription failed: {e}"));
         }
         return Ok(format!("{full_text} [connection lost: {e}]"));
-    }
-
-    // Add trailing space if configured, but never on a cancelled session
-    if crate::rest::trailing_space_due(cfg.trailing_space, &full_text)
-        && !cancelled.load(Ordering::SeqCst)
-    {
-        input::type_text(" ");
     }
 
     Ok(full_text)
