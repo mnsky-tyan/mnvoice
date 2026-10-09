@@ -40,37 +40,6 @@ pub const KEY_GAP: Duration = Duration::from_millis(2);
 static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
 static FAILING: AtomicBool = AtomicBool::new(false);
 
-/// A stand-in injector for tests that drive the real streaming loop.
-///
-/// The loop's only outward effect besides the socket is the keystrokes it
-/// synthesizes, and a test that runs it must not type into whatever window
-/// happens to be focused on the machine. Tests that only care about the
-/// returned transcript record what would have been typed here instead of
-/// asking the platform to send it.
-#[cfg(test)]
-pub mod recording {
-    use super::Injector;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-
-    static RECORDED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-
-    pub struct RecordingInjector;
-
-    impl Injector for RecordingInjector {
-        fn type_text(&self, text: &str) -> Result<(), String> {
-            RECORDED
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap()
-                .push(text.to_string());
-            Ok(())
-        }
-    }
-
-    pub static RECORDING_INJECTOR: RecordingInjector = RecordingInjector;
-}
-
 #[cfg(not(test))]
 fn platform_injector() -> &'static dyn Injector {
     #[cfg(windows)]
@@ -101,7 +70,7 @@ fn global() -> &'static dyn Injector {
     // test must not do to the machine it runs on.
     #[cfg(test)]
     {
-        return &recording::RECORDING_INJECTOR;
+        &recording::RECORDING_INJECTOR
     }
     #[cfg(not(test))]
     {
@@ -132,4 +101,35 @@ pub fn type_text(text: &str) {
             }
         }
     }
+}
+
+/// A stand-in injector for tests that drive the real streaming loop.
+///
+/// The loop's only outward effect besides the socket is the keystrokes it
+/// synthesizes, and a test that runs it must not type into whatever window
+/// happens to be focused on the machine. Tests that only care about the
+/// returned transcript record what would have been typed here instead of
+/// asking the platform to send it.
+#[cfg(test)]
+pub mod recording {
+    use super::Injector;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static RECORDED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    pub struct RecordingInjector;
+
+    impl Injector for RecordingInjector {
+        fn type_text(&self, text: &str) -> Result<(), String> {
+            RECORDED
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(text.to_string());
+            Ok(())
+        }
+    }
+
+    pub static RECORDING_INJECTOR: RecordingInjector = RecordingInjector;
 }
