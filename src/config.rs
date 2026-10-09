@@ -39,6 +39,11 @@ pub struct Config {
     /// Drop disfluencies (uh, um, erm). Streaming uses the provider's native
     /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
     pub strip_fillers: bool,
+    // AUTO_UPDATE deliberately has no field here: `auto_update_enabled()` is the
+    // single authority, because it must stay readable when load() has failed (a
+    // broken API key aborts the parse) and that is exactly when a user is most
+    // likely to be stuck on an outdated build. A field copy would be a second
+    // value that can disagree with the function it was copied from.
 }
 
 pub fn load() -> Result<Config, String> {
@@ -159,13 +164,6 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         raw.filler_words_str.trim().to_lowercase().as_str(),
         "1" | "true" | "on" | "yes" | "keep"
     );
-
-    // AUTO_UPDATE is not read from this pass at all, and `Config` deliberately
-    // carries no auto_update field: `auto_update_enabled()` is the single
-    // authority, because it must stay readable when load() has failed (a broken
-    // API key aborts the parse) and that is exactly when a user is most likely
-    // to be stuck on an outdated build. A field copy would be a second value
-    // that can disagree with the function it was copied from.
 
     Ok(Config {
         protocol,

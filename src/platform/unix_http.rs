@@ -313,18 +313,25 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
     std::thread::Builder::new()
         .name("mnvoice-resolve".to_string())
         .spawn(move || {
-            // A resolution failure is reported the same way an empty answer is:
-            // no addresses to try, which the caller turns into "cannot resolve".
-            let addrs: Vec<SocketAddr> = format!("{resolve_host}:{port}")
+            // The OS/DNS reason is carried back with the answer so the caller can
+            // report why resolution failed, not merely that it did.
+            let resolved = format!("{resolve_host}:{port}")
                 .to_socket_addrs()
-                .map(|it| it.collect())
-                .unwrap_or_default();
-            let _ = tx.send(addrs);
+                .map(|it| it.collect::<Vec<SocketAddr>>())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(resolved);
         })
         .map_err(|e| format!("cannot start resolver for {host} ({e})"))?;
-    let addrs: Vec<SocketAddr> = rx
-        .recv_timeout(timeout)
-        .map_err(|_| format!("cannot resolve {host} within {timeout:?}"))?;
+    let addrs: Vec<SocketAddr> = match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => return Err(format!("cannot resolve {host} ({e})")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(format!("cannot resolve {host} within {timeout:?}"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(format!("cannot resolve {host} (resolver thread stopped)"))
+        }
+    };
     if addrs.is_empty() {
         return Err(format!("cannot resolve {host}"));
     }
