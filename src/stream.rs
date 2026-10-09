@@ -188,6 +188,13 @@ pub fn run_stream(
     // message is kept here so the caller can report the real cause instead of
     // telling the user they said nothing.
     let read_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Set once the caller has asked the provider to end the stream. From that
+    // point the session is being torn down on purpose, so a socket that ends
+    // without a clean close frame is the ordinary end of a finished session,
+    // not a peer fault - and reporting it would label every good dictation as
+    // a lost connection. Only a fault seen while the caller still expects
+    // frames is attributed to the peer.
+    let draining = Arc::new(AtomicBool::new(false));
 
     // Capture this before the thread moves in, so the borrow cannot escape.
     let strip_fillers = cfg.strip_fillers;
@@ -198,6 +205,7 @@ pub fn run_stream(
     let cancelled_clone = cancelled.clone();
     let reader_done_clone = reader_done.clone();
     let read_error_clone = read_error.clone();
+    let draining_clone = draining.clone();
 
     let reader_thread = thread::spawn(move || {
         let mut typed_word_count = 0usize;
@@ -223,9 +231,14 @@ pub fn run_stream(
                     // (`close()` shuts the connection down, which is what
                     // releases this parked read), so an error seen after
                     // `reader_done` was set is self-inflicted and would mark
-                    // every ordinary session as lost. A genuine peer fault
+                    // every ordinary session as lost. The same holds once the
+                    // caller has sent `CloseStream`: the provider is already
+                    // being asked to end the stream, so a teardown that skips
+                    // the close frame is expected. A genuine peer fault
                     // arrives while the caller still expects frames.
-                    if !reader_done_clone.load(Ordering::SeqCst) {
+                    if !reader_done_clone.load(Ordering::SeqCst)
+                        && !draining_clone.load(Ordering::SeqCst)
+                    {
                         if let Ok(mut slot) = read_error_clone.lock() {
                             *slot = Some(e);
                         }
@@ -313,7 +326,9 @@ pub fn run_stream(
         }
     }
 
-    // Signal close to Deepgram
+    // Signal close to Deepgram. The caller is now committed to ending the
+    // stream, so from here a transport error is teardown, not a fault.
+    draining.store(true, Ordering::SeqCst);
     let _ = ws.send_text("{\"type\": \"CloseStream\"}");
 
     // Wait up to 1500ms for Deepgram to return the final transcription
