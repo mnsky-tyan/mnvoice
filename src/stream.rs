@@ -218,11 +218,17 @@ pub fn run_stream(
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
                 Err(e) => {
-                    // Keep it: a socket that dies mid-session would otherwise
-                    // be indistinguishable from silence, and the user is told
-                    // "no speech detected" for a provider fault.
-                    if let Ok(mut slot) = read_error_clone.lock() {
-                        *slot = Some(e);
+                    // Keep it only while the session is still running: the
+                    // caller terminates the socket itself on the way out
+                    // (`close()` shuts the connection down, which is what
+                    // releases this parked read), so an error seen after
+                    // `reader_done` was set is self-inflicted and would mark
+                    // every ordinary session as lost. A genuine peer fault
+                    // arrives while the caller still expects frames.
+                    if !reader_done_clone.load(Ordering::SeqCst) {
+                        if let Ok(mut slot) = read_error_clone.lock() {
+                            *slot = Some(e);
+                        }
                     }
                     break;
                 }
