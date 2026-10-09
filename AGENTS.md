@@ -38,3 +38,22 @@ and direct keyboard event injection.
    - WSL `/tmp` is not visible to `powershell.exe -File`; copy helpers under
      `C:\Users\tyanw\AppData\Local\Temp\` (reachable as `/mnt/c/Users/tyanw/AppData/Local/Temp/`)
      and delete them afterwards.
+   - A green no-mistakes lint/test step describes the head it ran against, which may
+     precede later fix commits. After a gate run finishes, re-run
+     `cargo clippy --locked --all-targets` and both test suites on the final head before
+     merging. This caught 2 clippy warnings in `src/platform/input.rs` that the lint step
+     reported as clean because the CI fixer rewrote the file afterwards.
+   - Fixtures in tests that serve MORE body than the client reads must not close the socket
+     with bytes still queued, or park indefinitely in an unbounded write. On Linux that
+     surfaces as `Connection reset by peer (os error 104)`, on macOS as `timed out reading
+     response` - it is a flaky-test signature, not a production bug. Write in bounded chunks
+     with a write timeout and drain until the client closes.
+   - `FindWindowW("mnvoiceTrayClass", $null)` returns zero even while the window exists.
+     Enumerate with `EnumWindows`, match `GetClassNameW` against `mnvoiceTrayClass` and
+     `GetWindowThreadProcessId` against the target PID, then `PostMessageW` the returned
+     hwnd. Verified again at the v0.1.24 update.
+   - `gh release download -D <dir>` can exit 0 with no file written when invoked from WSL
+     toward a Windows path. To verify a published asset, read its checksum file via
+     `gh api repos/:owner/:repo/releases/assets/<id> -H "Accept: application/octet-stream"`
+     and pipe the asset itself through the same endpoint into `sha256sum`; that compares
+     published bytes against published checksums without touching the filesystem.
