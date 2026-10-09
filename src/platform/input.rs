@@ -107,26 +107,24 @@ pub fn type_text(text: &str) {
 ///
 /// The loop's only outward effect besides the socket is the keystrokes it
 /// synthesizes, and a test that runs it must not type into whatever window
-/// happens to be focused on the machine. Tests that only care about the
-/// returned transcript record what would have been typed here instead of
-/// asking the platform to send it.
+/// happens to be focused on the machine. Under `cfg(test)` `global()` always
+/// returns this, so that never happens.
+///
+/// It deliberately keeps nothing. An earlier version appended every string to
+/// a `Mutex<Vec<String>>`, which no test ever read: an unbounded buffer with no
+/// reader, growing for the life of the test binary, reachable from any in-crate
+/// test with no way to inspect or clear it. A test that needs to know what was
+/// typed asserts on the transcript `run_stream` returns, which is the same
+/// text without the indirection. The injector stays because refusing to type is
+/// the point; the recording was not.
 #[cfg(test)]
 pub mod recording {
     use super::Injector;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-
-    static RECORDED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
     pub struct RecordingInjector;
 
     impl Injector for RecordingInjector {
-        fn type_text(&self, text: &str) -> Result<(), String> {
-            RECORDED
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap()
-                .push(text.to_string());
+        fn type_text(&self, _text: &str) -> Result<(), String> {
             Ok(())
         }
     }

@@ -373,26 +373,10 @@ mod tests {
         assert_eq!(url_encode("mnvoice"), "mnvoice");
     }
 
+    /// Delegates to the shared constructor so a new `Config` field is added in
+    /// one place, not four.
     fn test_cfg() -> Config {
-        Config {
-            protocol: crate::config::Protocol::Streaming,
-            api_key: "tok".into(),
-            model: "nova-3".into(),
-            language: "en".into(),
-            base_url: "https://api.deepgram.com".into(),
-            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
-            trailing_space: true,
-            keywords: vec!["Kubernetes".into()],
-            orb_color: crate::config::DEFAULT_ORB_COLOR,
-            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
-            hotkey: (0x4001, 0x20),
-            hotkey_str: "Alt+Space".into(),
-            cancel_key: (0x4000, 0x1B),
-            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
-            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
-            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
-            strip_fillers: true,
-        }
+        crate::config::test_config()
     }
 
     #[test]

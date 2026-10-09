@@ -60,7 +60,7 @@ LANGUAGE=en
 
 Get a free API key from [Deepgram](https://console.deepgram.com/) (streaming, ~$200 free credit, recommended) or [Groq](https://console.groq.com/) (REST, free tier). See the Configuration Reference below for every key.
 
-Everything else is optional - delete `mnvoice.env` entirely and mnvoice runs on its defaults, which strip filler words.
+Everything else is optional - you can delete every key except `API_KEY`, and mnvoice fills the rest in from its defaults, which strip filler words. (It does need `API_KEY`: with the file deleted entirely it still starts and shows its tray menu, so you can fix things from there, but pressing the hotkey does nothing until a key is set. On Linux and macOS it says so and exits instead.)
 
 ### 3. Run
 

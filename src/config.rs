@@ -452,6 +452,36 @@ pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
     cancel_key_with_display(s).0
 }
 
+/// A `Config` for tests, with every field at a known-good value.
+///
+/// One constructor for all of them: the four separate 19-field literals this
+/// replaced had to be edited in four places every time a field was added, and
+/// two of them had already drifted. Individual tests override only what they
+/// are actually about, which also makes it obvious when a test needs a field
+/// the others never touch.
+#[cfg(test)]
+pub fn test_config() -> Config {
+    Config {
+        protocol: Protocol::Streaming,
+        api_key: "tok".into(),
+        model: "nova-3".into(),
+        language: "en".into(),
+        base_url: "https://api.deepgram.com".into(),
+        max_seconds: DEFAULT_MAX_SECONDS,
+        trailing_space: true,
+        keywords: vec!["Kubernetes".into()],
+        orb_color: DEFAULT_ORB_COLOR,
+        orb_fluid_level: DEFAULT_ORB_FLUID_LEVEL,
+        hotkey: (0x4001, 0x20),
+        hotkey_str: "Alt+Space".into(),
+        cancel_key: (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
+        cancel_key_str: DEFAULT_CANCEL_STR.into(),
+        vad_silence_ms: DEFAULT_VAD_SILENCE_MS,
+        vad_rms_threshold: DEFAULT_VAD_RMS_THRESHOLD,
+        strip_fillers: true,
+    }
+}
+
 pub const DEFAULT_CANCEL_MOD: u32 = 0x4000; // MOD_NOREPEAT
 pub const DEFAULT_CANCEL_VK: u32 = 0x1B; // VK_ESCAPE
 pub const DEFAULT_CANCEL_STR: &str = "Escape";

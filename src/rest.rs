@@ -292,25 +292,7 @@ mod tests {
         // stopped short-circuiting, this call would attempt the network and
         // fail here instead of returning Ok, which is exactly the regression
         // this test exists to catch.
-        let cfg = Config {
-            protocol: crate::config::Protocol::Rest,
-            api_key: "unused".into(),
-            model: "nova-3".into(),
-            language: "en".into(),
-            base_url: "https://127.0.0.1:1".into(),
-            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
-            trailing_space: true,
-            keywords: Vec::new(),
-            orb_color: crate::config::DEFAULT_ORB_COLOR,
-            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
-            hotkey: (0x4001, 0x20),
-            hotkey_str: "Alt+Space".into(),
-            cancel_key: (0x4000, 0x1B),
-            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
-            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
-            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
-            strip_fillers: true,
-        };
+        let cfg = crate::config::test_config();
         let out = dictate_rest(&cfg, &[0i16; 640], &cancelled);
         assert_eq!(out, Ok(String::new()));
     }
@@ -650,25 +632,12 @@ mod tests {
             }
         });
 
-        let cfg = Config {
-            protocol: crate::config::Protocol::Rest,
-            api_key: "tok".into(),
-            model: "whisper-1".into(),
-            language: "en".into(),
-            base_url: format!("http://127.0.0.1:{port}"),
-            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
-            trailing_space: true,
-            keywords: Vec::new(),
-            orb_color: crate::config::DEFAULT_ORB_COLOR,
-            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
-            hotkey: (0x4001, 0x20),
-            hotkey_str: "Alt+Space".into(),
-            cancel_key: (0x4000, 0x1B),
-            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
-            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
-            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
-            strip_fillers: false,
-        };
+        let mut cfg = crate::config::test_config();
+        cfg.protocol = crate::config::Protocol::Rest;
+        cfg.model = "whisper-1".into();
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        cfg.keywords.clear();
+        cfg.strip_fillers = false;
 
         // Drive the same seam `transcribe` drives, so the body length the
         // transport actually buffered is observable: an uncapped read would
