@@ -42,6 +42,40 @@ pub fn audio_ms(samples: usize) -> u64 {
     samples as u64 * 1000 / SAMPLE_RATE as u64
 }
 
+/// Device samples per provider sample, from the device's own capture rate.
+///
+/// Both engines resample with this ratio, and it passes through unclamped,
+/// because the ratio carries the rate correction in both directions: a device
+/// slower than the provider rate has to come out *longer* than it went in for
+/// the audio to run at the rate the request declares. 8 kHz narrowband is 0.5
+/// and doubles the sample count, and flooring it to pass-through would hand
+/// the provider 16 kHz-labelled audio running at 8 kHz - a transcript an
+/// octave out, with nothing anywhere reporting a problem. A floor hurts from
+/// the other side too: 44.1 kHz gives 2.75625 and is very common and the
+/// macOS built-in input's nominal rate, so a floor at 1.0, at 2.75625, at
+/// 8 kHz's 0.5, or at the 3.0 a reviewer first proposed all silently decimate
+/// real capture.
+///
+/// The one rate that cannot be resampled is 0, because `resample_linear`
+/// divides by this to size its output buffer: `len / 0.0` saturates to
+/// `usize::MAX`, after which `+ 1` wraps to zero and the fill loop spins at
+/// position 0 pushing without bound until the allocation fails - and under
+/// `[profile.release] panic = "abort"` that is a process kill rather than a
+/// catchable error. A ratio below 1 is not that case, so the guard is the rate
+/// itself, not a floor on the ratio. A rate-less device passes its samples
+/// through one-for-one, the only honest answer when nothing says how fast it
+/// ran.
+///
+/// The formula itself used to be spelled at both call sites (`audio.rs` and
+/// `unix_audio.rs`); sharing it here means the guard cannot be applied to one
+/// engine and forgotten on the other.
+pub fn resample_step(device_rate: u32) -> f64 {
+    if device_rate == 0 {
+        return 1.0;
+    }
+    device_rate as f64 / SAMPLE_RATE as f64
+}
+
 /// The two silence windows that end a dictation.
 ///
 /// Shared by both engines so a VAD change cannot land on one platform only.
@@ -86,17 +120,21 @@ impl SilenceWindows {
             silence_expired(self.since_voice_ms, vad_silence_ms)
         } else {
             // Nothing said at all: the shared no-speech cutoff, so a forgotten
-            // open mic cannot hold the device for max_seconds.
+            // open mic cannot hold the device for max_seconds. The comparison
+            // goes through `silence_expired` like the branch above rather than
+            // being written out again, so both windows keep one rule.
             self.no_speech_ms += audio_ms(samples);
-            self.no_speech_ms >= NO_SPEECH_LIMIT_MS
+            silence_expired(self.no_speech_ms, NO_SPEECH_LIMIT_MS as u32)
         }
     }
 }
 
-/// Whether the silence detector ends a dictation that has heard speech.
+/// Whether a silence window of `since_voice_ms` has reached its limit.
 ///
-/// The threshold is the configured value itself, so `VAD_SILENCE_MS=0` stops
-/// on the first silent tick instead of switching the detector off.
+/// Both windows share this one comparison: the post-voice window against the
+/// configured `VAD_SILENCE_MS`, and the never-heard-speech window against
+/// [`NO_SPEECH_LIMIT_MS`]. The threshold is the limit itself, so a limit of 0
+/// stops on the first silent tick instead of switching the detector off.
 pub fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
     since_voice_ms >= vad_silence_ms as u64
 }
@@ -316,6 +354,70 @@ mod tests {
         }
     }
 
+    /// The amplitude comparison is strict (`rms > threshold`), so a chunk
+    /// exactly *at* the threshold is silence. Both branches of `advance`
+    /// return `false` for that single chunk, so the boundary only becomes
+    /// observable through which window it advances: treated as silence, it
+    /// feeds the no-speech window (`NO_SPEECH_LIMIT_MS`, 10 s); treated as
+    /// voice, it opens the post-voice window (`vad_silence_ms`, 3 s here).
+    /// Feeding the equality chunk and then only `vad_silence_ms` of quiet
+    /// therefore separates the two: the session must still be running, and
+    /// only the no-speech limit later ends it.
+    #[test]
+    fn a_chunk_exactly_at_the_threshold_counts_as_silence() {
+        let mut silence = SilenceWindows::new();
+        let mut chunks = 1u64;
+        assert!(
+            !silence.advance(640, 0.01, 0.01, 3_000),
+            "rms equal to the threshold is not voice"
+        );
+        // 75 chunks of 40 ms is exactly `vad_silence_ms`. Only a session that
+        // counted the equality chunk as voice ends here; a session that
+        // counted it as silence is still inside the no-speech window.
+        for tick in 0..75 {
+            chunks += 1;
+            assert!(
+                !silence.advance(640, 0.0, 0.01, 3_000),
+                "the equality chunk opened the post-voice window at tick {tick}"
+            );
+        }
+        // And the equality chunk really did count as silence, rather than
+        // being discarded: the no-speech limit arrives after it, not one
+        // chunk later.
+        loop {
+            chunks += 1;
+            if silence.advance(640, 0.0, 0.01, 3_000) {
+                break;
+            }
+            assert!(chunks < 1_000, "the no-speech limit never arrived");
+        }
+        assert_eq!(
+            chunks, 250,
+            "10 s of 40 ms chunks, counting the equality chunk"
+        );
+    }
+
+    /// The no-speech cutoff and the post-voice silence cutoff are the same rule
+    /// with different limits, so a session that never hears anything must end
+    /// on the shared boundary too, not on a separately written comparison.
+    #[test]
+    fn both_silence_windows_use_the_same_comparison() {
+        for (since, limit, expired) in [
+            (0u64, 3_000u32, false),
+            (2_999, 3_000, false),
+            (3_000, 3_000, true),
+            (3_001, 3_000, true),
+            (9_999, NO_SPEECH_LIMIT_MS as u32, false),
+            (10_000, NO_SPEECH_LIMIT_MS as u32, true),
+        ] {
+            assert_eq!(
+                silence_expired(since, limit),
+                expired,
+                "{since}ms against a {limit}ms limit"
+            );
+        }
+    }
+
     /// A voice chunk restarts the since-voice window, so a pause that never
     /// reached the threshold is not carried into the next one.
     #[test]
@@ -364,7 +466,7 @@ mod tests {
     #[test]
     fn a_44100hz_second_resamples_to_the_provider_rate() {
         let input: Vec<f32> = (0..44_100).map(|i| i as f32 / 44_100.0).collect();
-        let out = resample_linear(&input, 44_100.0 / SAMPLE_RATE as f64);
+        let out = resample_linear(&input, resample_step(44_100));
         assert!(
             (out.len() as i64 - SAMPLE_RATE as i64).abs() <= 2,
             "one second of 44.1 kHz audio produced {} samples",
@@ -377,10 +479,9 @@ mod tests {
     /// beyond quantisation is the resampler mangling the waveform.
     #[test]
     fn resampling_preserves_the_waveform() {
-        let rate = 44_100.0;
         let n = 44_100usize;
         let input: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let step = rate / SAMPLE_RATE as f64;
+        let step = resample_step(44_100);
         let out = resample_linear(&input, step);
         let worst = out
             .iter()
@@ -395,10 +496,56 @@ mod tests {
 
     /// A device slower than the provider rate is upsampled rather than
     /// clamped to pass-through, so the provider still receives its own rate.
+    /// This drives the ratio through `resample_step`, the way both engines do,
+    /// so a change there cannot leave the length the provider gets unpinned.
     #[test]
     fn an_8000hz_device_is_upsampled_to_the_provider_rate() {
         let input: Vec<f32> = (0..8_000).map(|i| i as f32 / 8_000.0).collect();
-        let out = resample_linear(&input, 8_000.0 / SAMPLE_RATE as f64);
+        let out = resample_linear(&input, resample_step(8_000));
         assert_eq!(out.len(), 16_000);
+    }
+
+    /// A device that reports no rate at all cannot be resampled: the zero step
+    /// saturates `resample_linear`'s output-length division to `usize::MAX`,
+    /// and under `panic = "abort"` the resulting unbounded push is a process
+    /// kill, not a catchable error. The guard has to make the *result*
+    /// bounded, so this drives the real function rather than only the ratio.
+    #[test]
+    fn a_device_reporting_no_rate_passes_its_samples_through() {
+        assert_eq!(resample_step(0), 1.0);
+        let input: Vec<f32> = (0..48_000)
+            .map(|i| (i as f64 / 48_000.0).sin() as f32)
+            .collect();
+        let out = resample_linear(&input, resample_step(0));
+        assert_eq!(out.len(), input.len());
+    }
+
+    /// Every real capture rate must keep its true ratio, in *both* directions.
+    /// This test exists so a future "clamp it to be safer" change cannot
+    /// quietly break real capture without failing here first.
+    ///
+    /// 8 kHz is the one below the provider rate that matters: its 0.5 ratio is
+    /// what turns an 8 kHz headset into audio the 16 kHz request can describe,
+    /// and flooring it to pass-through is that octave bug, not a safeguard.
+    /// 44.1 kHz is the one above it that matters, at 2.75625, so no floor
+    /// between the two - 0.5, 1.0, 2.75625 or 3.0 - may come back.
+    #[test]
+    fn no_capture_rate_is_clamped_away_from_its_true_ratio() {
+        for (rate, want) in [
+            (8_000u32, 0.5f64),
+            (16_000, 1.0),
+            (22_050, 1.378125),
+            (44_100, 2.75625),
+            (48_000, 3.0),
+            (88_200, 5.5125),
+            (96_000, 6.0),
+            (192_000, 12.0),
+        ] {
+            assert_eq!(
+                resample_step(rate),
+                want,
+                "rate {rate} was clamped away from its true ratio {want}"
+            );
+        }
     }
 }

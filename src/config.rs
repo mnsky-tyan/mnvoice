@@ -345,15 +345,15 @@ impl RawFields {
             model: String::new(),
             language: String::new(),
             base_url: String::new(),
-            max_seconds: 120,
+            max_seconds: DEFAULT_MAX_SECONDS,
             trailing_space: true,
             keywords: Vec::new(),
             orb_color_str: String::new(),
             orb_fluid_str: String::new(),
             hotkey_str: String::new(),
             cancel_key_str: String::new(),
-            vad_silence_ms: 3000,
-            vad_rms_threshold: 400.0,
+            vad_silence_ms: DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: DEFAULT_VAD_RMS_THRESHOLD,
             filler_words_str: String::new(),
         }
     }
@@ -436,6 +436,18 @@ pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
 pub const DEFAULT_CANCEL_MOD: u32 = 0x4000; // MOD_NOREPEAT
 pub const DEFAULT_CANCEL_VK: u32 = 0x1B; // VK_ESCAPE
 pub const DEFAULT_CANCEL_STR: &str = "Escape";
+
+/// How long one dictation may run before it stops itself.
+pub const DEFAULT_MAX_SECONDS: u32 = 120;
+
+/// How long the detector waits for speech after the last word before ending a
+/// dictation.
+pub const DEFAULT_VAD_SILENCE_MS: u32 = 3000;
+
+/// The RMS level at or below which a chunk counts as silence. Deliberately a
+/// raw amplitude, not a percentage: the value is compared against the RMS both
+/// engines compute over i16 samples (see `rms_of`), so the scale runs 0-32767.
+pub const DEFAULT_VAD_RMS_THRESHOLD: f64 = 400.0;
 
 /// The cancel key to register plus the spelling to show for it, decided in
 /// one place: the display must never advertise a key other than the pair

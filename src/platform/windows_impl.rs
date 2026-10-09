@@ -14,7 +14,9 @@
 // at the 302 would download an HTML page and stage it as an executable. The
 // trait documents the contract; the test in `update.rs` pins it.
 
-use crate::platform::http::{Response, Transport, WebSocket};
+use crate::platform::http::{
+    Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, USER_AGENT,
+};
 use crate::rest::parse_base_url;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Networking::WinHttp::*;
@@ -191,11 +193,21 @@ impl WinHttpTransport {
         status as u16
     }
 
-    /// Drain the body of an open response.
-    unsafe fn read_body(request: *mut std::ffi::c_void) -> Vec<u8> {
+    /// Drain the body of an open response, up to `max_bytes`.
+    ///
+    /// Capped like the unix backend so the two keep one contract: a misbehaving
+    /// server cannot stream an unbounded body into a process that is meant to
+    /// stay responsive. The bound is passed in rather than fixed here because
+    /// this one function serves both a JSON transcript and a release
+    /// executable.
+    unsafe fn read_body(request: *mut std::ffi::c_void, max_bytes: u64) -> Vec<u8> {
         let mut body = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
+        let cap = max_bytes as usize;
         loop {
+            if body.len() >= cap {
+                break;
+            }
             let mut read = 0u32;
             let ok = WinHttpReadData(
                 request,
@@ -206,23 +218,22 @@ impl WinHttpTransport {
             if ok.is_err() || read == 0 {
                 break;
             }
-            body.extend_from_slice(&chunk[..read as usize]);
+            let room = cap - body.len();
+            body.extend_from_slice(&chunk[..(read as usize).min(room)]);
         }
         body
     }
 }
 
 impl Transport for WinHttpTransport {
-    fn get(&self, url: &str, accept: &str) -> Result<Response, String> {
+    fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
             let (handles, _) = Self::open("GET", url, (0, 15_000, 45_000))?;
             let request = handles.request();
 
-            let headers = wide(&format!(
-                "Accept: {accept}\r\nUser-Agent: mnvoice-update\r\n"
-            ));
+            let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: {USER_AGENT}\r\n"));
             let result = (|| {
                 // Headers go on before the send; anything added afterwards
                 // never reaches the wire. Trailing CRLF trimmed because
@@ -235,7 +246,7 @@ impl Transport for WinHttpTransport {
                 WinHttpSendRequest(request, None, None, 0, 0, 0)?;
                 WinHttpReceiveResponse(request, std::ptr::null_mut())?;
                 let status = Self::status_of(request);
-                let body = Self::read_body(request);
+                let body = Self::read_body(request, max_bytes);
                 Ok::<Response, windows::core::Error>(Response { status, body })
             })();
 
@@ -282,7 +293,7 @@ impl Transport for WinHttpTransport {
                 )?;
                 WinHttpReceiveResponse(request, std::ptr::null_mut())?;
                 let status = Self::status_of(request);
-                let resp_body = Self::read_body(request);
+                let resp_body = Self::read_body(request, MAX_TRANSCRIPT_BYTES);
                 Ok::<Response, windows::core::Error>(Response {
                     status,
                     body: resp_body,
@@ -322,7 +333,7 @@ impl Transport for WinHttpTransport {
                 let _ = WinHttpAddRequestHeaders(
                     request,
                     &headers_w[..headers_w.len() - 1],
-                    0x2000_0000,
+                    WINHTTP_ADDREQ_FLAG_ADD,
                 );
             }
 
@@ -427,8 +438,13 @@ impl WebSocket for WinHttpSocket {
     /// WinHTTP has no "read with timeout" call and the socket is opened with
     /// no receive timeout, so the receive blocks until a frame arrives, the
     /// peer closes, or the transport fails - the contract the trait
-    /// documents. Any nonzero result ends the read: from the streaming loop's
-    /// point of view a session that stopped delivering frames is over.
+    /// documents. The two ends are kept apart, because the streaming loop
+    /// reports a lost connection only when the read says so: a nonzero result
+    /// is a transport failure and becomes an `Err`, while a close frame
+    /// arrives as a zero-length read with a success result and becomes
+    /// `Ok(None)`. Collapsing the two would make a provider disconnect
+    /// indistinguishable from an orderly end, which is exactly the confusion
+    /// the trait's `Result` exists to prevent.
     fn read(&self) -> Result<Option<Vec<u8>>, String> {
         // Once a WinHTTP request is upgraded to a socket, its receive timeout
         // is fixed at what the session was configured with, and the pre-seam
@@ -445,11 +461,12 @@ impl WebSocket for WinHttpSocket {
                 &mut read,
                 &mut buf_type,
             );
-            // WinHTTP reports through a raw error code; zero means a frame
-            // arrived. A zero-length read is the close frame, which is the end
-            // of the stream, not an empty poll. Both are reported the same way
-            // the streaming loop always treated them: stop.
-            if result != 0 || read == 0 {
+            if result != 0 {
+                return Err(format!("websocket read failed (error {result})"));
+            }
+            // A zero-length read is the close frame, which is the end of the
+            // stream, not an empty poll.
+            if read == 0 {
                 return Ok(None);
             }
             buffer.truncate(read as usize);
@@ -464,10 +481,14 @@ impl WebSocket for WinHttpSocket {
 /// honouring it. paste.rs owns the mechanics - one unicode event per
 /// character with a 2 ms gap so no target window's message queue drops
 /// characters - and stays the single source of that behaviour.
+// Only named by `platform_injector`, which is compiled out under tests in
+// favour of the recorder, so a test build has no other reference to them.
+#[cfg_attr(test, allow(dead_code))]
 pub struct SendInputInjector;
 
 /// The process-wide instance, registered as the global injector at startup by
 /// the Windows app shell.
+#[cfg_attr(test, allow(dead_code))]
 pub static SEND_INPUT_INJECTOR: SendInputInjector = SendInputInjector;
 
 impl crate::platform::input::Injector for SendInputInjector {

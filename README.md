@@ -445,7 +445,9 @@ rather than a tray icon:
 - Press **Enter** to start a dictation. Press **Enter** again to stop early;
   3 s of silence (`VAD_SILENCE_MS`) or the max duration also stops it. Words
   type into the focused window as they are recognized and echo to stdout.
-  Ctrl+C quits.
+  Ctrl+C quits. If the provider connection drops mid-dictation, whatever was
+  already typed is kept and the transcript line ends with
+  `[connection lost: ...]` rather than reading as a complete dictation.
 
 Known limits in this release, stated rather than papered over:
 

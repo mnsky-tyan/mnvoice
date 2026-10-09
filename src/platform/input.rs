@@ -34,8 +34,27 @@ use std::time::Duration;
 /// character is followed by this small sleep before the next.
 pub const KEY_GAP: Duration = Duration::from_millis(2);
 
+// The real platform injector is only reached outside tests (see `global`),
+// so a test build has no other reference to these two names.
+#[cfg_attr(test, allow(dead_code))]
 static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
 static FAILING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(test))]
+fn platform_injector() -> &'static dyn Injector {
+    #[cfg(windows)]
+    {
+        &crate::platform::windows_impl::SEND_INPUT_INJECTOR
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::linux_impl::default_injector()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos_impl::default_injector()
+    }
+}
 
 /// The platform's injector, installing the default on first use.
 ///
@@ -43,20 +62,20 @@ static FAILING: AtomicBool = AtomicBool::new(false);
 /// backend, which is what lets the same streaming loop type on Windows, X11
 /// and macOS without a single cfg in its body.
 fn global() -> &'static dyn Injector {
-    *INJECTOR.get_or_init(|| {
-        #[cfg(windows)]
-        {
-            &crate::platform::windows_impl::SEND_INPUT_INJECTOR
-        }
-        #[cfg(target_os = "linux")]
-        {
-            crate::platform::linux_impl::default_injector()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::platform::macos_impl::default_injector()
-        }
-    })
+    // Under `cfg(test)` the recorder always wins, so a test that drives the
+    // real streaming loop never reaches the platform's global keyboard
+    // injection, whatever order the test binary happens to start its threads
+    // in. A test that does want the real thing has no reason to be here:
+    // typing into whatever window happens to be focused is exactly what a
+    // test must not do to the machine it runs on.
+    #[cfg(test)]
+    {
+        &recording::RECORDING_INJECTOR
+    }
+    #[cfg(not(test))]
+    {
+        *INJECTOR.get_or_init(platform_injector)
+    }
 }
 
 /// Convenience matching the pre-seam call sites: type, and report a failure
@@ -82,4 +101,35 @@ pub fn type_text(text: &str) {
             }
         }
     }
+}
+
+/// A stand-in injector for tests that drive the real streaming loop.
+///
+/// The loop's only outward effect besides the socket is the keystrokes it
+/// synthesizes, and a test that runs it must not type into whatever window
+/// happens to be focused on the machine. Tests that only care about the
+/// returned transcript record what would have been typed here instead of
+/// asking the platform to send it.
+#[cfg(test)]
+pub mod recording {
+    use super::Injector;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static RECORDED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    pub struct RecordingInjector;
+
+    impl Injector for RecordingInjector {
+        fn type_text(&self, text: &str) -> Result<(), String> {
+            RECORDED
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(text.to_string());
+            Ok(())
+        }
+    }
+
+    pub static RECORDING_INJECTOR: RecordingInjector = RecordingInjector;
 }

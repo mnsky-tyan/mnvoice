@@ -183,6 +183,11 @@ pub fn run_stream(
 
     let full_transcript = Arc::new(Mutex::new(String::new()));
     let reader_done = Arc::new(AtomicBool::new(false));
+    // A transport failure mid-dictation is not a clean close, and the seam
+    // types `read` as a Result precisely so the two can be told apart. The
+    // message is kept here so the caller can report the real cause instead of
+    // telling the user they said nothing.
+    let read_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Capture this before the thread moves in, so the borrow cannot escape.
     let strip_fillers = cfg.strip_fillers;
@@ -192,6 +197,7 @@ pub fn run_stream(
     let stop_clone = stop.clone();
     let cancelled_clone = cancelled.clone();
     let reader_done_clone = reader_done.clone();
+    let read_error_clone = read_error.clone();
 
     let reader_thread = thread::spawn(move || {
         let mut typed_word_count = 0usize;
@@ -211,7 +217,27 @@ pub fn run_stream(
             let frame = match ws_reader.read() {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
-                Err(_) => break,
+                Err(e) => {
+                    // Keep it only while the session is still running: the
+                    // caller terminates the socket itself on the way out
+                    // (`close()` shuts the connection down, which is what
+                    // releases this parked read), so an error seen after
+                    // `reader_done` was set is self-inflicted and would mark
+                    // every ordinary session as lost. Likewise once `stop` is
+                    // set the session is ending on purpose, so a provider that
+                    // tears down without a close frame is the expected end of
+                    // a finished dictation. A fault that arrives while the
+                    // caller still expects frames - including one that breaks
+                    // the send loop first - is the case the marker is for.
+                    if !reader_done_clone.load(Ordering::SeqCst)
+                        && !stop_clone.load(Ordering::SeqCst)
+                    {
+                        if let Ok(mut slot) = read_error_clone.lock() {
+                            *slot = Some(e);
+                        }
+                    }
+                    break;
+                }
             };
             if frame.is_empty() {
                 break;
@@ -308,12 +334,32 @@ pub fn run_stream(
     let _ = reader_thread.join();
 
     let full_text = full_transcript.lock().unwrap().trim().to_string();
+    let read_error = read_error.lock().unwrap().clone();
 
-    // Add trailing space if configured, but never on a cancelled session
+    // The configured trailing space is a side effect of a session that
+    // produced words, and it must not depend on which way the session ended:
+    // a lost connection after words were typed would otherwise be the one
+    // path that commits text without it.
     if crate::rest::trailing_space_due(cfg.trailing_space, &full_text)
         && !cancelled.load(Ordering::SeqCst)
     {
         input::type_text(" ");
+    }
+
+    // A read that failed with nothing typed is a real failure and is reported
+    // as one. Once words have been typed the user already has their dictation,
+    // so it is kept - but the failure is still stated, in the text the caller
+    // shows, because a silent partial result reads as a complete one. The user
+    // pressed once and got half a sentence with no sign anything went wrong.
+    //
+    // No log line here: `windows_app` is Windows-only and this module compiles
+    // on all three targets, and the marker travels with the returned text,
+    // which every caller already reports.
+    if let Some(e) = read_error {
+        if full_text.is_empty() {
+            return Err(format!("streaming transcription failed: {e}"));
+        }
+        return Ok(format!("{full_text} [connection lost: {e}]"));
     }
 
     Ok(full_text)
@@ -337,7 +383,7 @@ mod tests {
             model: "nova-3".into(),
             language: "en".into(),
             base_url: "https://api.deepgram.com".into(),
-            max_seconds: 120,
+            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
             trailing_space: true,
             keywords: vec!["Kubernetes".into()],
             orb_color: crate::config::DEFAULT_ORB_COLOR,
@@ -345,9 +391,9 @@ mod tests {
             hotkey: (0x4001, 0x20),
             hotkey_str: "Alt+Space".into(),
             cancel_key: (0x4000, 0x1B),
-            cancel_key_str: "Escape".into(),
-            vad_silence_ms: 3000,
-            vad_rms_threshold: 400.0,
+            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
+            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: true,
             auto_update: false,
         }
@@ -432,5 +478,291 @@ mod tests {
         assert_eq!(auth_value(&cfg), "Bearer sk-x");
         cfg.api_key = "raw-key".into();
         assert_eq!(auth_value(&cfg), "Token raw-key");
+    }
+
+    /// The whole point of the connection-lost work: `run_stream` is driven
+    /// against a real WebSocket peer on loopback that speaks Deepgram's
+    /// framing, so the string the user is shown comes from the production
+    /// function and a real socket - not from a stub. `type_text` is a recorder
+    /// under `cfg(test)` (see `platform::input`), so this runs the real
+    /// streaming loop without touching the machine's keyboard.
+    mod live_provider {
+        use super::*;
+        use crate::platform::audio::SAMPLE_RATE;
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicBool;
+
+        /// A server-to-client WebSocket frame: server frames are never masked.
+        pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![0x80 | opcode];
+            if payload.len() < 126 {
+                out.push(payload.len() as u8);
+            } else if payload.len() < 65_536 {
+                out.push(126);
+                out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            } else {
+                out.push(127);
+                out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            }
+            out.extend_from_slice(payload);
+            out
+        }
+
+        /// Finish the HTTP upgrade by hand, then run `after_handshake` with a
+        /// connected peer. Returns the port the client should dial.
+        pub fn serve(
+            after_handshake: impl FnOnce(&mut TcpStream) + Send + 'static,
+        ) -> (u16, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                // Read the request head up to the blank line.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) => return,
+                        Ok(_) => head.push(byte[0]),
+                        Err(_) => return,
+                    }
+                    if head.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let key = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let accept = tungstenite_accept(&key);
+                let reply = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+                after_handshake(&mut stream);
+            });
+            (port, handle)
+        }
+
+        /// `Sec-WebSocket-Accept`: base64(sha1(key + GUID)). The crate ships a
+        /// SHA-1 only inside the update module's checksum helper, so the
+        /// handshake digest is spelled here from the RFC 6455 magic value.
+        fn tungstenite_accept(key: &str) -> String {
+            const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+            sha1_base64(format!("{key}{GUID}").as_bytes())
+        }
+
+        /// Minimal SHA-1 + base64, enough for a 20-byte handshake digest.
+        fn sha1_base64(data: &[u8]) -> String {
+            let digest = sha1(data);
+            base64(&digest)
+        }
+
+        fn sha1(data: &[u8]) -> [u8; 20] {
+            let mut h: [u32; 5] = [
+                0x6745_2301,
+                0xEFCD_AB89,
+                0x98BA_DCFE,
+                0x1032_5476,
+                0xC3D2_E1F0,
+            ];
+            let mut msg = data.to_vec();
+            let bit_len = (data.len() as u64) * 8;
+            msg.push(0x80);
+            while msg.len() % 64 != 56 {
+                msg.push(0);
+            }
+            msg.extend_from_slice(&bit_len.to_be_bytes());
+            for block in msg.chunks(64) {
+                let mut w = [0u32; 80];
+                for (i, word) in block.chunks(4).enumerate() {
+                    w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+                }
+                for i in 16..80 {
+                    w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+                }
+                let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+                for (i, &wi) in w.iter().enumerate() {
+                    let (f, k) = match i {
+                        0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                        20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                        40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                        _ => (b ^ c ^ d, 0xCA62_C1D6),
+                    };
+                    let temp = a
+                        .rotate_left(5)
+                        .wrapping_add(f)
+                        .wrapping_add(e)
+                        .wrapping_add(k)
+                        .wrapping_add(wi);
+                    e = d;
+                    d = c;
+                    c = b.rotate_left(30);
+                    b = a;
+                    a = temp;
+                }
+                h[0] = h[0].wrapping_add(a);
+                h[1] = h[1].wrapping_add(b);
+                h[2] = h[2].wrapping_add(c);
+                h[3] = h[3].wrapping_add(d);
+                h[4] = h[4].wrapping_add(e);
+            }
+            let mut out = [0u8; 20];
+            for (i, word) in h.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            out
+        }
+
+        fn base64(data: &[u8]) -> String {
+            const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in data.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+                out.push(TABLE[((n >> 18) & 63) as usize] as char);
+                out.push(TABLE[((n >> 12) & 63) as usize] as char);
+                out.push(if chunk.len() > 1 {
+                    TABLE[((n >> 6) & 63) as usize] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    TABLE[(n & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+
+        /// One Deepgram interim/final result frame, the shape `parse_stream_json`
+        /// reads: `channel.alternatives[0].transcript` plus the two booleans.
+        pub fn result_frame(transcript: &str, is_final: bool, speech_final: bool) -> Vec<u8> {
+            // The `Results` envelope is what `parse_stream_json` keys off before
+            // it parses anything, so a metadata frame is rejected cheaply; this
+            // is the same shape Deepgram sends.
+            let json = format!(
+                "{{\"type\":\"Results\",\"channel\":{{\"alternatives\":[{{\"transcript\":\"{transcript}\"}}]}},\"is_final\":{is_final},\"speech_final\":{speech_final}}}"
+            );
+            frame(0x1, json.as_bytes())
+        }
+
+        /// Build the config that points the real streaming loop at `port`.
+        pub fn cfg_for(port: u16) -> Config {
+            let mut cfg = test_cfg();
+            cfg.protocol = crate::config::Protocol::Streaming;
+            cfg.base_url = format!("ws://127.0.0.1:{port}");
+            cfg.keywords.clear();
+            cfg
+        }
+
+        /// Feed `packets` of silence into the channel and return the real
+        /// `run_stream` result. `stop` is set by the reader itself when it sees
+        /// `speech_final`, so the audio channel only has to stay open briefly.
+        pub fn drive(cfg: &Config, packets: usize) -> Result<String, String> {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+            let n = SAMPLE_RATE as usize / 10; // 100 ms of silence per packet
+            std::thread::spawn(move || {
+                for _ in 0..packets {
+                    if tx.send(vec![0i16; n]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let stop = Arc::new(AtomicBool::new(false));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            run_stream(cfg, &stop, &cancelled, rx)
+        }
+    }
+
+    /// The intent's headline behaviour: a stream that dies after words were
+    /// typed must return those words with the lost-connection marker, not a
+    /// bare success that reads as a complete dictation.
+    #[test]
+    fn a_fault_after_words_were_typed_is_returned_with_the_connection_lost_marker() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // Say a sentence, finalise it so the words are committed, then drop
+            // the TCP connection with no WebSocket close frame: the shape of a
+            // provider that dies mid-dictation.
+            let _ = stream.write_all(&live_provider::result_frame("hello world", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(300));
+            // Returning from the closure lets the server thread end, which
+            // closes the socket the client is parked on.
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 40);
+        let _ = server.join();
+
+        let text = out.expect("words were typed, so the result must be Ok");
+        assert!(
+            text.starts_with("hello world"),
+            "the typed words must survive: {text}"
+        );
+        assert!(
+            text.contains("[connection lost:"),
+            "a fault after words must be marked, not silent: {text}"
+        );
+    }
+
+    /// The adversarial counterpart: an orderly close frame must NOT be
+    /// reported as a lost connection. Round 5's `draining` flag suppressed
+    /// this, round 6 narrowed it to `stop`, and round 7 (the change under
+    /// validation) scopes it to the graceful stop; this asserts the ordinary
+    /// end stays quiet.
+    #[test]
+    fn an_orderly_close_frame_after_words_is_not_reported_as_a_lost_connection() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            let _ = stream.write_all(&live_provider::result_frame("all good", true, true));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(&live_provider::frame(0x8, &[]));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(300));
+            // Returning from the closure lets the server thread end, which
+            // closes the socket the client is parked on.
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 40);
+        let _ = server.join();
+
+        let text = out.expect("an orderly session is Ok");
+        assert_eq!(text, "all good", "a clean close must not be marked: {text}");
+    }
+
+    /// The other half of the intent: when nothing was typed, the fault must be
+    /// an error the caller reports, not the old "no speech detected".
+    #[test]
+    fn a_fault_before_any_words_is_an_error_not_a_silent_empty_result() {
+        let (port, server) = live_provider::serve(|_stream| {
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 40);
+        let _ = server.join();
+
+        let err = out.expect_err("nothing typed and the peer died is a failure");
+        assert!(
+            err.contains("streaming transcription failed"),
+            "the error must say the stream failed: {err}"
+        );
     }
 }

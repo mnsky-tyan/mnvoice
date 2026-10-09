@@ -199,10 +199,27 @@ pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> 
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("bad BASE_URL: {url}"))?;
-    let secure = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss");
+    // An allow-list, not a deny-list: anything that is not one of these four
+    // is refused rather than treated as cleartext. Treating "not https" as
+    // "plain http" silently downgrades a mistyped scheme - ftp:// or gopher://
+    // would parse fine and then post the transcript unencrypted to a host the
+    // user wrote believing it was secure.
+    let secure = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => true,
+        "http" | "ws" => false,
+        _ => return Err(format!("unsupported scheme {scheme}:// in BASE_URL (use http, https, ws or wss): {url}")),
+    };
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, format!("/{}", p.trim_start_matches('/'))),
         None => (rest, String::new()),
+    };
+    // Userinfo is stripped before the host/port split: `rsplit_once(':')` on
+    // "user:pass@host:8080" would otherwise hand back "user:pass@host" as the
+    // host, which no resolver can answer. The authority parser in the http
+    // crate drops userinfo the same way, so both ends now normalise alike.
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
     };
     let (host, port) = if authority.starts_with('[') {
         let end = authority
@@ -281,7 +298,7 @@ mod tests {
             model: "nova-3".into(),
             language: "en".into(),
             base_url: "https://127.0.0.1:1".into(),
-            max_seconds: 120,
+            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
             trailing_space: true,
             keywords: Vec::new(),
             orb_color: crate::config::DEFAULT_ORB_COLOR,
@@ -289,9 +306,9 @@ mod tests {
             hotkey: (0x4001, 0x20),
             hotkey_str: "Alt+Space".into(),
             cancel_key: (0x4000, 0x1B),
-            cancel_key_str: "Escape".into(),
-            vad_silence_ms: 3000,
-            vad_rms_threshold: 400.0,
+            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
+            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
             strip_fillers: true,
             auto_update: false,
         };
@@ -344,6 +361,61 @@ mod tests {
         assert_eq!(port, 80);
         assert!(!secure);
         assert_eq!(path, "/");
+    }
+
+    /// A scheme that is neither http(s) nor ws(s) used to parse as cleartext,
+    /// so a mistyped or hostile `BASE_URL` silently downgraded the transcript
+    /// to an unencrypted request instead of being refused.
+    #[test]
+    fn an_unsupported_scheme_is_refused_rather_than_downgraded_to_cleartext() {
+        for url in [
+            "ftp://api.deepgram.com",
+            "gopher://example.com/x",
+            "file:///etc/passwd",
+        ] {
+            let err = parse_base_url(url).unwrap_err();
+            assert!(
+                err.contains("unsupported scheme"),
+                "{url} was accepted or mis-reported: {err}"
+            );
+        }
+    }
+
+    /// The four schemes the app actually speaks must all still parse, and the
+    /// secure pair must still mark themselves secure.
+    #[test]
+    fn the_four_supported_schemes_all_parse() {
+        for (url, want_secure) in [
+            ("http://h:1/p", false),
+            ("https://h:1/p", true),
+            ("ws://h:1/p", false),
+            ("wss://h:1/p", true),
+        ] {
+            let (_, _, secure, path) = parse_base_url(url).unwrap();
+            assert_eq!(secure, want_secure, "{url}");
+            assert_eq!(path, "/p", "{url}");
+        }
+    }
+
+    /// `rsplit_once(':')` used to hand "user:pass@host" back as the host, so
+    /// credentials in the URL left the connector with an unresolvable name.
+    /// The userinfo is dropped before the host/port split, which also matches
+    /// what the http crate's authority parser does.
+    #[test]
+    fn credentials_in_the_url_are_stripped_before_the_host_is_split() {
+        let (host, port, _, _) = parse_base_url("https://user:pass@api.example.com:8443/p").unwrap();
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 8443);
+
+        let (host, port, _, _) = parse_base_url("http://token@api.example.com/p").unwrap();
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 80);
+
+        // Credentials in front of an IPv6 literal must not defeat the
+        // bracket handling either.
+        let (host, port, _, _) = parse_base_url("http://user@[::1]:8080/p").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
     }
 
     #[test]
@@ -470,5 +542,149 @@ mod tests {
         for w in ["uh-huh", "mm-hmm", "mhm", "uh-hum"] {
             assert!(!is_disfluency(w), "{w} is an affirmative, not a filler");
         }
+    }
+
+    /// The two response ceilings must be different ceilings, not one shared
+    /// number: a transcript is a few kilobytes and a release executable is
+    /// several megabytes, and the intent requires the asset path to keep
+    /// headroom the transcript path does not. This drives the real Windows
+    /// transport (`transcribe` -> `WinHttpTransport::post` -> the capped
+    /// `read_body`) against a loopback server that answers with more bytes than
+    /// `MAX_TRANSCRIPT_BYTES`, and asserts the body really was clipped there.
+    ///
+    /// It is deliberately not a test of truncation *silently* happening - that
+    /// behaviour was reviewed and declined - but of the two bounds being
+    /// distinct, which is what the split was for.
+    #[test]
+    fn a_transcript_response_is_bounded_by_the_transcript_ceiling() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        // One byte past the transcript ceiling, and nowhere near the asset one.
+        let body_len = crate::platform::http::MAX_TRANSCRIPT_BYTES as usize + 1;
+        assert!(
+            body_len < crate::platform::http::MAX_ASSET_BYTES as usize,
+            "the fixture only makes sense while the ceilings differ"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+            // A blocked write must not wedge the server thread: the client
+            // stops reading at its ceiling, so once the socket buffers fill the
+            // server can only make progress by giving up on the rest of the
+            // body. Without this bound the server can park in `write` forever
+            // while the client waits for bytes that will never come.
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(20)));
+            // Consume the whole request, head and body, before answering. If the
+            // server answers while WinHTTP is still sending its multipart body,
+            // the client's own write can fail and the read sees a reset instead
+            // of the response - which would make this test measure the wrong
+            // thing entirely.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let want: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut got = 0usize;
+            let mut sink = [0u8; 16 * 1024];
+            while got < want {
+                match stream.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got += n,
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            // A JSON body whose first characters are a valid transcript, then
+            // padding: an uncapped read would return all of it.
+            let prefix = b"{\"text\":\"ok\"}";
+            if stream.write_all(prefix).is_err() {
+                return;
+            }
+            // The padding is written in bounded chunks rather than one large
+            // `write_all`, so a full socket buffer surfaces as one failed
+            // chunk - which ends the loop - instead of an unbounded write. The
+            // write is expected to fail once the client has read its ceiling
+            // and stopped: "connection reset by peer" or a timed-out write here
+            // is the fixture working, not a fault. It is ignored on purpose.
+            let chunk = [b' '; 16 * 1024];
+            let mut left = body_len - prefix.len();
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if stream.write_all(&chunk[..n]).is_err() {
+                    break;
+                }
+                left -= n;
+            }
+            let _ = stream.flush();
+            // Crucially, do NOT drop the connection here. The response body is
+            // one byte longer than the client will read, so closing first
+            // leaves an unread byte queued and the kernel answers the client's
+            // next read with RST - which ureq reports as a read error instead
+            // of the capped body this test is measuring. Holding the socket
+            // open until the client closes keeps the byte in flight so the
+            // read ends cleanly at the ceiling on every platform.
+            let mut drain = [0u8; 16 * 1024];
+            while let Ok(n) = stream.read(&mut drain) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let cfg = Config {
+            protocol: crate::config::Protocol::Rest,
+            api_key: "tok".into(),
+            model: "whisper-1".into(),
+            language: "en".into(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
+            trailing_space: true,
+            keywords: Vec::new(),
+            orb_color: crate::config::DEFAULT_ORB_COLOR,
+            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
+            hotkey: (0x4001, 0x20),
+            hotkey_str: "Alt+Space".into(),
+            cancel_key: (0x4000, 0x1B),
+            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
+            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
+            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
+            strip_fillers: false,
+            auto_update: false,
+        };
+
+        // Drive the same seam `transcribe` drives, so the body length the
+        // transport actually buffered is observable: an uncapped read would
+        // return `body_len`, a capped one exactly the ceiling.
+        let url = endpoint_url(&cfg.base_url).unwrap();
+        let response = crate::platform::http::NativeTransport
+            .post(&url, Some("Bearer tok"), "multipart/form-data; boundary=x", b"x")
+            .expect("the request itself succeeds");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body.len() as u64,
+            crate::platform::http::MAX_TRANSCRIPT_BYTES,
+            "the transcript path must stop at its own ceiling"
+        );
+        let _ = server.join();
     }
 }

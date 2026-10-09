@@ -21,7 +21,9 @@
 // Like the Windows transport, every call is stateless: open, complete, close.
 // A failed request cannot poison the next one.
 
-use crate::platform::http::{Response, Transport, WebSocket};
+use crate::platform::http::{
+    Response, Transport, WebSocket, MAX_ASSET_BYTES, MAX_TRANSCRIPT_BYTES, USER_AGENT,
+};
 use std::io::Read as _;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -92,11 +94,14 @@ fn agent_builder() -> Result<ureq::AgentBuilder, String> {
 // message and the transcribe path keys off the status itself. So status
 // errors are unpacked into a normal Response here, and only genuine transport
 // failures (DNS, TLS, connection refused) surface as Err.
-fn finish(resp: ureq::Response) -> Result<Response, String> {
+fn finish(resp: ureq::Response, max_bytes: u64) -> Result<Response, String> {
     // status() borrows, into_reader() consumes - so status comes first.
     let status = resp.status();
     let mut body = Vec::new();
+    // Capped: ureq's own docs warn that an uncapped read_to_end "might return
+    // enough bytes to exhaust available memory" when the server misbehaves.
     resp.into_reader()
+        .take(max_bytes)
         .read_to_end(&mut body)
         .map_err(|e| format!("reading response body failed ({e})"))?;
     Ok(Response { status, body })
@@ -142,11 +147,20 @@ fn download_agent() -> Result<&'static ureq::Agent, String> {
 }
 
 /// A GET with an `Accept` header. Redirects are followed - the contract.
-pub fn get(url: &str, accept: &str) -> Result<Response, String> {
+///
+/// `max_bytes` bounds the buffered body: the caller knows whether it asked for
+/// a JSON transcript or a release executable, and the two want different
+/// ceilings. See [`MAX_TRANSCRIPT_BYTES`] and [`MAX_ASSET_BYTES`].
+pub fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
     ensure_tls_ready();
-    match download_agent()?.get(url).set("Accept", accept).call() {
-        Ok(resp) => finish(resp),
-        Err(ureq::Error::Status(_, resp)) => finish(resp),
+    match download_agent()?
+        .get(url)
+        .set("Accept", accept)
+        .set("User-Agent", USER_AGENT)
+        .call()
+    {
+        Ok(resp) => finish(resp, max_bytes),
+        Err(ureq::Error::Status(_, resp)) => finish(resp, max_bytes),
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -165,8 +179,8 @@ pub fn post(
         req = req.set("Authorization", auth);
     }
     match req.send(body) {
-        Ok(resp) => finish(resp),
-        Err(ureq::Error::Status(_, resp)) => finish(resp),
+        Ok(resp) => finish(resp, MAX_TRANSCRIPT_BYTES),
+        Err(ureq::Error::Status(_, resp)) => finish(resp, MAX_TRANSCRIPT_BYTES),
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -268,6 +282,15 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
 /// that resolves but never completes a handshake would otherwise hold the
 /// caller for as long as the operating system cares to wait.
 fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+    // Brackets around an IPv6 literal are stripped here so the string handed
+    // to the resolver is a bare address. Rust's `ToSocketAddrs` happens to
+    // tolerate the bracketed form itself (it splits host:port before calling
+    // getaddrinfo), so this is belt-and-braces rather than a fix for an
+    // observed failure - but other tools that read BASE_URL, and any future
+    // resolver swap, do reject it, and a bare address is what the rest of the
+    // stack expects. The Host header is unaffected: tungstenite builds it from
+    // the URI, which keeps the brackets a URI authority requires.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     let addrs: Vec<SocketAddr> = format!("{host}:{port}")
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {host} ({e})"))?
@@ -294,8 +317,8 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
 pub struct UnixTransport;
 
 impl Transport for UnixTransport {
-    fn get(&self, url: &str, accept: &str) -> Result<Response, String> {
-        get(url, accept)
+    fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
+        get(url, accept, max_bytes)
     }
 
     fn post(
@@ -461,6 +484,9 @@ mod tests {
             .get(
                 &format!("http://{redirect_addr}/releases/download/v0.1.15/asset"),
                 "application/octet-stream",
+                // This request stands in for an asset download, so it takes the
+                // asset ceiling rather than the transcript one.
+                MAX_ASSET_BYTES,
             )
             .unwrap();
 
@@ -529,6 +555,83 @@ mod tests {
             Err(_) => panic!("close left a reader waiting for a frame from a silent peer"),
         }
         reader.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A URI authority must bracket an IPv6 literal, and `Authority::host()`
+    /// hands those brackets back, so the host reaching `connect_with_timeout`
+    /// arrives as `[::1]`. This drives the real `websocket()` against a
+    /// listener on `[::1]` and asserts the handshake actually completes, so a
+    /// regression in either bracket direction fails here rather than at a
+    /// user's connect attempt.
+    ///
+    /// Measured on glibc while writing this: Rust's `ToSocketAddrs` tolerates
+    /// the bracketed form (it splits host:port before resolving), while
+    /// `getent` and Python's `getaddrinfo` reject it. The strip in
+    /// `connect_with_timeout` is therefore defence in depth rather than the
+    /// repair of an observed failure - the test pins the behaviour, not a bug.
+    #[test]
+    fn a_websocket_connects_to_a_bracketed_ipv6_url() {
+        let listener = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(l) => l,
+            // A host with IPv6 disabled in the loopback config cannot run this
+            // test; that is an environment fact, not a code defect.
+            Err(_) => {
+                eprintln!("skipping: this host cannot bind [::1]");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let len = conn.read(&mut buf).unwrap();
+            let head = String::from_utf8_lossy(&buf[..len]).to_string();
+            let key = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap()
+                .trim()
+                .to_string();
+            // The request line must carry the bracketed authority, because
+            // that is what a URI requires; the connector is what has to strip.
+            assert!(
+                head.starts_with(&format!("GET / HTTP/1.1\r\n") ) || head.starts_with("GET / "),
+                "unexpected handshake request: {head}"
+            );
+            assert!(
+                head.contains(&format!("Host: [::1]:{port}")),
+                "the Host header lost its brackets: {head}"
+            );
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut sink = [0u8; 512];
+            while let Ok(n) = conn.read(&mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let socket = websocket(&format!("ws://[::1]:{port}/"), &[]);
+        assert!(
+            socket.is_ok(),
+            "a bracketed IPv6 websocket URL did not connect: {:?}",
+            socket.err()
+        );
+        // Prove the connection is real before dropping it.
+        let socket = socket.unwrap();
+        socket.close();
         server.join().unwrap();
     }
 }

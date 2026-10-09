@@ -34,11 +34,19 @@ pub struct Release {
     pub sha256_url: String,
 }
 
-/// Version baked in at compile time: the release tag (`MNVOICE_TAG`, set by
-/// build.rs) parsed by the same `version_of_tag` the feed tags go through, so
-/// the updater compares like with like by construction.
-pub fn current_version() -> String {
-    crate::platform::version()
+/// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
+///
+/// Both the "is it time to check" read and the stamp write read the clock
+/// through this, so the degenerate case has one meaning: 0 is the stamp a
+/// pre-1970 clock writes and the value the read compares against, and
+/// `0.saturating_sub(0)` is 0 - not more than a day - so the updater stays
+/// quiet until the clock is corrected rather than checking on every start.
+/// The two halves share that interpretation rather than each guessing at it.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// True when `a` is strictly newer than `b`, comparing dotted numeric parts.
@@ -70,14 +78,26 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     false
 }
 
-/// Minimal GET against an https URL, returning the whole body.
+/// Minimal GET against an https URL, buffering the body up to the asset
+/// ceiling.
 ///
 /// Routed through the platform seam so the Windows build and the Linux and
 /// macOS ports share one redirect contract. A non-200 is an error here rather
 /// than a `Response`, because a 404 or 403 body must not be mistaken for a
 /// release that names no version, or for an executable missing its MZ header.
+///
+/// The bound is the asset ceiling, not the transcript one: this function
+/// downloads an executable, which is an order of magnitude larger than a
+/// transcription response, and using the smaller bound here would truncate a
+/// legitimate download. A truncated exe then fails the checksum comparison
+/// with a message about tampering rather than about a cut-off body, so the
+/// ceiling is set where it cannot quietly bite.
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
-    let response = crate::platform::http::NativeTransport.get(url, accept)?;
+    let response = crate::platform::http::NativeTransport.get(
+        url,
+        accept,
+        crate::platform::http::MAX_ASSET_BYTES,
+    )?;
     if response.status != 200 {
         return Err(response.error_for_status("update request"));
     }
@@ -440,8 +460,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     let old = match stage_and_swap(&bytes, &exe, &busy) {
         Ok(old) => old,
         Err(e) => {
-            let _ = helper.kill();
-            reap_helpers();
+            stop_helper(&mut helper);
             return Err(e);
         }
     };
@@ -451,13 +470,11 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // exe's path, so the old process must not keep running the renamed one.
     if let Err(e) = Command::new(&exe).arg(RESTART_ARG).spawn() {
         let _ = fs::rename(&old, &exe);
-        let _ = helper.kill();
-        reap_helpers();
+        stop_helper(&mut helper);
         return Err(format!("cannot start the new exe ({e})"));
     }
     crate::windows_app::log(&format!("updated to v{version}, relaunching"));
-    let _ = helper.kill();
-    reap_helpers();
+    stop_helper(&mut helper);
     std::process::exit(0);
 }
 
@@ -492,6 +509,21 @@ fn spawn_helper(exe: &Path) -> Result<std::process::Child, String> {
 /// its own pid, so a second install never has to share one.
 fn helper_copy_path() -> PathBuf {
     std::env::temp_dir().join(format!("{HELPER_IMAGE_PREFIX}{}.exe", std::process::id()))
+}
+
+/// Stop the recovery helper, then take its copy away.
+///
+/// `Child::kill` is `TerminateProcess` on Windows, which returns as soon as the
+/// termination is *requested*, not when the process is gone. Reaping the helper
+/// file straight after that races the dying process for its own image, so the
+/// wait comes first: once `wait` returns, the handle is released and the file is
+/// genuinely free. Without it the code asserts an invariant ("killed, so it can
+/// never repair") that the OS does not actually guarantee for a few microseconds
+/// after the call.
+fn stop_helper(helper: &mut std::process::Child) {
+    let _ = helper.kill();
+    let _ = helper.wait();
+    reap_helpers();
 }
 
 /// Take the helper copies left in the temp directory away. Best effort, like
@@ -642,10 +674,17 @@ fn should_check_at(stamp: &Path) -> bool {
     let Ok(last) = text.trim().parse::<u64>() else {
         return true;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    check_due(now_secs(), last)
+}
+
+/// Whether a stamp of `last` allows a check now that the clock reads `now`.
+///
+/// Pure so the degenerate-clock rule can be pinned without faking the system
+/// clock. A clock before 1970 reads 0, and `0.saturating_sub(anything)` is 0,
+/// which is never more than a day: a pre-1970 clock therefore fails CLOSED and
+/// the updater stays quiet until the clock is corrected, rather than reading a
+/// zero stamp as an enormous elapsed time and checking on every start.
+fn check_due(now: u64, last: u64) -> bool {
     now.saturating_sub(last) > 86_400
 }
 
@@ -660,10 +699,7 @@ fn mark_checked() {
 }
 
 fn mark_checked_at(stamp: &Path) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = now_secs();
     let _ = fs::write(stamp, now.to_string());
 }
 
@@ -1129,7 +1165,10 @@ mod tests {
             sent.contains("accept: application/atom+xml"),
             "request was: {sent}"
         );
-        assert!(sent.contains("user-agent: mnvoice-update"), "request was: {sent}");
+        assert!(
+            sent.contains(&format!("user-agent: {}", crate::platform::http::USER_AGENT).to_lowercase()),
+            "request was: {sent}"
+        );
     }
 
     #[test]
@@ -1255,6 +1294,34 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
             super::expected_hash(&with_bom, "other.exe").is_err(),
             "a BOM must not turn a different asset's absence into an install"
         );
+    }
+
+    /// The asset path must keep the headroom the transcript path does not:
+    /// the two ceilings are separate precisely so a release executable larger
+    /// than a transcript can still be downloaded whole. This drives the real
+    /// `http_get` over the Windows transport against a loopback server that
+    /// answers with more than `MAX_TRANSCRIPT_BYTES`, and asserts the whole
+    /// body arrives.
+    #[test]
+    fn an_asset_larger_than_the_transcript_ceiling_is_downloaded_whole() {
+        use crate::platform::http::{MAX_ASSET_BYTES, MAX_TRANSCRIPT_BYTES};
+        // Between the two ceilings: big enough to be clipped by a shared
+        // transcript-sized bound, small enough not to strain the fixture.
+        let len = MAX_TRANSCRIPT_BYTES as usize + 1;
+        assert!(len < MAX_ASSET_BYTES as usize, "the ceilings must differ");
+        let mut payload = vec![b'M'; len];
+        payload[1] = b'Z';
+
+        let served = MockFeed::once(&payload, "releases/download/v0.1.17-win/mnvoice.exe", "200 OK");
+        let got = http_get(&served.url, "application/octet-stream")
+            .expect("a valid asset download must succeed");
+        assert_eq!(
+            got.len(),
+            len,
+            "the asset path must not clip at the transcript ceiling"
+        );
+        assert_eq!(&got[..2], b"MZ", "the downloaded bytes must be the asset");
+        let _ = served.request();
     }
 
     #[test]
@@ -1696,6 +1763,53 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `stop_helper` must free the child's own image before it finishes: on
+    /// Windows `kill()` is `TerminateProcess`, which returns as soon as
+    /// termination is requested, so deleting the image straight after `kill()`
+    /// races the dying process and can fail with a sharing violation. This
+    /// spawns a real child from a copy of a real executable and asserts the copy
+    /// can be removed and its path rewritten immediately after `stop_helper`.
+    ///
+    /// The copy is deliberately NOT named `HELPER_IMAGE_PREFIX...`: `stop_helper`
+    /// sweeps every helper-named file out of the shared temp directory, and a
+    /// second test asserts that directory holds none. Using a helper name here
+    /// would make those two tests race under a parallel run, which is exactly
+    /// the flake this avoids.
+    #[test]
+    fn stopping_the_helper_frees_its_image_before_reaping_it() {
+        use std::os::windows::process::CommandExt as _;
+        let path = std::env::temp_dir()
+            .join(format!("mnvoice-child-image-{}.exe", std::process::id()));
+        let _ = fs::remove_file(&path);
+        // A real executable to copy: the child has to be a process whose image
+        // file the `wait()` is protecting. `cmd.exe` is present on every
+        // supported Windows and, waiting on a name that does not resolve, never
+        // runs anything or touches the machine.
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into());
+        fs::copy(&cmd, &path).expect("the child image copy must be written");
+
+        let mut helper = std::process::Command::new(&path)
+            .args(["/c", "ping -n 60 127.0.0.1 >NUL"])
+            // CREATE_NO_WINDOW: a console child would otherwise flash a window
+            // on whatever desktop the test runs on, which a test must never do.
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .expect("a harmless stay-alive child must spawn");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        stop_helper(&mut helper);
+
+        // The child is reaped and its image is free - the rename a dying
+        // process would still block. Rewriting the path proves the image is
+        // released rather than merely unlinked-but-open.
+        assert!(
+            helper.try_wait().unwrap().is_some(),
+            "the helper must be waited on"
+        );
+        fs::write(&path, b"reusable").expect("the image path must be free immediately");
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn a_staged_path_that_cannot_be_written_aborts_the_install() {
         let (dir, exe) = install_folder("swap-blocked-stage");
@@ -1800,5 +1914,18 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let stamp = stamp_file("nonsense");
         fs::write(&stamp, "yesterday").unwrap();
         assert!(should_check_at(&stamp));
+    }
+
+    /// The degenerate-clock rule is fail-CLOSED: a pre-1970 clock reads 0, and
+    /// a zero stamp must not be read as an enormous elapsed time. The write side
+    /// now stamps that 0 (rather than skipping the write), so the pair has to
+    /// agree that 0 against 0 is not due - otherwise a pre-1970 clock would
+    /// re-check on every single start.
+    #[test]
+    fn a_pre_1970_clock_never_makes_the_updater_due() {
+        assert!(!check_due(0, 0), "0 against a zero stamp must not be due");
+        assert!(!check_due(0, u64::MAX), "a zero clock must never be due");
+        assert!(!check_due(86_400, 0), "exactly a day is not more than a day");
+        assert!(check_due(86_401, 0), "past a day is due");
     }
 }
