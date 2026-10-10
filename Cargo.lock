@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "mnvoice"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "cpal",
  "enigo",
