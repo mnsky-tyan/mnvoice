@@ -161,22 +161,31 @@ fn audio_worker_loop(request_rx: Receiver<CaptureRequest>) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
         // Pre-initialize WASAPI in standby state! (Paid once at startup)
-        let mut state: Option<EngineState> = init_wasapi().ok();
+        //
+        // The reason for the failure is kept, not discarded into a bool. A
+        // user whose Windows Audio service is stopped and a user with no
+        // microphone both land here, and the four messages init_wasapi builds
+        // are the only thing that tells them apart; collapsing them to None
+        // made both report "failed to initialize microphone".
+        let mut state = init_wasapi();
 
         while let Ok(req) = request_rx.recv() {
-            if state.is_none() {
-                state = init_wasapi().ok();
+            if state.is_err() {
+                state = init_wasapi();
             }
 
-            let res = if let Some(engine) = &mut state {
-                let r = run_session(engine, &req);
-                if r.is_err() {
-                    // Reset state on error so next session can re-init
-                    state = None;
+            let res = match state.as_mut() {
+                Ok(engine) => {
+                    let r = run_session(engine, &req);
+                    if r.is_err() {
+                        // Reset state on error so next session can re-init
+                        state = Err("previous session ended in error".into());
+                    }
+                    r
                 }
-                r
-            } else {
-                Err("failed to initialize microphone".into())
+                // The reason init_wasapi gave, not a generic one: it already
+                // names which of the four ways the backend refused.
+                Err(why) => Err(why.clone()),
             };
 
             let _ = req.done_tx.send(res);
@@ -428,18 +437,52 @@ mod tests {
         );
     }
 
+    /// `nBlockAlign` must actually be consulted, not just present.
+    ///
+    /// The previous version of this test could not fail on the change it
+    /// named: it set `nBlockAlign: 8` on a 2-channel 32-bit format, and 8 is
+    /// exactly what the `channels * sample_bytes` fallback computes, so the
+    /// two branches agreed and the assertion held either way.
+    ///
+    /// A block align SMALLER than one frame is the case that separates them,
+    /// and it needs no floating-point comparison to be decisive: honoured, it
+    /// trips the "unexpected capture buffer size" guard; ignored, the fallback
+    /// stride reads the same bytes without complaint.
     #[test]
     fn block_align_sets_frame_stride_when_provided() {
-        let f = WAVEFORMATEX {
-            nChannels: 2,
-            nSamplesPerSec: SAMPLE_RATE,
-            wBitsPerSample: 32,
-            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
-            nBlockAlign: 8, // 2 channels * 4 bytes
-            ..Default::default()
+        let convert = |n_block_align: u16, bytes: usize| {
+            let f = WAVEFORMATEX {
+                nChannels: 2,
+                nSamplesPerSec: SAMPLE_RATE,
+                wBitsPerSample: 32,
+                wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+                nBlockAlign: n_block_align,
+                ..Default::default()
+            };
+            let raw = vec![0u8; bytes];
+            convert_mix(&raw, &f, SampleKind::Float)
         };
-        let raw = vec![0u8; 8 * 10]; // 10 frames
-        assert!(convert_mix(&raw, &f, SampleKind::Float).is_ok());
+
+        // One frame is 2 channels * 4 bytes = 8. A 4-byte block align claims
+        // half a frame, which cannot be read, and saying so is the whole point
+        // of consulting the field.
+        assert!(
+            convert(4, 40).is_err(),
+            "a block align below one frame must be rejected, not silently \
+             replaced by the channels * sample_bytes fallback"
+        );
+
+        // The fallback still works when the field is absent...
+        assert!(convert(0, 80).is_ok(), "nBlockAlign 0 must use the fallback");
+        // ...and so does a field that agrees with it.
+        assert!(convert(8, 80).is_ok(), "a matching block align must convert");
+
+        // A stride wider than one frame is padding the device inserted, and is
+        // accepted: only a stride too small to hold a frame is an error.
+        assert!(
+            convert(12, 120).is_ok(),
+            "a padded frame stride must still convert"
+        );
     }
 
     /// `sample_kind` reads the sub-format GUID for WAVE_FORMAT_EXTENSIBLE, so a

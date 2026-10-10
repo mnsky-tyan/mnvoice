@@ -259,12 +259,12 @@ pub fn main() {
         // left behind (the staged download and helper copies - the swap-aside
         // .old belongs to the just-updated handshake consumed just above) and
         // arm the periodic background check when AUTO_UPDATE=1.
-        // The fallback keeps updates armed when the config did not load, which
-        // is when a user is most likely stuck on an outdated build.
-        let auto_update = config
-            .as_ref()
-            .map(|c| c.auto_update)
-            .unwrap_or_else(config::auto_update_enabled);
+        // Deliberately not read off the Config: auto_update_enabled() is called
+        // directly. It stays readable when load() fails - a broken API key
+        // aborts the parse - and that is exactly when a user is most likely to
+        // be stuck on an outdated build, so the updater must not depend on a
+        // Config having parsed successfully.
+        let auto_update = config::auto_update_enabled();
         // Consume the just-updated handshake before anything else could
         // observe or remove the swap-aside image (the predicate deletes it as
         // it reads it, so this is also what makes the announcement at-most-once).
@@ -275,6 +275,8 @@ pub fn main() {
         // so the window, the hotkey and the tray never wait on its spawns.
         thread::spawn(migrate_autostart);
 
+        // A load() failure is exactly the state the idle tip has to report,
+        // and it is the reason dictation cannot start at all.
         let Some(hwnd) =
             create_tray_window(hinstance, config, hk_str.clone(), audio_engine)
         else {
@@ -291,7 +293,7 @@ pub fn main() {
             register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
         };
         app_ref(hwnd).hotkey_ok = hotkey_ok;
-        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok));
+        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, app_ref(hwnd).config.is_some()));
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -518,7 +520,13 @@ unsafe fn add_tray(hwnd: HWND, tip: &str) {
 /// A disabled hotkey (HOTKEY=none) says where the control moved, and an
 /// unregistered one (held by another app) keeps saying so - the first idle
 /// write used to erase the startup warning and advertise a dead key.
-fn idle_tip(hotkey: &str, hotkey_ok: bool) -> String {
+fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
+    // Without a key nothing can be transcribed, so that outranks every other
+    // idle message: telling the user which key to press, when pressing it does
+    // nothing, is the exact dead end this replaces.
+    if !has_config {
+        return "mnvoice - NO API KEY. Set API_KEY in mnvoice.env (see log).".to_string();
+    }
     match (hotkey, hotkey_ok) {
         ("none", _) => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
         (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
@@ -528,9 +536,9 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool) -> String {
 
 /// The tray tooltip for a given session state. Single-sourced so left-click
 /// polling and state transitions never disagree on tooltip text.
-fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool) -> String {
+fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool, has_config: bool) -> String {
     match state {
-        State::Idle => idle_tip(hotkey_str, hotkey_ok),
+        State::Idle => idle_tip(hotkey_str, hotkey_ok, has_config),
         State::Recording => "mnvoice - listening (auto-stops on silence)".to_string(),
         State::Transcribing => "mnvoice - transcribing...".to_string(),
     }
@@ -631,7 +639,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
-                    set_tray_tip(hwnd, &state_tip(app.state, &app.hotkey_str, app.hotkey_ok));
+                    set_tray_tip(
+                        hwnd,
+                        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
+                    );
                 }
                 LRESULT(0)
             }
@@ -653,7 +664,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     set_state(app, State::Idle);
                     set_tray_tip(
                         hwnd,
-                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok),
+                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                     );
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
@@ -796,7 +807,7 @@ fn toggle(app: &mut App) {
             unsafe {
                 set_tray_tip(
                     app.hwnd,
-                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok),
+                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                 )
             };
             log("recording started");
@@ -811,7 +822,7 @@ fn toggle(app: &mut App) {
             unsafe {
                 set_tray_tip(
                     app.hwnd,
-                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok),
+                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
                 )
             };
             log("recording stopped, transcribing");
@@ -839,7 +850,7 @@ fn cancel(app: &mut App) {
     unsafe {
         set_tray_tip(
             app.hwnd,
-            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok),
+            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
         )
     };
     log("recording cancelled");
@@ -1595,13 +1606,38 @@ mod tests {
         );
     }
 
+    /// Without an API key dictation cannot start at all, so the idle tip has to
+    /// say that rather than name a hotkey that does nothing. The app still
+    /// starts in this state (there must be a tray menu to fix the file from),
+    /// which is exactly why it needs saying: before, pressing the hotkey logged
+    /// one line and returned, and nothing on screen explained why.
+    #[test]
+    fn a_missing_api_key_is_reported_instead_of_the_hotkey() {
+        for ok in [true, false] {
+            let tip = idle_tip("Alt+Space", ok, false);
+            assert!(
+                tip.contains("NO API KEY"),
+                "expected the missing key to be named, got {tip:?}"
+            );
+            assert!(
+                !tip.contains("to dictate"),
+                "must not advertise a hotkey that cannot work: {tip:?}"
+            );
+        }
+        // And the healthy case is unchanged.
+        assert_eq!(
+            idle_tip("Alt+Space", true, true),
+            "mnvoice - idle. Alt+Space to dictate."
+        );
+    }
+
     #[test]
     fn the_idle_tray_tip_names_the_configured_hotkey() {
         // A user with HOTKEY=F9 must not be told to press Alt+Space, and with
         // no config yet the documented default is what the tip names.
-        assert_eq!(idle_tip("F9", true), "mnvoice - idle. F9 to dictate.");
+        assert_eq!(idle_tip("F9", true, true), "mnvoice - idle. F9 to dictate.");
         assert_eq!(
-            idle_tip("Alt+Space", true),
+            idle_tip("Alt+Space", true, true),
             "mnvoice - idle. Alt+Space to dictate."
         );
         // A hotkey that never registered keeps saying so: the first idle
@@ -1609,21 +1645,21 @@ mod tests {
         // the default spelling too, which is what a config that failed to
         // load leaves the app running on.
         assert_eq!(
-            idle_tip("F9", false),
+            idle_tip("F9", false, true),
             "mnvoice - idle. HOTKEY F9 UNAVAILABLE (in use by another app)"
         );
         assert_eq!(
-            idle_tip("Alt+Space", false),
+            idle_tip("Alt+Space", false, true),
             "mnvoice - idle. HOTKEY Alt+Space UNAVAILABLE (in use by another app)"
         );
         // HOTKEY=none moved the control to the tray; the tip says where, and
         // the deliberately disabled key is not reported as a failed one.
         assert_eq!(
-            idle_tip("none", true),
+            idle_tip("none", true, true),
             "mnvoice - idle. Hotkey disabled - use the tray menu."
         );
         assert_eq!(
-            idle_tip("none", false),
+            idle_tip("none", false, true),
             "mnvoice - idle. Hotkey disabled - use the tray menu."
         );
     }
@@ -1684,15 +1720,15 @@ mod tests {
     #[test]
     fn the_tray_state_tip_reflects_session_state() {
         assert_eq!(
-            state_tip(State::Idle, "Alt+Space", true),
+            state_tip(State::Idle, "Alt+Space", true, true),
             "mnvoice - idle. Alt+Space to dictate."
         );
         assert_eq!(
-            state_tip(State::Recording, "Alt+Space", true),
+            state_tip(State::Recording, "Alt+Space", true, true),
             "mnvoice - listening (auto-stops on silence)"
         );
         assert_eq!(
-            state_tip(State::Transcribing, "Alt+Space", true),
+            state_tip(State::Transcribing, "Alt+Space", true, true),
             "mnvoice - transcribing..."
         );
     }

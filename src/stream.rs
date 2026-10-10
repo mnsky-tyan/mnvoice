@@ -124,12 +124,9 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
 /// The Authorization header value for this config: Deepgram wants `Token`,
 /// OpenAI-compatible endpoints want `Bearer`; whatever the user already typed
 /// is passed through so either spelling works.
+/// The streaming scheme is `Token`, per Deepgram; see `config::auth_value`.
 fn auth_value(cfg: &Config) -> String {
-    if cfg.api_key.starts_with("Token ") || cfg.api_key.starts_with("Bearer ") {
-        cfg.api_key.clone()
-    } else {
-        format!("Token {}", cfg.api_key)
-    }
+    crate::config::auth_value(&cfg.api_key, "Token")
 }
 
 /// Types the words in `words[from..to]` at the cursor and appends them to the
@@ -159,7 +156,7 @@ fn commit_words(
     input::type_text(&to_type);
     *has_typed_any = true;
 
-    let mut full = full.lock().unwrap();
+    let mut full = full.lock().unwrap_or_else(|e| e.into_inner());
     if !full.is_empty() {
         full.push(' ');
     }
@@ -232,9 +229,9 @@ pub fn run_stream(
                     if !reader_done_clone.load(Ordering::SeqCst)
                         && !stop_clone.load(Ordering::SeqCst)
                     {
-                        if let Ok(mut slot) = read_error_clone.lock() {
-                            *slot = Some(e);
-                        }
+                        let mut slot =
+                            read_error_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        *slot = Some(e);
                     }
                     break;
                 }
@@ -333,8 +330,8 @@ pub fn run_stream(
 
     let _ = reader_thread.join();
 
-    let full_text = full_transcript.lock().unwrap().trim().to_string();
-    let read_error = read_error.lock().unwrap().clone();
+    let full_text = full_transcript.lock().unwrap_or_else(|e| e.into_inner()).trim().to_string();
+    let read_error = read_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     // The configured trailing space is a side effect of a session that
     // produced words, and it must not depend on which way the session ended:
@@ -376,27 +373,10 @@ mod tests {
         assert_eq!(url_encode("mnvoice"), "mnvoice");
     }
 
+    /// Delegates to the shared constructor so a new `Config` field is added in
+    /// one place, not four.
     fn test_cfg() -> Config {
-        Config {
-            protocol: crate::config::Protocol::Streaming,
-            api_key: "tok".into(),
-            model: "nova-3".into(),
-            language: "en".into(),
-            base_url: "https://api.deepgram.com".into(),
-            max_seconds: crate::config::DEFAULT_MAX_SECONDS,
-            trailing_space: true,
-            keywords: vec!["Kubernetes".into()],
-            orb_color: crate::config::DEFAULT_ORB_COLOR,
-            orb_fluid_level: crate::config::DEFAULT_ORB_FLUID_LEVEL,
-            hotkey: (0x4001, 0x20),
-            hotkey_str: "Alt+Space".into(),
-            cancel_key: (0x4000, 0x1B),
-            cancel_key_str: crate::config::DEFAULT_CANCEL_STR.into(),
-            vad_silence_ms: crate::config::DEFAULT_VAD_SILENCE_MS,
-            vad_rms_threshold: crate::config::DEFAULT_VAD_RMS_THRESHOLD,
-            strip_fillers: true,
-            auto_update: false,
-        }
+        crate::config::test_config()
     }
 
     #[test]
@@ -483,9 +463,9 @@ mod tests {
     /// The whole point of the connection-lost work: `run_stream` is driven
     /// against a real WebSocket peer on loopback that speaks Deepgram's
     /// framing, so the string the user is shown comes from the production
-    /// function and a real socket - not from a stub. `type_text` is a recorder
-    /// under `cfg(test)` (see `platform::input`), so this runs the real
-    /// streaming loop without touching the machine's keyboard.
+    /// function and a real socket - not from a stub. `type_text` is a no-op
+    /// test injector under `cfg(test)` (see `platform::input`), so this runs
+    /// the real streaming loop without touching the machine's keyboard.
     mod live_provider {
         use super::*;
         use crate::platform::audio::SAMPLE_RATE;

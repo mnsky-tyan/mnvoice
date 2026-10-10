@@ -8,8 +8,23 @@ fn main() {
         // Without this, the tray and window class icons fall back to the generic
         // OS application icon and the orb never reaches the binary.
         let mut res = winres::WindowsResource::new();
-        res.set_icon("assets/mnvoice.ico");
-        res.compile().expect("failed to compile windows resources");
+        const ICON: &str = "assets/mnvoice.ico";
+        res.set_icon(ICON);
+        // A real diagnostic, not `expect`. A build-script panic reaches the
+        // user as "failed to run custom build command", which names neither
+        // the file nor the reason; the rest of this file is careful enough
+        // (see the rerun-if note below) that an opaque failure here is the one
+        // place a broken checkout gives nothing to act on. The common cause is
+        // a missing or unreadable .ico, so that is what it says.
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=resource compilation failed for {ICON}: {e}");
+            println!(
+                "cargo:warning=mnvoice embeds its icon from {ICON} at compile \
+                 time; a failed checkout, a missing file, or an unreadable .ico \
+                 all land here"
+            );
+            panic!("failed to compile windows resources from {ICON}: {e}");
+        }
         // Emitting any rerun-if instruction stops Cargo's default scan of the
         // package, so the icon the resource section is built from would
         // otherwise stop being watched and a rebuild after editing it would

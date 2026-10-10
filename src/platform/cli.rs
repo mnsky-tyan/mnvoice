@@ -271,7 +271,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             drop(tx);
-            *engine_ended.lock().unwrap() = Some(Instant::now());
+            *engine_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             let _ = done_tx.send(Ok(()));
         });
 
@@ -294,7 +294,7 @@ mod tests {
         let (packets, fed_at) = outcome.expect("the transcriber ran to completion");
         assert_eq!(packets, 10, "every captured packet reached the transcriber");
         let fed_at = fed_at.expect("the transcriber was handed packets");
-        let ended_at = ended_at.lock().unwrap().expect("the capture reported done");
+        let ended_at = ended_at.lock().unwrap_or_else(|e| e.into_inner()).expect("the capture reported done");
         assert!(
             fed_at < ended_at,
             "the transcriber must be fed before the capture ends, not after"

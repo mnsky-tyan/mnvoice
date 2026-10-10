@@ -291,10 +291,50 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
     // stack expects. The Host header is unaffected: tungstenite builds it from
     // the URI, which keeps the brackets a URI authority requires.
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<SocketAddr> = format!("{host}:{port}")
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {host} ({e})"))?
-        .collect();
+
+    // Resolution gets its own bound, on a worker thread, because it otherwise
+    // has none: `to_socket_addrs` blocks in getaddrinfo for as long as the
+    // resolver takes, and a host with a broken DNS server can hang past every
+    // timeout below - the connect bound would never be reached because the call
+    // never got that far. Windows resolves inside its connect timeout, so
+    // without this the two backends disagree about how long a connect may take.
+    //
+    // The address is dropped if the bound expires, which is correct here: the
+    // caller already has the host name and would retry from scratch, and a
+    // half-connected socket is not something this layer can use.
+    //
+    // The bound is enforced by a timed receive, NOT by joining the thread: a
+    // `join()` waits for as long as the thread runs, so it would bound nothing.
+    // A resolver that never returns leaves one detached thread behind, which is
+    // the lesser evil - it dies with the process, and the caller is free again
+    // immediately with a real error instead of a hang.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let resolve_host = host.to_string();
+    std::thread::Builder::new()
+        .name("mnvoice-resolve".to_string())
+        .spawn(move || {
+            // The OS/DNS reason is carried back with the answer so the caller can
+            // report why resolution failed, not merely that it did.
+            let resolved = format!("{resolve_host}:{port}")
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<SocketAddr>>())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(resolved);
+        })
+        .map_err(|e| format!("cannot start resolver for {host} ({e})"))?;
+    let addrs: Vec<SocketAddr> = match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => return Err(format!("cannot resolve {host} ({e})")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(format!("cannot resolve {host} within {timeout:?}"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(format!("cannot resolve {host} (resolver thread stopped)"))
+        }
+    };
+    if addrs.is_empty() {
+        return Err(format!("cannot resolve {host}"));
+    }
     let mut last_err = None;
     for addr in &addrs {
         match TcpStream::connect_timeout(addr, timeout) {
@@ -362,10 +402,11 @@ impl WebSocket for UnixSocket {
         let _ = self
             .shutdown
             .set_write_timeout(Some(Duration::from_secs(2)));
-        if let Ok(mut ws) = self.socket.lock() {
-            // A close frame asks the server to shut down; the reply arrives on
-            // whichever thread reads next. We do not wait for it - the caller
-            // means "stop now".
+        // A close frame asks the server to shut down; the reply arrives on
+        // whichever thread reads next. We do not wait for it - the caller
+        // means "stop now".
+        {
+            let mut ws = self.socket.lock().unwrap_or_else(|e| e.into_inner());
             let _ = ws.send(Message::Close(None));
             let _ = ws.flush();
         }

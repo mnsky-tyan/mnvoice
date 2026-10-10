@@ -39,9 +39,11 @@ pub struct Config {
     /// Drop disfluencies (uh, um, erm). Streaming uses the provider's native
     /// parameter when one exists; REST filters locally. FILLER_WORDS=0 strips.
     pub strip_fillers: bool,
-    /// Install a newer published release automatically when one appears.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub auto_update: bool,
+    // AUTO_UPDATE deliberately has no field here: `auto_update_enabled()` is the
+    // single authority, because it must stay readable when load() has failed (a
+    // broken API key aborts the parse) and that is exactly when a user is most
+    // likely to be stuck on an outdated build. A field copy would be a second
+    // value that can disagree with the function it was copied from.
 }
 
 pub fn load() -> Result<Config, String> {
@@ -163,8 +165,6 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         "1" | "true" | "on" | "yes" | "keep"
     );
 
-    // AUTO_UPDATE is read by auto_update_enabled() above, not from this pass.
-
     Ok(Config {
         protocol,
         api_key: raw.api_key,
@@ -183,11 +183,28 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         vad_silence_ms: raw.vad_silence_ms,
         vad_rms_threshold: raw.vad_rms_threshold,
         strip_fillers,
-        // Deliberately not parsed inline below: a broken API key aborts load(),
-        // and if AUTO_UPDATE were derived from the same pass the updater would
-        // silently go dark exactly when the config is least trustworthy.
-        auto_update: auto_update_enabled(),
     })
+}
+
+/// The Authorization header value for a config, honouring either scheme.
+///
+/// `default_scheme` is what this transport uses when the key carries no scheme
+/// of its own: Deepgram wants `Token`, OpenAI-compatible endpoints want
+/// `Bearer`. Those defaults differ per transport and are NOT interchangeable -
+/// they are what the providers actually accept - so each caller passes its own
+/// and neither is silently changed.
+///
+/// What is shared is the pass-through: both transports are configured by one
+/// `API_KEY`, so a key the user already spelled `Token ...` must not be
+/// double-prefixed. A hardcoded `Bearer {}` on the REST path turned exactly
+/// that key into `Bearer Token xyz` and it was rejected there, while the same
+/// key worked for streaming.
+pub fn auth_value(api_key: &str, default_scheme: &str) -> String {
+    if api_key.starts_with("Token ") || api_key.starts_with("Bearer ") {
+        api_key.to_string()
+    } else {
+        format!("{default_scheme} {api_key}")
+    }
 }
 
 /// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
@@ -431,6 +448,36 @@ impl RawFields {
 #[cfg(test)]
 pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
     cancel_key_with_display(s).0
+}
+
+/// A `Config` for tests, with every field at a known-good value.
+///
+/// One constructor for all of them: the four separate 19-field literals this
+/// replaced had to be edited in four places every time a field was added, and
+/// two of them had already drifted. Individual tests override only what they
+/// are actually about, which also makes it obvious when a test needs a field
+/// the others never touch.
+#[cfg(test)]
+pub fn test_config() -> Config {
+    Config {
+        protocol: Protocol::Streaming,
+        api_key: "tok".into(),
+        model: "nova-3".into(),
+        language: "en".into(),
+        base_url: "https://api.deepgram.com".into(),
+        max_seconds: DEFAULT_MAX_SECONDS,
+        trailing_space: true,
+        keywords: vec!["Kubernetes".into()],
+        orb_color: DEFAULT_ORB_COLOR,
+        orb_fluid_level: DEFAULT_ORB_FLUID_LEVEL,
+        hotkey: (0x4001, 0x20),
+        hotkey_str: "Alt+Space".into(),
+        cancel_key: (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
+        cancel_key_str: DEFAULT_CANCEL_STR.into(),
+        vad_silence_ms: DEFAULT_VAD_SILENCE_MS,
+        vad_rms_threshold: DEFAULT_VAD_RMS_THRESHOLD,
+        strip_fillers: true,
+    }
 }
 
 pub const DEFAULT_CANCEL_MOD: u32 = 0x4000; // MOD_NOREPEAT

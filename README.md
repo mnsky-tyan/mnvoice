@@ -60,7 +60,7 @@ LANGUAGE=en
 
 Get a free API key from [Deepgram](https://console.deepgram.com/) (streaming, ~$200 free credit, recommended) or [Groq](https://console.groq.com/) (REST, free tier). See the Configuration Reference below for every key.
 
-Everything else is optional - delete `mnvoice.env` entirely and mnvoice runs on its defaults, which strip filler words.
+Everything else is optional - you can delete every key except `API_KEY`, and mnvoice fills the rest in from its defaults, which strip filler words. (It does need `API_KEY`: with the file deleted entirely it still starts and shows its tray menu, so you can fix things from there, but pressing the hotkey does nothing until a key is set. On Linux and macOS it says so and exits instead.)
 
 ### 3. Run
 
@@ -273,7 +273,8 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `ORB_COLOR` | `hot_pink` | Orb fluid color: preset name or `#RRGGBB` |
 | `ORB_FLUID_LEVEL` | `0.75` | Orb fill `0.05`-`1.0`, or `5%`-`100%` (values below the floor clamp to it) |
 
-Delete `mnvoice.env` at any time to fall back to every default above.
+Delete `mnvoice.env` at any time to fall back to every default above - but keep
+`API_KEY`, because without it nothing can be transcribed (see step 2).
 
 Each key also answers to its vendor aliases: `DEEPGRAM_API_KEY` /
 `GROQ_API_KEY` / `OPENAI_API_KEY` (and likewise `DEEPGRAM_MODEL`,
