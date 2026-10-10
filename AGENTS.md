@@ -57,3 +57,14 @@ and direct keyboard event injection.
      `gh api repos/:owner/:repo/releases/assets/<id> -H "Accept: application/octet-stream"`
      and pipe the asset itself through the same endpoint into `sha256sum`; that compares
      published bytes against published checksums without touching the filesystem.
+   - A green no-mistakes step describes the head it ran against, not the head you
+     merge. After a gate finishes, re-run `cargo clippy --locked --all-targets` and
+     both test suites on the final head before merging. This has now caught real
+     defects twice (2 clippy warnings in `src/platform/input.rs` after the CI fixer
+     rewrote the file; a test consolidation that silently removed an unreachable
+     base URL and would have made a real network call).
+   - When consolidating test fixtures onto a shared constructor, re-check that each
+     test's deliberately extreme value (an unreachable URL, a hostile key) is still
+     set explicitly. Consolidation removed one and the test kept passing while
+     becoming non-hermetic - a green test is not evidence that it still fails the
+     way it was written to.
