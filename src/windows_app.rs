@@ -804,23 +804,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             }
                         });
                     }
-                    IDM_RESTART => {
-                        // Clear the shared session state before handing over, exactly as
-                        // IDM_EXIT does. Without it the state this process was in -
-                        // Recording or Transcribing - stays published for the window
-                        // between this process exiting and the replacement's first
-                        // toggle, and `session_active()` then reports a brand new
-                        // process with no session as busy. A triggered update in that
-                        // window defers itself with "currently transcribing", which
-                        // names a session that does not exist.
-                        //
-                        // Deliberately NOT added to WM_DESTROY: a session genuinely in
-                        // flight must not be reported as idle to the updater that
-                        // installed us.
-                        let app = app_ref(hwnd);
-                        set_state(app, State::Idle);
-                        relaunch_for_restart();
-                    }
+                    IDM_RESTART => relaunch_for_restart(),
                     IDM_UPDATE => check_for_updates_async(false),
                     IDM_OPEN_CONFIG => {
                         open_companion_file(
