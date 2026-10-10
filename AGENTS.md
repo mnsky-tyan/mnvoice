@@ -68,3 +68,17 @@ and direct keyboard event injection.
      set explicitly. Consolidation removed one and the test kept passing while
      becoming non-hermetic - a green test is not evidence that it still fails the
      way it was written to.
+   - **A stale cargo target dir can report a test count that does not exist in
+     the source.** A gate auto-fix round added tests, the pipeline rebased the
+     branch, and `cargo test` then ran the old binary: 141 "passing" tests whose
+     names `grep -rn` could not find anywhere in `src/`. Detected by comparing
+     against a pristine `git worktree` of the same commit (136). After any
+     pipeline auto-fix round, `touch src/*.rs src/platform/*.rs` before trusting
+     a count, or build in a fresh worktree. A count that disagrees with
+     `grep -c '#\[test\]'` is the tell.
+   - **A gate can validate a head that is not the head you merge.** The run's
+     `head` stayed at the pre-rebase commit while follow-up commits landed on
+     top, so the pipeline's own steps never ran on the final commit. Confirm the
+     passing CI run's `head_sha` equals `git rev-parse HEAD` before merging
+     (`gh api repos/:owner/:repo/actions/runs/<id> --jq .head_sha`), and verify
+     the final head yourself.
