@@ -1755,6 +1755,45 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The staged file is what actually gets renamed over the exe, so the bytes
+    /// that were verified in memory are re-read from disk and compared before
+    /// the swap. A file rewritten in that window - an AV/EDR restore or
+    /// quarantine, a second updater, a dropper - must not be installed, and
+    /// must not be left beside the exe for the next attempt to trip over
+    /// either. Same length, different bytes: a restored or torn write rather
+    /// than a truncation.
+    ///
+    /// Driven through `verify_staged` itself rather than `stage_and_swap`,
+    /// because that is the whole seam the fix adds: nothing between the write
+    /// and this call can be made to change the file from a test without a race,
+    /// and a call site that dropped this check would leave the function unused,
+    /// which the lint step's dead-code pass reports.
+    #[test]
+    fn a_staged_exe_that_changed_on_disk_is_refused_and_removed() {
+        let (dir, exe) = install_folder("swap-staged-changed");
+        let staged = staged_path(&exe);
+        fs::write(&staged, downloaded_exe()).unwrap();
+        let mut tampered = downloaded_exe();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        let err = verify_staged(&staged, &tampered).unwrap_err();
+        assert!(
+            err.contains("staged exe changed on disk"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !staged.exists(),
+            "a refused staged file must not be left for the next attempt"
+        );
+        // The unchanged case still verifies, and leaves the file for the swap
+        // that follows it.
+        fs::write(&staged, downloaded_exe()).unwrap();
+        verify_staged(&staged, &downloaded_exe())
+            .expect("a staged file that still holds the verified bytes verifies");
+        assert!(staged.exists(), "a verified staged file is left in place");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_payload_that_is_not_a_windows_exe_is_rejected_before_anything_is_written() {
         let (dir, exe) = install_folder("swap-not-exe");

@@ -592,7 +592,14 @@ fn fill_wide(dst: &mut [u16], text: &str) {
     // Nothing fed to these fields approaches their size today (szTip is 128,
     // szInfo 256), so this is a cliff removed rather than a bug fixed, but the
     // contract the function claims is now upheld on the truncation path too.
-    let cap = dst.len().saturating_sub(1);
+    //
+    // A zero-length buffer is the one shape with no last slot to reserve: the
+    // terminator write below would index past its end, so it is skipped rather
+    // than clamped. No caller passes one, and the copy is a no-op either way.
+    if dst.is_empty() {
+        return;
+    }
+    let cap = dst.len() - 1;
     let n = src.len().min(cap);
     dst[..n].copy_from_slice(&src[..n]);
     dst[n] = 0;
@@ -1580,6 +1587,44 @@ fn relaunch_for_restart() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell reads szTip/szInfo/szInfoTitle NUL-terminated, so a copy that
+    /// fills the whole buffer leaves no terminator anywhere in it and the read
+    /// runs off the end of the field. Nothing fed to these fields approaches
+    /// their size today (szTip 128, szInfo 256, szInfoTitle 64), so this is a
+    /// cliff removed rather than a bug fixed - but the contract the function
+    /// claims is now upheld on the truncation path too, and this pins it.
+    #[test]
+    fn a_truncated_wide_copy_still_ends_with_a_terminator() {
+        // A destination eight slots wide and a source longer than that.
+        let mut dst = [0xAAAAu16; 8];
+        fill_wide(&mut dst, "abcdefghij");
+        // The first seven slots carry the text, and the eighth is the NUL the
+        // shell stops on - not the eighth character.
+        assert_eq!(&dst[..7], &wide("abcdefg")[..7]);
+        assert_eq!(dst[7], 0, "the last slot must be the terminator: {dst:?}");
+        assert!(
+            !dst.contains(&0xAAAA),
+            "every slot must be written, not just the ones copied: {dst:?}"
+        );
+
+        // A text that fits still terminates inside the buffer.
+        let mut dst = [0xAAAAu16; 8];
+        fill_wide(&mut dst, "short");
+        assert_eq!(&dst[..5], &wide("short")[..5]);
+        assert_eq!(dst[5], 0, "the text's own terminator survives");
+
+        // A text exactly as long as the usable width keeps its terminator in
+        // the last slot, which is the boundary the reservation exists for.
+        let mut dst = [0xAAAAu16; 8];
+        fill_wide(&mut dst, "abcdefg");
+        assert_eq!(&dst[..7], &wide("abcdefg")[..7]);
+        assert_eq!(dst[7], 0, "a text of exactly cap-1 still terminates");
+
+        // An empty buffer is not a panic: nothing is written at all.
+        let mut dst: [u16; 0] = [];
+        fill_wide(&mut dst, "anything");
+    }
 
     #[test]
     fn the_query_arguments_do_not_ask_for_a_format() {

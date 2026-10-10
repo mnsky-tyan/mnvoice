@@ -920,6 +920,24 @@ mod tests {
         assert_eq!(parse_color("#ff0080"), (1.0, 0.0, 128.0 / 255.0));
     }
 
+    /// A line with no key names no field. `f` filters on the FIELDS list, so an
+    /// empty key was already inert - but rejecting it in the parser makes it a
+    /// parse decision rather than something a later filter happened to catch,
+    /// and this pins that the callback is never handed one.
+    #[test]
+    fn a_line_with_no_key_names_no_field() {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        parse(
+            "=orphan\n   = spaced orphan\nAPI_KEY=k\n=another\n",
+            |k, v| seen.push((k.to_string(), v.to_string())),
+        );
+        assert_eq!(
+            seen,
+            vec![("API_KEY".to_string(), "k".to_string())],
+            "only the line that names a field may reach the callback"
+        );
+    }
+
     #[test]
     fn the_file_pass_lets_the_canonical_key_override_an_alias() {
         let mut raw = RawFields::new();

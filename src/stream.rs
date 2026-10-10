@@ -617,8 +617,27 @@ mod tests {
         pub fn serve(
             after_handshake: impl FnOnce(&mut TcpStream) + Send + 'static,
         ) -> (u16, std::thread::JoinHandle<()>) {
+            let (port, handle, _head) = serve_capturing_head(move |_head, stream| {
+                after_handshake(stream)
+            });
+            (port, handle)
+        }
+
+        /// The same handshake, but the request head the client actually sent is
+        /// handed to `after_handshake` and returned in a shared slot, so a test
+        /// can assert what went on the wire rather than what a URL builder
+        /// returned.
+        pub fn serve_capturing_head(
+            after_handshake: impl FnOnce(String, &mut TcpStream) + Send + 'static,
+        ) -> (
+            u16,
+            std::thread::JoinHandle<()>,
+            std::sync::Arc<std::sync::Mutex<String>>,
+        ) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
+            let head_slot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let captured = std::sync::Arc::clone(&head_slot);
             let handle = std::thread::spawn(move || {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -652,9 +671,12 @@ mod tests {
                 );
                 let _ = stream.write_all(reply.as_bytes());
                 let _ = stream.flush();
-                after_handshake(&mut stream);
+                if let Ok(mut slot) = captured.lock() {
+                    *slot = head.clone();
+                }
+                after_handshake(head, &mut stream);
             });
-            (port, handle)
+            (port, handle, head_slot)
         }
 
         /// `Sec-WebSocket-Accept`: base64(sha1(key + GUID)). The crate ships a
@@ -849,6 +871,113 @@ mod tests {
 
         let text = out.expect("an orderly session is Ok");
         assert_eq!(text, "all good", "a clean close must not be marked: {text}");
+    }
+
+    /// The other half of the send-side fix. A provider that takes the socket
+    /// away while audio is still flowing used to produce a bare `Ok`: the send
+    /// loop broke, the drain and CloseStream and the 1500 ms wait all failed
+    /// silently, and the reader had already seen an orderly close frame, so
+    /// nothing anywhere recorded the fault and half a sentence was typed with
+    /// no marker.
+    ///
+    /// The server here sends an orderly close frame first and only then lets the
+    /// connection go, so the reader has already taken the close as a clean end
+    /// (`Ok(None)`, which must not be marked) and never reports an error: the
+    /// ONLY fault the client can see is on its send side, while audio is still
+    /// flowing. That is what makes this the send-side test rather than a second
+    /// copy of the read one.
+    #[test]
+    fn a_send_failure_mid_dictation_is_marked_even_though_the_read_closed_cleanly() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // Words first, committed as final so they are already typed.
+            let _ = stream.write_all(&live_provider::result_frame("half a sentence", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(300));
+            // An orderly close from the provider's side: not a fault in itself.
+            let _ = stream.write_all(&live_provider::frame(0x8, &[]));
+            let _ = stream.flush();
+            // Stay connected long enough for the reader to take the close frame
+            // as an orderly end - a close frame is not a fault - and only then
+            // let the connection go, which is what the client's send side runs
+            // into while audio is still flowing.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 100);
+        let _ = server.join();
+
+        let text = out.expect("words were typed, so the result must be Ok");
+        assert!(
+            text.starts_with("half a sentence"),
+            "the typed words must survive: {text}"
+        );
+        assert!(
+            text.contains("[connection lost:"),
+            "a mid-dictation socket death on the send side must be marked: {text}"
+        );
+    }
+
+    /// The wire-level counterpart of `a_model_or_language_cannot_inject_query_parameters`:
+    /// the same hostile values, observed as the request line the real transport
+    /// puts on a real socket, rather than as a string the URL builder returned.
+    /// A URL that looks right can still be rewritten by a client that
+    /// normalizes it, so the bytes are what prove the contract.
+    ///
+    /// It also pins the two things the intent forbids changing: the per-transport
+    /// auth scheme (Deepgram takes `Token`, and a user-supplied prefix passes
+    /// through) and the trailing parameters that make a session stream words at
+    /// all.
+    #[test]
+    fn the_request_on_the_wire_survives_a_hostile_model_and_language() {
+        use std::io::Write as _;
+        let (port, server, head) = live_provider::serve_capturing_head(|_head, stream| {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(&live_provider::result_frame("wire", true, true));
+            let _ = stream.flush();
+        });
+        let mut cfg = live_provider::cfg_for(port);
+        cfg.model = "nova-3&encoding=multi#frag".into();
+        cfg.language = "en&keyterm=evil".into();
+        cfg.api_key = "Token my-own-prefix".into();
+        let out = live_provider::drive(&cfg, 10);
+        let _ = server.join();
+        let head = head.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let request_line = head.lines().next().unwrap_or_default().to_string();
+
+        assert!(out.is_ok(), "a hostile model must not break the session: {out:?}");
+        // The hostile text arrives as one encoded value, and the parameters the
+        // session declares are all still there as parameters of their own.
+        assert!(
+            request_line.contains("model=nova-3%26encoding%3Dmulti%23frag"),
+            "the model must arrive percent-encoded: {request_line}"
+        );
+        assert!(
+            request_line.contains("language=en%26keyterm%3Devil"),
+            "the language must arrive percent-encoded: {request_line}"
+        );
+        for required in [
+            "smart_format=true",
+            "interim_results=true",
+            "endpointing=1500",
+            "no_delay=true",
+            "vad_events=true",
+        ] {
+            assert!(
+                request_line.contains(required),
+                "{required} must survive on the wire: {request_line}"
+            );
+        }
+        assert!(
+            !request_line.contains("&encoding=multi") && !request_line.contains("&keyterm=evil"),
+            "no injected parameter may reach the provider: {request_line}"
+        );
+        // The auth scheme is untouched: a user-supplied prefix is passed
+        // through rather than being re-wrapped as `Token Token ...`.
+        assert!(
+            head.contains("Authorization: Token my-own-prefix"),
+            "a prefixed key must pass through unchanged: {head}"
+        );
     }
 
     /// The other half of the intent: when nothing was typed, the fault must be
