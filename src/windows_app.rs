@@ -1491,39 +1491,25 @@ pub(crate) fn check_for_updates_async(quiet: bool) {
         }
 
         // Never install while the user is speaking or a transcript is in flight.
+        //
+        // This is the pre-download check, and it is deliberately NOT the only
+        // one: `install_and_relaunch` takes `session_active` and passes it to
+        // `stage_and_swap` as its `busy` closure, which runs after the download
+        // and the checksum verify, immediately before the two renames. That inner
+        // check is the one that can see a session that began while the bytes
+        // were in flight, because it is the one evaluated at the moment of the
+        // swap - which is why `update::tests::the_idle_gate_is_read_after_the
+        // _download_and_stops_the_swap` drives it there rather than here.
+        //
+        // A second copy of the same test used to sit below, before the download,
+        // where nothing between it and this one can change state. The review
+        // round flagged it as redundant and it was removed: two copies of one
+        // test is how the two copies drift apart, and this one only catches the
+        // case where a session is already running when the check happens.
         let state = session_state();
         if state != State::Idle {
             log(&format!(
                 "update v{} available, deferred (currently {})",
-                rel.version,
-                state_name(state)
-            ));
-            if !quiet {
-                balloon(
-                    "Update available",
-                    &format!(
-                        "v{} is available. Not installed while mnvoice is busy - check again when idle.",
-                        rel.version
-                    ),
-                );
-            }
-            return;
-        }
-
-        // A session that began after the check above - the download takes
-        // tens of seconds and the toggle stays live the whole time - can be
-        // over before this line runs: if its audio engine had already died,
-        // capture_to_channel returns Err, the worker's recv() returns at once,
-        // and the whole session finishes in milliseconds, leaving State::Idle
-        // again. stage_and_swap's busy() then sees an idle app and swaps the
-        // exe under a transcript that was in flight when the download started.
-        // Re-reading the state immediately before the install closes that
-        // window: the exe is only replaced when the app is idle right now, not
-        // when it happened to be idle before the download.
-        let state = session_state();
-        if state != State::Idle {
-            log(&format!(
-                "update v{} deferred, a session started during the download ({})",
                 rel.version,
                 state_name(state)
             ));
