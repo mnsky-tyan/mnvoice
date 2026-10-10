@@ -197,26 +197,42 @@ fn kill_running_instances() {
         .unwrap_or("mnvoice.exe")
         .to_string();
     let self_pid = unsafe { GetCurrentProcessId() };
-    let status = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
+    let reported = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
         .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
         .creation_flags(0x0800_0000)
-        .status();
+        .status()
+        .map(|s| s.code());
     // Report what the scheduler actually said. `let _ = ...status()` dropped
     // the ExitStatus, so this line was written whether taskkill ran at all, was
     // filtered to zero victims, or failed - a restart log claiming a teardown
     // that never happened is worse than no log, because the next thing on
     // screen is a hotkey-registration failure with no cause above it.
-    match status {
-        Ok(s) if s.success() => {
-            log(&format!("restart: terminated other {name} instances"));
-        }
+    log(&restart_log_line(&name, reported));
+}
+
+/// What the restart teardown writes to the log, given what the scheduler
+/// actually reported: `Ok(Some(0))` is a taskkill that ran and succeeded,
+/// `Ok(Some(n))` one that ran and reported `n`, `Ok(None)` one that ended with
+/// no code at all, and `Err` one that could not be spawned.
+///
+/// Pure on purpose. The two failure arms cannot be reached through the real
+/// command without a taskkill that genuinely fails, and with
+/// `/FI "PID ne <pid>"` present a no-victim restart exits 0 - so the only
+/// benign way to a failure is a victim the caller cannot terminate, an
+/// elevated or protected process. Producing one takes an interactive UAC
+/// consent, which stalls an automated run indefinitely and leaves a prompt on
+/// the secure desktop that a non-elevated process cannot dismiss. Classifying
+/// a value means the arms are pinned by a unit test with no process spawned.
+fn restart_log_line(name: &str, reported: std::io::Result<Option<i32>>) -> String {
+    match reported {
+        Ok(Some(0)) => format!("restart: terminated other {name} instances"),
         // taskkill exits non-zero both for "no process matched" (the ordinary
         // first-restart case, filtered out by /FI) and for a real failure.
-        Ok(s) => log(&format!(
+        Ok(code) => format!(
             "restart: taskkill reported {} for other {name} instances",
-            s.code().unwrap_or(-1)
-        )),
-        Err(e) => log(&format!("restart: could not run taskkill ({e})")),
+            code.unwrap_or(-1)
+        ),
+        Err(e) => format!("restart: could not run taskkill ({e})"),
     }
 }
 
@@ -1857,6 +1873,44 @@ mod tests {
         });
         assert!(joiner.join().is_err(), "the probe panicked as intended");
         let _mutation = autostart_lock();
+    }
+
+    /// The restart teardown's three arms, driven from the value the scheduler
+    /// returns rather than from a real taskkill.
+    ///
+    /// This is the only way to reach the two failure arms: through the real
+    /// command a failure needs a victim the caller cannot terminate, and
+    /// producing one takes an interactive UAC consent that stalls an automated
+    /// run. See `restart_log_line`.
+    #[test]
+    fn the_restart_report_names_what_the_scheduler_actually_said() {
+        // A teardown that worked, and the ordinary first restart where /FI
+        // filtered every victim out: taskkill exits 0 for both.
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Ok(Some(0))),
+            "restart: terminated other mnvoice.exe instances"
+        );
+        // A non-zero exit is reported as the number the scheduler gave. A
+        // restart log claiming a teardown that never happened is worse than no
+        // log: the next line is a hotkey-registration failure with no cause
+        // above it.
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Ok(Some(5))),
+            "restart: taskkill reported 5 for other mnvoice.exe instances"
+        );
+        // A status carrying no code at all reads as -1 rather than claiming
+        // success or panicking.
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Ok(None)),
+            "restart: taskkill reported -1 for other mnvoice.exe instances"
+        );
+        // A taskkill that could not be spawned is its own answer, and it names
+        // the reason rather than a code.
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "taskkill.exe missing");
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Err(err)),
+            "restart: could not run taskkill (taskkill.exe missing)"
+        );
     }
 
     #[test]
