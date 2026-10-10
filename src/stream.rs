@@ -263,6 +263,20 @@ pub fn run_stream(
             let msg = String::from_utf8_lossy(&frame);
             if let Some(res) = parse_stream_json(&msg) {
                 let trimmed = res.transcript.trim();
+                // `speech_final` is a control flag, not data: it says the
+                // provider has finished an utterance, and the frame that says
+                // so can legitimately carry no words at all. Gating it on the
+                // transcript being non-empty - which is where this used to sit,
+                // inside the block below - meant an empty final frame never set
+                // `stop`, so the session ran to MAX_SECONDS instead of ending
+                // when speech did, and the missed flag left `typed_word_count`
+                // pointing into the clause that had just ended, so the next
+                // clause's interims typed or dropped the wrong words. A flag
+                // that ends a session must not depend on what the frame
+                // happens to contain.
+                if res.speech_final {
+                    stop_clone.store(true, Ordering::SeqCst);
+                }
                 if !trimmed.is_empty() {
                     // Filter fillers before this frame is typed, so the word
                     // indices below stay aligned frame to frame.
@@ -290,10 +304,6 @@ pub fn run_stream(
                             commit_words(&words, typed_word_count, words.len() - 1, &mut has_typed_any, &full_transcript_clone);
                             typed_word_count = words.len() - 1;
                         }
-                    }
-
-                    if res.speech_final {
-                        stop_clone.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -483,42 +493,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_whitespace_only_model_falls_back_instead_of_reaching_the_wire() {
-        // An environment variable is untrimmed and `load` hands it straight to
-        // the raw fields, so `MODEL=" "` used to produce a Config whose model
-        // was one space and no error - and listen_url then spliced that space
-        // into the query. The emptiness rule the API key already uses now
-        // applies to model, base_url and language too.
-        //
-        // `derive` is private to the config module and its `load_from` test
-        // helper is too, so this asserts the property at the seam this module
-        // owns: whatever the config hands over, the URL must not carry a
-        // whitespace value as a parameter. The trimming rule itself is pinned
-        // by config's own test (`a_whitespace_only_model_falls_back`).
-        let mut cfg = test_cfg();
-        cfg.model = "   ".into();
-        cfg.language = "\t".into();
-        // derive() would have replaced these with defaults; setting them here
-        // is the pre-fix state, and the point is that the URL builder never has
-        // to defend against it because derive already did.
-        let url = listen_url(&cfg).expect("the default base URL parses");
-        // The spaces are escaped rather than dropped, so the provider receives
-        // one malformed model name - visible, greppable, and fixable - instead
-        // of a query whose parameters have been shifted.
-        assert!(
-            url.contains("model=%20%20%20"),
-            "a whitespace model must be escaped, not spliced raw: {url}"
-        );
-        assert!(
-            url.contains("language=%09"),
-            "a whitespace language must be escaped: {url}"
-        );
-        // And crucially the rest of the query is intact: no parameter was
-        // swallowed by a value that ran off the end of the string.
-        assert!(url.contains("smart_format=true"), "{url}");
-    }
-
+    /// The whitespace-only model is pinned here too, but as an *end-to-end*
+    /// property rather than a re-assertion of the URL builder.
+    ///
+    /// The old version of this test asserted `url.contains("model=%20%20%20")`,
+    /// which is what an *escaped* model looks like - so it was satisfied by
+    /// `url_encode` alone and passed with the escaping reverted, while its own
+    /// comment said the point was that the builder never has to defend because
+    /// `derive` already did. What it actually tested was the builder defending.
+    /// The trimming rule itself is pinned by config's
+    /// `a_whitespace_only_model_falls_back`, and the escaping that survives is
+    /// pinned by `the_request_on_the_wire_survives_a_hostile_model_and_language`
+    /// against bytes written to a real socket, so neither needed a second copy.
     #[test]
     fn an_ipv6_base_url_is_rebracketed_in_the_listen_url() {
         // parse_base_url yields the bare literal, which is what WinHTTP wants,
@@ -1011,6 +997,59 @@ mod tests {
         assert!(
             err.contains("streaming transcription failed"),
             "the error must say the stream failed: {err}"
+        );
+    }
+
+    /// An empty `speech_final` frame must still end the session.
+    ///
+    /// `speech_final` is the flag that says the provider has finished an
+    /// utterance, and the frame carrying it can legitimately have no words in
+    /// it. The check used to sit inside the `if !trimmed.is_empty()` block, so
+    /// an empty final frame never set `stop`: the session ran to MAX_SECONDS
+    /// instead of ending when speech did, and the missed flag left
+    /// `typed_word_count` pointing into the clause that had just ended, so the
+    /// next clause's interims typed or dropped the wrong words.
+    ///
+    /// The discriminator is a frame sent AFTER the empty final one. With the
+    /// flag honoured the send loop has already broken, so the session's close
+    /// path has run and this frame is never read; with the flag missed the
+    /// session is still consuming audio when it arrives, so its words are typed.
+    /// The producer therefore has to outlive the frame (3 s of packets against
+    /// a 1.5 s post-stop wait) - a short producer would end the session through
+    /// the channel disconnect instead, and the test would pass either way.
+    #[test]
+    fn an_empty_speech_final_frame_still_ends_the_session() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // A real clause, finalised, so its words are committed.
+            let _ = stream.write_all(&live_provider::result_frame("one two three", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(150));
+            // The utterance-ending frame, with nothing in it. This is the frame
+            // whose flag the bug dropped.
+            let _ = stream.write_all(&live_provider::result_frame("", false, true));
+            let _ = stream.flush();
+            // Long enough that the session's own close path has certainly run
+            // before this arrives - 1.5 s of post-stop wait plus slack.
+            std::thread::sleep(Duration::from_millis(2200));
+            // If the flag was missed this is still being read, and its words
+            // reach the user's window.
+            let _ = stream.write_all(&live_provider::result_frame("four five six", true, false));
+            let _ = stream.flush();
+        });
+        let cfg = live_provider::cfg_for(port);
+        // 150 packets x 20 ms = 3 s of audio, so the channel is still open when
+        // the late frame arrives unless `stop` ended the send loop first.
+        let out = live_provider::drive(&cfg, 150);
+        let _ = server.join();
+        let text = out.expect("the session must not error");
+        assert!(
+            text.contains("one two three"),
+            "the committed words must survive: {text}"
+        );
+        assert!(
+            !text.contains("four five six"),
+            "a frame sent after speech_final must not be read: {text}"
         );
     }
 }

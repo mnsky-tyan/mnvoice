@@ -11,7 +11,7 @@ const BOUNDARY: &str = "mnvoiceboundary9f2a";
 /// Transcribe a WAV clip using an OpenAI-compatible REST endpoint. Returns plain text.
 pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
     let url = endpoint_url(&cfg.base_url)?;
-    let body = multipart_body(cfg, wav);
+    let body = multipart_body(cfg, wav)?;
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
 
     let response = crate::platform::http::NativeTransport.post(
@@ -192,6 +192,11 @@ pub fn dictate_rest(
             crate::platform::input::type_text(" ");
         }
     }
+    // `trailing` is consumed for its side effect above and dropped from the
+    // return, so callers must not re-derive it from the transcript - and cannot
+    // mistake the transcript for something that says whether it was typed. A
+    // caller wanting to know has to call `rest_typing` again, which is the only
+    // honest answer.
     Ok(text)
 }
 
@@ -250,7 +255,52 @@ pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> 
     Ok((host, port, secure, path))
 }
 
-fn multipart_body(cfg: &Config, wav: &[u8]) -> Vec<u8> {
+/// Refuse a value that would break out of its multipart part.
+///
+/// CR or LF ends the part's headers early and makes the rest of the value parse
+/// as new headers; the boundary itself ends the part and lets the caller supply
+/// the closing delimiter. Both are refused rather than escaped - see
+/// `multipart_body` for why.
+fn reject_part_breaker(label: &str, value: &str) -> Result<(), String> {
+    if value.contains('\r') || value.contains('\n') {
+        return Err(format!(
+            "{label} must not contain a line break (it would break the upload's formatting)"
+        ));
+    }
+    if value.contains(BOUNDARY) {
+        return Err(format!(
+            "{label} must not contain the multipart boundary {BOUNDARY}"
+        ));
+    }
+    Ok(())
+}
+
+fn multipart_body(cfg: &Config, wav: &[u8]) -> Result<Vec<u8>, String> {
+    // Three user-supplied values are written into the body verbatim, and the
+    // boundary is a fixed constant with no uniqueness check. A value containing
+    // CR or LF terminates its part early and the following bytes are parsed as
+    // new part headers; a value containing the boundary itself ends the part
+    // and lets the closing `--BOUNDARY--` be the caller's. Either way the
+    // `file` part can be truncated, and the POST then carries a Content-Length
+    // for a body whose final boundary is not the one this side sent.
+    //
+    // Refused rather than escaped: a model name, a language code or a keyterm
+    // list has no legitimate reason to contain a newline or this boundary, so
+    // "MODEL must not contain a newline" is a more useful message than a
+    // percent-encoded model name the provider will reject anyway. The streaming
+    // path percent-encodes the same two fields (stream.rs listen_url), which is
+    // what made the asymmetry worth closing: one MODEL value was inert on the
+    // websocket query and structurally significant here.
+    for (label, value) in [
+        ("MODEL", cfg.model.as_str()),
+        ("LANGUAGE", cfg.language.as_str()),
+    ] {
+        reject_part_breaker(label, value)?;
+    }
+    for kw in &cfg.keywords {
+        reject_part_breaker("KEYWORDS", kw)?;
+    }
+
     let mut body = Vec::with_capacity(wav.len() + 512);
     let field = |body: &mut Vec<u8>, name: &str, value: &str| {
         body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
@@ -274,7 +324,7 @@ fn multipart_body(cfg: &Config, wav: &[u8]) -> Vec<u8> {
     body.extend_from_slice(wav);
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-    body
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -537,6 +587,58 @@ mod tests {
     /// It is deliberately not a test of truncation *silently* happening - that
     /// behaviour was reviewed and declined - but of the two bounds being
     /// distinct, which is what the split was for.
+    #[test]
+    fn a_value_that_would_break_out_of_its_part_is_refused() {
+        // Three user-supplied values go into the body verbatim and the boundary
+        // is a fixed constant, so a value with a line break in it ends its part
+        // early and the bytes after it parse as new part headers - which can
+        // truncate the `file` part while the Content-Length still claims the
+        // whole body. Refused rather than escaped.
+        let base = || {
+            let mut c = crate::config::test_config();
+            c.model = "whisper-large-v3-turbo".into();
+            c.language = "en".into();
+            c
+        };
+
+        // A line break in any of the three is refused.
+        for (label, mutate) in [
+            ("model", 0usize),
+            ("language", 1),
+            ("keywords", 2),
+        ] {
+            let mut cfg = base();
+            match mutate {
+                0 => cfg.model = "whisper\r\n--mnvoiceboundary9f2a--".into(),
+                1 => cfg.language = "en\nContent-Disposition: form-data".into(),
+                _ => cfg.keywords = vec!["kubernetes".into(), "dock\r\ner".into()],
+            }
+            let err = multipart_body(&cfg, b"RIFFxxxx").expect_err("{label} must be refused");
+            assert!(
+                err.to_ascii_uppercase().contains(&label.to_ascii_uppercase()),
+                "the message must name the field: {err}"
+            );
+            assert!(
+                err.contains("line break") || err.contains("boundary"),
+                "the message must say what was wrong: {err}"
+            );
+        }
+
+        // The boundary itself is refused even with no line break.
+        let mut cfg = base();
+        cfg.model = format!("x{}y", BOUNDARY);
+        let err = multipart_body(&cfg, b"RIFFxxxx").expect_err("the boundary must be refused");
+        assert!(err.contains("boundary"), "{err}");
+
+        // Ordinary values still build, and the body is unchanged for them.
+        let cfg = base();
+        let body = multipart_body(&cfg, b"RIFFxxxx").expect("ordinary values build");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with(&format!("--{BOUNDARY}\r\n")), "{text}");
+        assert!(text.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"), "{text}");
+        assert!(text.ends_with(&format!("--{BOUNDARY}--\r\n")), "{text}");
+    }
+
     #[test]
     fn a_transcript_response_is_bounded_by_the_transcript_ceiling() {
         use std::io::{Read as _, Write as _};

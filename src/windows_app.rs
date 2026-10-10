@@ -94,6 +94,18 @@ fn state_name(s: State) -> &'static str {
 }
 
 impl State {
+    /// The wire form, shared with the updater's worker thread.
+    ///
+    /// One encode, one decode. This used to be three spellings of the same
+    /// table: this `as u8`, the static's initializer written out as `0`, and
+    /// `from_code`'s `1 => Recording, 2 => Transcribing, _ => Idle`. Nothing
+    /// kept them in agreement but declaration order, so inserting a variant - or
+    /// reordering them - silently remapped the shared atomic. Keeping both
+    /// directions here and nowhere else is what makes the table checkable.
+    const fn as_code(self) -> u8 {
+        self as u8
+    }
+
     fn from_code(code: u8) -> State {
         match code {
             1 => State::Recording,
@@ -110,7 +122,7 @@ impl State {
 /// thread's window for the answer: that lookup handed out a raw pointer into
 /// UI-thread-owned memory that another thread then read and aliased, which is
 /// only correct by luck and disappears entirely once the window is gone.
-static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle as u8);
+static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle.as_code());
 
 /// Set at the very start of startup, before anything could consume the
 /// swap-aside image the previous process left behind, and read once the tray
@@ -123,7 +135,7 @@ static JUST_UPDATED: AtomicBool = AtomicBool::new(false);
 /// Record a state change in both the UI's own copy and the shared atomic.
 fn set_state(app: &mut App, state: State) {
     app.state = state;
-    SESSION_STATE.store(state as u8, Ordering::SeqCst);
+    SESSION_STATE.store(state.as_code(), Ordering::SeqCst);
 }
 
 struct App {
@@ -351,7 +363,12 @@ pub fn main() {
 /// process was that finisher.
 fn finish_pending_install(args: &[String]) -> bool {
     if let Some(pos) = args.iter().position(|a| a == update::FINISH_UPDATE_ARG) {
-        update::finish_install(args.get(pos + 1).map(std::path::Path::new));
+        let install = args.get(pos + 1).map(std::path::Path::new);
+        // The digest the installer verified, passed to the helper so the staged
+        // file it may have to finish installing is re-checked against it. See
+        // `update::finish_install`.
+        let digest = args.get(pos + 2).map(String::as_str);
+        update::finish_install(install, digest);
         return true;
     }
     false
@@ -582,6 +599,26 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+/// Push the tray tip for the state `app` is in right now.
+///
+/// `state_tip`'s doc says the *text* is single-sourced "so left-click polling
+/// and state transitions never disagree on tooltip text" - and it is. The
+/// *arguments* were not: this exact four-argument expression was spelled out at
+/// five call sites (the tray left-click, the worker teardown, both toggle arms
+/// and cancel), with every input a field of the same `App`, so a field the tip
+/// should reflect had to be threaded through five places. `hotkey_ok` already
+/// was, which is the drift this prevents rather than merely tidies.
+///
+/// Reads `app.state` rather than taking a state argument, so the tip always
+/// describes the state the app is in - at the three sites that call `set_state`
+/// first, that is the state they were hardcoding.
+unsafe fn push_tip(hwnd: HWND, app: &App) {
+    set_tray_tip(
+        hwnd,
+        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
+    );
+}
+
 /// The tray icon's identity, shared by every `Shell_NotifyIconW` call: the
 /// window, the id and the GUID are what make four different calls address
 /// the same icon.
@@ -687,10 +724,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
-                    set_tray_tip(
-                        hwnd,
-                        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                    );
+                    push_tip(hwnd, app);
                 }
                 LRESULT(0)
             }
@@ -710,10 +744,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    set_tray_tip(
-                        hwnd,
-                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                    );
+                    push_tip(hwnd, app);
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription. On REST nothing
@@ -773,7 +804,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             }
                         });
                     }
-                    IDM_RESTART => relaunch_for_restart(),
+                    IDM_RESTART => {
+                        // Clear the shared session state before handing over, exactly as
+                        // IDM_EXIT does. Without it the state this process was in -
+                        // Recording or Transcribing - stays published for the window
+                        // between this process exiting and the replacement's first
+                        // toggle, and `session_active()` then reports a brand new
+                        // process with no session as busy. A triggered update in that
+                        // window defers itself with "currently transcribing", which
+                        // names a session that does not exist.
+                        //
+                        // Deliberately NOT added to WM_DESTROY: a session genuinely in
+                        // flight must not be reported as idle to the updater that
+                        // installed us.
+                        let app = app_ref(hwnd);
+                        set_state(app, State::Idle);
+                        relaunch_for_restart();
+                    }
                     IDM_UPDATE => check_for_updates_async(false),
                     IDM_OPEN_CONFIG => {
                         open_companion_file(
@@ -867,12 +914,7 @@ fn toggle(app: &mut App) {
                 orb.show(orb::OrbState::Recording);
             }
             let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
-            unsafe {
-                set_tray_tip(
-                    app.hwnd,
-                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                )
-            };
+            unsafe { push_tip(app.hwnd, app) };
             log("recording started");
         }
         State::Recording => {
@@ -882,12 +924,7 @@ fn toggle(app: &mut App) {
             if let Some(orb) = &mut app.orb {
                 orb.set_state(orb::OrbState::Transcribing);
             }
-            unsafe {
-                set_tray_tip(
-                    app.hwnd,
-                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                )
-            };
+            unsafe { push_tip(app.hwnd, app) };
             log("recording stopped, transcribing");
         }
         State::Transcribing => {}
@@ -910,12 +947,7 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    unsafe {
-        set_tray_tip(
-            app.hwnd,
-            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-        )
-    };
+    unsafe { push_tip(app.hwnd, app) };
     log("recording cancelled");
 }
 
@@ -1010,8 +1042,22 @@ fn worker(
 
     // Streaming leaves the capture report unread until here; the REST arm above
     // has already consumed it (a second recv sees a closed channel and no-ops).
+    //
+    // Classified the same four ways the REST arm classifies it, rather than
+    // matching only `Ok(Err(e))`. The two shapes this used to drop were the ones
+    // the settled capture-fault rule exists for: `None` means the engine was gone
+    // before the thread started, and `Err(RecvError)` means the audio worker
+    // panicked before its `send`. Reporting either as the transcript tells a user
+    // whose Windows Audio service just stopped that they said nothing - under
+    // streaming only, which is what made the asymmetry worth closing. A clean
+    // `Ok(Ok(()))` with a short buffer is the one shape that really is silence.
     if let Some(rx) = capture_done {
-        if let Ok(Err(e)) = rx.recv() {
+        let fault = match rx.recv() {
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some("capture failed: the audio worker stopped".to_string()),
+            Ok(Ok(())) => None,
+        };
+        if let Some(e) = fault {
             result = (false, e);
         }
     }

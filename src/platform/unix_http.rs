@@ -378,6 +378,22 @@ impl Transport for UnixTransport {
 
 impl WebSocket for UnixSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
+        // A write timeout on the shared socket, for the same reason `close`
+        // sets one on its shutdown handle: a peer that stopped reading blocks
+        // `send` forever. The one place that is most likely to happen is the
+        // post-session drain in `stream.rs`, which fires after the session has
+        // already ended - exactly when a provider that has gone away is least
+        // likely to still be reading - and nothing after the drain could run
+        // until it finished, because the close frame and the reader join come
+        // after it. Two seconds is far more than a 3.2 KB PCM frame needs.
+        //
+        // Set here rather than around the drain so the main send loop is
+        // bounded by the same rule: it is the same `send` call against the same
+        // stalled peer, and a session whose provider stopped reading has no
+        // working state to preserve.
+        let _ = self
+            .shutdown
+            .set_write_timeout(Some(Duration::from_secs(2)));
         self.socket
             .lock()
             .map_err(|_| "websocket lock poisoned".to_string())?
