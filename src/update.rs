@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::platform::http::Transport;
-use crate::platform::version_of_tag;
+use crate::platform::{tag_parts as platform_tag_parts, version_of_tag};
 
 /// Repository that publishes mnvoice releases.
 const REPO: &str = "mnsky-tyan/mnvoice";
@@ -89,9 +89,16 @@ pub fn is_newer(a: &str, b: &str) -> bool {
 /// The bound is the asset ceiling, not the transcript one: this function
 /// downloads an executable, which is an order of magnitude larger than a
 /// transcription response, and using the smaller bound here would truncate a
-/// legitimate download. A truncated exe then fails the checksum comparison
-/// with a message about tampering rather than about a cut-off body, so the
-/// ceiling is set where it cannot quietly bite.
+/// legitimate download.
+///
+/// A truncated exe then fails the checksum comparison with a message about
+/// tampering rather than about a cut-off body. That holds for the exe path,
+/// whose only consumer is `verify_download` - but NOT for the release feed,
+/// which `check_latest_from` fetches through this same function and parses
+/// with `feed_tags` under no length or shape check. A truncated feed there
+/// yields "release feed names no release for this platform", which names the
+/// wrong cause. The ceiling is therefore safe where it is checked, and the
+/// feed's failure mode is the generic one, not a truncation report.
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
     let response = crate::platform::http::NativeTransport.get(
         url,
@@ -328,11 +335,14 @@ const fn platform_release_suffix() -> &'static str {
 /// A bare `vX.Y.Z` tag is accepted on Windows only, because every release
 /// published before the three-way split was Windows and those installs must
 /// keep updating.
+///
+/// Split through `platform::tag_parts`, the single definition of where a
+/// version ends and a platform suffix begins, so this classifier and the
+/// version comparison in `is_newer` cannot disagree about the same tag.
 fn tag_is_ours(tag: &str) -> bool {
-    let bare = tag.strip_prefix('v').unwrap_or(tag);
-    match bare.split_once('-') {
-        Some((_, suffix)) => suffix == platform_release_suffix(),
-        None => cfg!(windows),
+    match platform_tag_parts(tag) {
+        (_, Some(suffix)) => suffix == platform_release_suffix(),
+        (_, None) => cfg!(windows),
     }
 }
 
@@ -589,12 +599,44 @@ fn finish_swap(exe: &Path) -> Result<(), String> {
     fs::rename(staged_path(exe), exe).map_err(|e| format!("cannot finish the install ({e})"))
 }
 
+/// Re-checks the staged file against the bytes that were verified in memory.
+///
+/// A second hash of the same input, not a second download: the published
+/// checksum was already confirmed against `bytes`, so the only question left is
+/// whether the file that is about to be renamed over the exe still holds them.
+/// A mismatch removes the staged file exactly as the `busy()` branch does, so a
+/// tampered or torn write cannot be left beside the exe for the next attempt.
+fn verify_staged(staged: &Path, expected: &[u8]) -> Result<(), String> {
+    let on_disk = fs::read(staged).map_err(|e| format!("cannot re-read staged exe ({e})"))?;
+    if on_disk != expected {
+        let _ = fs::remove_file(staged);
+        return Err(format!(
+            "staged exe changed on disk after it was written ({} bytes written, {} read); refusing to install",
+            expected.len(),
+            on_disk.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Write the new image beside the running one, then move it over, but only if
 /// nothing started recording while the bytes were in flight.
 fn stage_and_swap(bytes: &[u8], exe: &Path, busy: &dyn Fn() -> bool) -> Result<PathBuf, String> {
     check_exe_payload(bytes)?;
     let staged = staged_path(exe);
     fs::write(&staged, bytes).map_err(|e| format!("cannot write staged exe ({e})"))?;
+
+    // The checksum was verified against the bytes in memory, but what gets
+    // swapped in is this file, not those bytes - and it sat on disk for the
+    // whole window between the write above and the renames in swap_in, while
+    // the helper was spawned and the busy check ran. Anything that rewrote the
+    // path in that window (an AV/EDR scanner restoring or quarantining, a
+    // second updater, a dropper) would have installed bytes that were never
+    // verified, and the verifier could not have detected it because it never
+    // looked at the file it approved. Reading the file back and hashing it
+    // again makes the check describe the artifact that is actually installed,
+    // and closes the window to the rename-only gap.
+    verify_staged(&staged, bytes)?;
 
     if busy() {
         let _ = fs::remove_file(&staged);
@@ -915,6 +957,41 @@ mod tests {
         assert_eq!(version_of_tag("v0.1.15-win"), "0.1.15");
         assert_eq!(version_of_tag("v0.1.14"), "0.1.14");
         assert_eq!(version_of_tag("0.1.15-linux"), "0.1.15");
+    }
+
+    #[test]
+    fn the_tag_classifier_and_the_version_parser_split_a_tag_the_same_way() {
+        // tag_is_ours and version_of_tag used to spell the split rule
+        // separately - `split_once('-')` on the right side versus
+        // `split('-').next()` on the left - and nothing tied them together. A
+        // change to either one would have made the updater classify a tag by a
+        // different split than the one it compares versions by. They now share
+        // platform::tag_parts, so this asserts the property that made sharing
+        // worth doing rather than re-testing either function on its own: for
+        // every tag shape the publish gate accepts, the suffix the classifier
+        // sees is exactly the segment the version parser drops.
+        for tag in [
+            "v0.1.25-win",
+            "v0.1.25-linux",
+            "v0.1.25-macos",
+            "v0.1.25",
+            "0.1.25-linux",
+        ] {
+            let (version, suffix) = platform_tag_parts(tag);
+            assert_eq!(version, version_of_tag(tag), "{tag}: parser disagrees");
+            // What the classifier keys on is the suffix, and what the parser
+            // drops is the same text, so a bare tag has nothing for it to match.
+            let expected = if tag.starts_with('v') {
+                tag.trim_start_matches('v')
+            } else {
+                tag
+            };
+            let (want_version, want_suffix) = expected
+                .split_once('-')
+                .map_or((expected, None), |(v, s)| (v, Some(s)));
+            assert_eq!(version, want_version, "{tag}: version part");
+            assert_eq!(suffix, want_suffix, "{tag}: suffix part");
+        }
     }
 
     #[test]

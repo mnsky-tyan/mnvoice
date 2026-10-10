@@ -197,11 +197,27 @@ fn kill_running_instances() {
         .unwrap_or("mnvoice.exe")
         .to_string();
     let self_pid = unsafe { GetCurrentProcessId() };
-    let _ = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
+    let status = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
         .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
         .creation_flags(0x0800_0000)
         .status();
-    log(&format!("restart: terminated other {name} instances"));
+    // Report what the scheduler actually said. `let _ = ...status()` dropped
+    // the ExitStatus, so this line was written whether taskkill ran at all, was
+    // filtered to zero victims, or failed - a restart log claiming a teardown
+    // that never happened is worse than no log, because the next thing on
+    // screen is a hotkey-registration failure with no cause above it.
+    match status {
+        Ok(s) if s.success() => {
+            log(&format!("restart: terminated other {name} instances"));
+        }
+        // taskkill exits non-zero both for "no process matched" (the ordinary
+        // first-restart case, filtered out by /FI) and for a real failure.
+        Ok(s) => log(&format!(
+            "restart: taskkill reported {} for other {name} instances",
+            s.code().unwrap_or(-1)
+        )),
+        Err(e) => log(&format!("restart: could not run taskkill ({e})")),
+    }
 }
 
 /// Where the process starts, one step per line: finish a pending update
@@ -569,8 +585,17 @@ fn tray_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
 /// NUL-terminated, so clamping is the contract, not an afterthought.
 fn fill_wide(dst: &mut [u16], text: &str) {
     let src = wide(text);
-    let n = src.len().min(dst.len());
+    // Reserve the last slot for the terminator. Copying dst.len() elements when
+    // the source is longer leaves the buffer full of data with no NUL anywhere
+    // in it, and the shell reads these fields NUL-terminated - so a truncated
+    // copy would run off the end of szTip looking for the end of the string.
+    // Nothing fed to these fields approaches their size today (szTip is 128,
+    // szInfo 256), so this is a cliff removed rather than a bug fixed, but the
+    // contract the function claims is now upheld on the truncation path too.
+    let cap = dst.len().saturating_sub(1);
+    let n = src.len().min(cap);
     dst[..n].copy_from_slice(&src[..n]);
+    dst[n] = 0;
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -705,10 +730,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // Toggle the logon task. The Run key is cleared as a side
                         // effect, and the state is re-read on next open, so the
                         // checkbox can never drift out of sync with reality.
-                        let enable = !autostart_enabled();
-                        if let Err(e) = set_autostart(enable) {
-                            log(&format!("autostart toggle failed: {e}"));
-                        }
+                        //
+                        // Runs on a worker thread, like check_for_updates_async
+                        // and migrate_autostart: this body spawns schtasks and,
+                        // whenever no task is registered, up to five reg.exe
+                        // calls, each an unbounded Command::status()/.output()
+                        // wait - std has no timeout. Doing that on the UI thread
+                        // meant doing it inside TrackPopupMenu's modal loop,
+                        // where nothing else is serviced: the tray window showed
+                        // Not Responding, the balloon stopped updating, and a
+                        // queued WM_APP_WORKER teardown was delayed by however
+                        // long the registry took. On an AV-scanned or
+                        // domain-locked machine that is a visible freeze from a
+                        // single menu click.
+                        thread::spawn(|| {
+                            let enable = !autostart_enabled();
+                            if let Err(e) = set_autostart(enable) {
+                                log(&format!("autostart toggle failed: {e}"));
+                            }
+                        });
                     }
                     IDM_RESTART => relaunch_for_restart(),
                     IDM_UPDATE => check_for_updates_async(false),
@@ -913,10 +953,27 @@ fn worker(
             // this arm used to have with it. A cancelled session is the same
             // case - dictate_rest refuses to type it, and there is no reason
             // to upload it either.
-            let capture_err = capture_done.as_ref().and_then(|done| match done.recv() {
-                Ok(Err(e)) => Some(e),
-                _ => None,
-            });
+            //
+            // Three shapes reach here and they are not the same outcome. A
+            // clean `Ok(())` with a short buffer really is no speech. But
+            // `capture_done == None` means `capture_to_channel` returned
+            // `Err` (the engine was gone before the thread started) and
+            // `Err(RecvError)` means the audio worker panicked before its
+            // `send` - both of those are a broken microphone, and reporting
+            // them as NO_SPEECH tells a user whose Windows Audio service just
+            // stopped that they said nothing, which is exactly the misleading
+            // diagnostic the four specific init_wasapi messages exist to
+            // prevent. Only the third shape is silence.
+            let capture_err = match &capture_done {
+                None => Some("capture failed: the audio engine is unavailable".to_string()),
+                Some(done) => match done.recv() {
+                    Ok(Err(e)) => Some(e),
+                    // The worker dropped its sender without sending, which for
+                    // this channel means it did not reach its own report.
+                    Err(_) => Some("capture failed: the audio worker stopped".to_string()),
+                    Ok(Ok(())) => None,
+                },
+            };
             match capture_err {
                 Some(e) => (false, e),
                 None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
@@ -992,6 +1049,13 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = SetForegroundWindow(hwnd);
     let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    // The popup is gone by the time TrackPopupMenu returns, so the menu it
+    // owns is freed here rather than at process exit. Every other resource in
+    // this crate that the shell hands out is released on the same path that
+    // used it - Orb::drop destroys its DC, bitmap and window - and a USER32
+    // menu is no different. One leaked handle per right-click, for the life of
+    // the process, was the only leak of its kind here.
+    let _ = DestroyMenu(menu);
 }
 
 const AUTOSTART_TASK: &str = r"\mnvoice";
@@ -1304,7 +1368,11 @@ fn set_autostart(enable: bool) -> Result<(), String> {
     } else {
         // The delete's own exit code is authority: a zero already means the
         // task is gone, so the scheduler is only asked when it says otherwise.
-        status.success() || delete_left_task_gone(status.success(), task_state())
+        // The helper below takes `delete_ok` only to be callable from a test
+        // that wants to exercise the failed-delete branch; the live call site
+        // is inside this `else`, where a zero already short-circuited, so the
+        // flag is always false here.
+        status.success() || delete_left_task_gone(false, task_state())
     };
     if !in_place {
         // Whatever carries the autostart until the scheduler holds the one
@@ -1404,6 +1472,35 @@ pub(crate) fn check_for_updates_async(quiet: bool) {
         if state != State::Idle {
             log(&format!(
                 "update v{} available, deferred (currently {})",
+                rel.version,
+                state_name(state)
+            ));
+            if !quiet {
+                balloon(
+                    "Update available",
+                    &format!(
+                        "v{} is available. Not installed while mnvoice is busy - check again when idle.",
+                        rel.version
+                    ),
+                );
+            }
+            return;
+        }
+
+        // A session that began after the check above - the download takes
+        // tens of seconds and the toggle stays live the whole time - can be
+        // over before this line runs: if its audio engine had already died,
+        // capture_to_channel returns Err, the worker's recv() returns at once,
+        // and the whole session finishes in milliseconds, leaving State::Idle
+        // again. stage_and_swap's busy() then sees an idle app and swaps the
+        // exe under a transcript that was in flight when the download started.
+        // Re-reading the state immediately before the install closes that
+        // window: the exe is only replaced when the app is idle right now, not
+        // when it happened to be idle before the download.
+        let state = session_state();
+        if state != State::Idle {
+            log(&format!(
+                "update v{} deferred, a session started during the download ({})",
                 rel.version,
                 state_name(state)
             ));
