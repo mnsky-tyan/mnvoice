@@ -974,8 +974,24 @@ mod tests {
         );
         // The auth scheme is untouched: a user-supplied prefix is passed
         // through rather than being re-wrapped as `Token Token ...`.
-        assert!(
-            head.contains("Authorization: Token my-own-prefix"),
+        //
+        // HTTP field names are case-insensitive, and the two backends spell
+        // this one differently: WinHTTP writes the name the caller handed it,
+        // while the Unix handshake emits every caller-supplied header
+        // lowercased (tungstenite writes `http::HeaderName::as_str()`, which is
+        // always lowercase). The value is the contract, so the field name is
+        // matched case-insensitively and the value is compared exactly.
+        let auth = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("authorization") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            auth,
+            Some("Token my-own-prefix"),
             "a prefixed key must pass through unchanged: {head}"
         );
     }
