@@ -55,6 +55,11 @@ const DOWNLOAD_IO_TIMEOUT: Duration = Duration::from_secs(45);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on every write to the WebSocket socket, so a peer that stopped reading
+/// cannot park the send loop or the session teardown forever. Two seconds is far
+/// more than a 3.2 KB PCM frame or a close frame needs.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(target_os = "linux")]
 fn ensure_tls_ready() {
     // rustls needs a process-level crypto provider before the first
@@ -267,8 +272,16 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
 
     let (socket, _) = tungstenite::client_tls_with_config(request, stream, None, None)
         .map_err(|e| format!("websocket connect failed ({e})"))?;
+    // Both bounds live on the shared socket, so every write is bounded by
+    // construction: audio frames, the CloseStream frame, the close frame and
+    // the pong reply the reader sends all go through this one socket. A peer
+    // that stopped reading blocks a write forever otherwise, and the session's
+    // teardown has nothing after it that could run.
     options
         .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))
+        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+    options
+        .set_write_timeout(Some(WRITE_TIMEOUT))
         .map_err(|e| format!("websocket socket setup failed ({e})"))?;
 
     Ok(UnixSocket {
@@ -378,22 +391,6 @@ impl Transport for UnixTransport {
 
 impl WebSocket for UnixSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
-        // A write timeout on the shared socket, for the same reason `close`
-        // sets one on its shutdown handle: a peer that stopped reading blocks
-        // `send` forever. The one place that is most likely to happen is the
-        // post-session drain in `stream.rs`, which fires after the session has
-        // already ended - exactly when a provider that has gone away is least
-        // likely to still be reading - and nothing after the drain could run
-        // until it finished, because the close frame and the reader join come
-        // after it. Two seconds is far more than a 3.2 KB PCM frame needs.
-        //
-        // Set here rather than around the drain so the main send loop is
-        // bounded by the same rule: it is the same `send` call against the same
-        // stalled peer, and a session whose provider stopped reading has no
-        // working state to preserve.
-        let _ = self
-            .shutdown
-            .set_write_timeout(Some(Duration::from_secs(2)));
         self.socket
             .lock()
             .map_err(|_| "websocket lock poisoned".to_string())?
@@ -410,14 +407,6 @@ impl WebSocket for UnixSocket {
     }
 
     fn close(&self) {
-        // Bound the close-frame write: the trait promises shutdown "without
-        // waiting for the peer", and a peer that stopped reading could block
-        // send/flush forever - which would also park the shutdown below, and
-        // with it the caller's reader join. Two seconds is far more than a
-        // two-byte close frame needs; the socket dies right after either way.
-        let _ = self
-            .shutdown
-            .set_write_timeout(Some(Duration::from_secs(2)));
         // A close frame asks the server to shut down; the reply arrives on
         // whichever thread reads next. We do not wait for it - the caller
         // means "stop now".
@@ -615,18 +604,18 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// A send to a peer that stopped reading must be bounded, not blocked.
+    /// A peer that completes the WebSocket handshake and then stops reading.
     ///
-    /// The streaming loop drains queued audio through `send_binary` after the
-    /// session has ended - exactly when a provider that has gone away is least
-    /// likely to still be reading - and nothing after the drain can run until
-    /// it returns. On the Unix backend that is a blocking socket write, so
-    /// without a write deadline the drain, the close frame and the reader join
-    /// all park forever. This drives the real `websocket()` and `send_binary`
-    /// against a peer that completes the handshake and then stops reading, and
-    /// asserts the send fails within the bound instead of blocking.
-    #[test]
-    fn send_binary_is_bounded_when_the_peer_stops_reading() {
+    /// The handshake is answered so the client has a live connection, and then
+    /// the peer never reads again: the socket buffers fill and every further
+    /// byte the client sends has nowhere to go. The connection is held open so
+    /// the client blocks on its own send rather than on a closed peer. Returns
+    /// the URL, a handle that releases the server, and its thread.
+    fn stalled_peer() -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -651,14 +640,25 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap();
-            // The handshake is answered and then the peer stops reading: the
-            // socket buffers fill and every further byte the client sends has
-            // nowhere to go. The connection is held open so the client blocks
-            // on its own send rather than on a closed peer.
             let _ = stop_rx.recv();
         });
+        (format!("ws://{addr}/"), stop_tx, server)
+    }
 
-        let socket = websocket(&format!("ws://{addr}/"), &[]).unwrap();
+    /// A send to a peer that stopped reading must be bounded, not blocked.
+    ///
+    /// The streaming loop drains queued audio through `send_binary` after the
+    /// session has ended - exactly when a provider that has gone away is least
+    /// likely to still be reading - and nothing after the drain can run until
+    /// it returns. On the Unix backend that is a blocking socket write, so
+    /// without a write deadline the drain, the close frame and the reader join
+    /// all park forever. This drives the real `websocket()` and `send_binary`
+    /// against a peer that completes the handshake and then stops reading, and
+    /// asserts the send fails within the bound instead of blocking.
+    #[test]
+    fn send_binary_is_bounded_when_the_peer_stops_reading() {
+        let (url, stop_tx, server) = stalled_peer();
+        let socket = websocket(&url, &[]).unwrap();
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
         let sender = std::thread::spawn(move || {
             // Realistically sized PCM frames, as the post-session drain sends
@@ -678,6 +678,42 @@ mod tests {
                 "a stalled send must fail as a send error: {err}"
             ),
             Err(_) => panic!("send_binary blocked past its write deadline"),
+        }
+        sender.join().unwrap();
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
+
+    /// The CloseStream frame is a write on the same socket and must be bounded
+    /// by the same rule, not merely inherit a deadline from an earlier audio
+    /// frame. The streaming loop sends it right before `close()`, and a user
+    /// who cancels before the first audio packet reaches `send_text` with no
+    /// `send_binary` call behind it - so this drives the text path alone
+    /// against a peer that stopped reading.
+    #[test]
+    fn send_text_is_bounded_when_the_peer_stops_reading() {
+        let (url, stop_tx, server) = stalled_peer();
+        let socket = websocket(&url, &[]).unwrap();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            // Large enough that the socket buffer fills and the write blocks;
+            // no `send_binary` runs first, so the deadline can only come from
+            // the socket setup.
+            let frame = vec![b'x'; 16 * 1024];
+            loop {
+                if let Err(e) = socket.send_text(std::str::from_utf8(&frame).unwrap()) {
+                    let _ = outcome_tx.send(e);
+                    return;
+                }
+            }
+        });
+
+        match outcome_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(err) => assert!(
+                err.contains("websocket send failed"),
+                "a stalled send must fail as a send error: {err}"
+            ),
+            Err(_) => panic!("send_text blocked past its write deadline"),
         }
         sender.join().unwrap();
         let _ = stop_tx.send(());

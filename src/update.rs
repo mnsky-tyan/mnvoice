@@ -601,11 +601,7 @@ pub fn finish_install(install: Option<&Path>, expected_digest: Option<&str>) {
     // A digest that cannot be read off the command line is a refusal, not a
     // skip: the helper has no other source of truth, and installing unverified
     // bytes is the failure this is here to prevent.
-    if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
-        crate::windows_app::log(&format!("update helper: {e}"));
-        return;
-    }
-    if let Err(e) = finish_swap(exe) {
+    if let Err(e) = repair_interrupted_install(exe, expected_digest) {
         crate::windows_app::log(&format!("update helper: {e}"));
         return;
     }
@@ -624,10 +620,33 @@ fn swap_interrupted(exe: &Path) -> bool {
     !exe.exists() && staged_path(exe).exists()
 }
 
+/// Verify the staged image and move it in, or restore the previous image.
+///
+/// The helper reaches this only with the exe absent (`swap_interrupted` proved
+/// it), so the swap-aside image is the one runnable copy left: refusing to
+/// install unverified bytes must not also throw away the copy that still runs.
+fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Result<(), String> {
+    if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
+        restore_old_image(exe);
+        return Err(e);
+    }
+    finish_swap(exe)
+}
+
 /// Move the staged image into the exe path, which the interrupted process could
 /// not.
 fn finish_swap(exe: &Path) -> Result<(), String> {
     fs::rename(staged_path(exe), exe).map_err(|e| format!("cannot finish the install ({e})"))
+}
+
+/// Put the swap-aside image back when a refused staged file would otherwise
+/// leave the install with no exe at all.
+fn restore_old_image(exe: &Path) {
+    let old = old_path(exe);
+    if exe.exists() || !old.exists() {
+        return;
+    }
+    let _ = fs::rename(&old, exe);
 }
 
 /// Re-checks the staged file against the bytes that were verified in memory.
@@ -1857,6 +1876,85 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         fs::write(&staged, &good).unwrap();
         let err = verify_staged_digest(&staged, Some("nope")).expect_err("garbage is a refusal");
         assert!(err.contains("no usable checksum"), "unexpected error: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A helper that refuses the staged file must put the previous image back.
+    ///
+    /// The helper runs only in the interrupted state, where the exe path is
+    /// empty and the swap-aside image is the one runnable copy left. A staged
+    /// file altered in that window (the AV/EDR restore the re-hash exists for)
+    /// is refused - but deleting the last staged copy and stopping would leave
+    /// the install with no exe at all, which nothing auto-recovers. Refusing
+    /// the bytes must not throw away the copy that still runs.
+    #[test]
+    fn a_helper_refusal_restores_the_previous_image_instead_of_bricking_the_install() {
+        let good = downloaded_exe();
+        let digest = sha256::hex_digest(&good);
+        let mut tampered = good.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+
+        // A tampered staged file with the matching-digest shape, then the two
+        // unusable-digest shapes: every refusal the helper can reach.
+        for (name, on_disk, expected) in [
+            (
+                "helper-refusal-tampered",
+                tampered.as_slice(),
+                Some(digest.as_str()),
+            ),
+            ("helper-refusal-none", good.as_slice(), None),
+            (
+                "helper-refusal-garbage",
+                good.as_slice(),
+                Some("not-a-digest"),
+            ),
+        ] {
+            let (dir, exe) = install_folder(name);
+            // The interrupted state: the running image was moved aside and the
+            // process died before the staged image landed.
+            fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+            fs::write(staged_path(&exe), on_disk).unwrap();
+            assert!(
+                swap_interrupted(&exe),
+                "the interrupted state must be recognised"
+            );
+
+            let err = repair_interrupted_install(&exe, expected).unwrap_err();
+            assert!(
+                err.contains("refusing to install") || err.contains("no usable checksum"),
+                "unexpected error: {err}"
+            );
+            // The install is runnable again, and it is the previous image, not
+            // the refused bytes.
+            assert!(
+                exe.exists(),
+                "a refusal must not leave the install with no exe"
+            );
+            assert_eq!(fs::read(&exe).unwrap(), installed_exe());
+            assert!(
+                !staged_path(&exe).exists(),
+                "the refused staged file is gone"
+            );
+            assert!(!swap_interrupted(&exe), "nothing is left half-done");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The accepted path still installs the staged image and leaves no `.old`
+    /// behind, so the refusal recovery above did not change the ordinary swap.
+    #[test]
+    fn a_helper_that_accepts_the_staged_file_installs_it() {
+        let (dir, exe) = install_folder("helper-accept");
+        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        let good = downloaded_exe();
+        fs::write(staged_path(&exe), &good).unwrap();
+
+        repair_interrupted_install(&exe, Some(&sha256::hex_digest(&good))).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), good);
+        assert!(!staged_path(&exe).exists());
+        // The swap-aside image survives for the just-updated handshake.
+        assert!(dir.join("mnvoice.exe.old").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
