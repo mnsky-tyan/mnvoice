@@ -108,21 +108,26 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         return Err("No API key configured. Set API_KEY in mnvoice.env next to the mnvoice binary.".into());
     }
 
-    let mut model = raw.model;
+    let mut model = raw.model.trim().to_string();
     if model.is_empty() {
         model = match protocol {
             Protocol::Streaming => "nova-3".into(),
             Protocol::Rest => "whisper-large-v3-turbo".into(),
         };
     }
-    let mut base_url = raw.base_url;
+    // Same rule the API key uses above. The file path is already trimmed by
+    // `parse`, but an environment variable is not, and `load` hands it straight
+    // to `raw.set` - so `MODEL=" "` used to produce a Config whose model was
+    // one space and no error, which `listen_url` then spliced verbatim into the
+    // query. "Empty" now means one thing for every field.
+    let mut base_url = raw.base_url.trim().to_string();
     if base_url.is_empty() {
         base_url = match protocol {
             Protocol::Streaming => "https://api.deepgram.com".into(),
             Protocol::Rest => "https://api.groq.com".into(),
         };
     }
-    let mut language = raw.language;
+    let mut language = raw.language.trim().to_string();
     if language.is_empty() {
         language = "en".into();
     }
@@ -263,8 +268,31 @@ fn parse<F: FnMut(&str, &str)>(text: &str, mut f: F) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim().trim_matches('"').trim_matches('\'');
-            f(k.trim(), v);
+            // A trailing comment is only a comment when whitespace separates it
+            // from the value: `MODEL=nova-3  # my model` used to yield the
+            // literal string `nova-3  # my model`, which then went onto the
+            // wire verbatim. A `#` inside a value with no space before it
+            // (a fragment in a URL) is left alone.
+            let v = match v.find(" #").or_else(|| v.find("\t#")) {
+                Some(i) => &v[..i],
+                None => v,
+            };
+            // Strip one matched quote pair rather than every leading and
+            // trailing quote character: `trim_matches('"')` also rewrites a
+            // value that legitimately begins or ends with one.
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v);
+            let k = k.trim();
+            // An empty key names no field; `f` filters on the FIELDS list so
+            // this is inert today, but rejecting it here means a malformed line
+            // is a parse decision rather than an accident of a later filter.
+            if !k.is_empty() {
+                f(k, v);
+            }
         }
     }
 }
@@ -439,17 +467,6 @@ impl RawFields {
     }
 }
 
-/// The cancel key to register. `none` means disabled - a zero virtual key,
-/// which the hotkey registration reads as "register nothing" - and anything
-/// else parses as a hotkey, falling back to the documented Escape default
-/// only when the spelling matches nothing. The live tray/log path takes the
-/// pair straight from `cancel_key_with_display`, so a normal build reaches
-/// this only through its tests; it stays as the public spelling.
-#[cfg(test)]
-pub fn resolve_cancel_key(s: &str) -> (u32, u32) {
-    cancel_key_with_display(s).0
-}
-
 /// A `Config` for tests, with every field at a known-good value.
 ///
 /// One constructor for all of them: the four separate 19-field literals this
@@ -538,7 +555,15 @@ pub fn parse_color(s: &str) -> (f32, f32, f32) {
         "pink" | "hot_pink" | "magenta" => DEFAULT_ORB_COLOR,
         _ => {
             let hex = s.trim_start_matches('#');
-            if hex.len() == 6 {
+            // Six ASCII hex digits and nothing else. The length check alone is
+            // not enough: `hex.len()` is bytes, so a six-byte string of
+            // multi-byte characters passes it and the byte-offset slices below
+            // then split a character - `ORB_COLOR=€€` is exactly six bytes
+            // with boundaries at 0/3/6 and panicked at startup instead of
+            // falling back to the default. Validating the alphabet first also
+            // makes the three parses below guaranteed to succeed, so the
+            // `if let (Ok, Ok, Ok)` is a shape check rather than the real test.
+            if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 if let (Ok(r), Ok(g), Ok(b)) = (
                     u8::from_str_radix(&hex[0..2], 16),
                     u8::from_str_radix(&hex[2..4], 16),
@@ -721,10 +746,20 @@ mod tests {
         // The docs promise "none" disables the cancel key. The old fallback
         // silently re-registered Escape, so a user who asked for none still
         // lost transcripts to a stray Escape press.
-        assert_eq!(resolve_cancel_key("none"), (0, 0));
-        assert_eq!(resolve_cancel_key("NONE"), (0, 0));
-        assert_eq!(resolve_cancel_key("Escape"), (0x4000, 0x1B));
-        assert_eq!(resolve_cancel_key("unparseable"), (0x4000, 0x1B), "unknown spelling falls back to the default");
+        //
+        // Driven through `cancel_key_with_display`, the same function the live
+        // tray and log paths call, rather than a test-only `resolve_cancel_key`
+        // wrapper that existed solely to be called here. The wrapper widened
+        // the module's public surface for one test and duplicated coverage the
+        // three hotkey tests above already provide.
+        assert_eq!(cancel_key_with_display("none").0, (0, 0));
+        assert_eq!(cancel_key_with_display("NONE").0, (0, 0));
+        assert_eq!(cancel_key_with_display("Escape").0, (0x4000, 0x1B));
+        assert_eq!(
+            cancel_key_with_display("unparseable").0,
+            (0x4000, 0x1B),
+            "unknown spelling falls back to the default"
+        );
     }
 
     #[test]
@@ -795,6 +830,111 @@ mod tests {
         assert!(
             raw.keywords.contains(&"six".to_string()),
             "VOCABULARY must reach the keywords from the file"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_model_falls_back_to_the_default() {
+        // An environment variable is untrimmed and `load` hands it straight to
+        // `raw.set`, so `MODEL=" "` used to produce a Config whose model was
+        // one space and no error - and listen_url then spliced that space into
+        // the query. The emptiness rule the API key uses at the top of `derive`
+        // now applies to model, base_url and language too, so "empty" means one
+        // thing across every field.
+        //
+        // Built through RawFields rather than `load_from` on purpose: `load_from`
+        // goes through `parse`, which already trims, so it would pass with or
+        // without the fix. The environment path is the one that does not.
+        let mut raw = RawFields::new();
+        raw.set(Field::ApiKey, "API_KEY", "k", false);
+        raw.set(Field::Model, "MODEL", "   ", false);
+        raw.set(Field::Language, "LANGUAGE", "\t", false);
+        raw.set(Field::BaseUrl, "BASE_URL", "  ", false);
+        let cfg = derive(raw).expect("a whitespace value is not an error, it is a default");
+        assert_eq!(cfg.model, "nova-3", "a whitespace model falls back");
+        assert_eq!(cfg.language, "en", "a whitespace language falls back");
+        assert_eq!(
+            cfg.base_url, "https://api.deepgram.com",
+            "a whitespace base URL falls back"
+        );
+        // A real value survives the same trim, and only the padding goes.
+        let mut raw = RawFields::new();
+        raw.set(Field::ApiKey, "API_KEY", "k", false);
+        raw.set(Field::Model, "MODEL", "  nova-3  ", false);
+        let cfg = derive(raw).expect("a padded value derives");
+        assert_eq!(cfg.model, "nova-3", "a padded real value is trimmed");
+    }
+
+    #[test]
+    fn an_inline_comment_is_not_part_of_the_value() {
+        // The parser had no notion of a malformed line, so
+        // `MODEL=nova-3  # my model` yielded the literal string
+        // `nova-3  # my model`, which then went onto the wire verbatim. A `#`
+        // preceded by whitespace is a comment; one inside a value with no space
+        // before it (a URL fragment) is left alone.
+        let cfg = load_from("API_KEY=k\nMODEL=nova-3  # my model");
+        assert_eq!(cfg.model, "nova-3", "a trailing comment is stripped");
+        let cfg = load_from("API_KEY=k\nBASE_URL=https://api.deepgram.com/v1#frag");
+        assert_eq!(
+            cfg.base_url, "https://api.deepgram.com/v1#frag",
+            "a # with no preceding whitespace is part of the value"
+        );
+    }
+
+    #[test]
+    fn only_one_matched_quote_pair_is_stripped() {
+        // `trim_matches('"').trim_matches('\'')` stripped every leading and
+        // trailing quote character, so a value that legitimately begins or ends
+        // with one was silently altered. One matched pair is the whole rule.
+        let cfg = load_from("API_KEY=\"quoted-key\"");
+        assert_eq!(cfg.api_key, "quoted-key", "a matched pair is stripped");
+        let cfg = load_from("API_KEY='single'");
+        assert_eq!(cfg.api_key, "single", "a matched single-quote pair too");
+        let cfg = load_from("API_KEY=\"unclosed");
+        assert_eq!(
+            cfg.api_key, "\"unclosed",
+            "an unmatched quote is data, not a delimiter"
+        );
+        let cfg = load_from("API_KEY=\"\"doublequoted\"\"");
+        assert_eq!(
+            cfg.api_key, "\"doublequoted\"",
+            "only the outermost pair is stripped"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_hex_color_falls_back_instead_of_panicking() {
+        // The hex branch gated on `hex.len() == 6`, which is BYTES, and then
+        // sliced `&hex[0..2]` at byte offsets. `€€` is exactly six bytes with
+        // boundaries at 0/3/6, so the slice split a character and panicked -
+        // at startup, because `derive` calls parse_color unconditionally.
+        // Verified by measurement before the fix: the panic message was
+        // "end byte index 2 is not a char boundary; it is inside '€'".
+        // Both of these must fall back to the documented default.
+        assert_eq!(parse_color("€€"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("ééé"), DEFAULT_ORB_COLOR);
+        // The ASCII cases still work, including the ones that used to take the
+        // safe path only by accident.
+        assert_eq!(parse_color("zzzzzz"), DEFAULT_ORB_COLOR);
+        assert_eq!(parse_color("ff0080"), (1.0, 0.0, 128.0 / 255.0));
+        assert_eq!(parse_color("#ff0080"), (1.0, 0.0, 128.0 / 255.0));
+    }
+
+    /// A line with no key names no field. `f` filters on the FIELDS list, so an
+    /// empty key was already inert - but rejecting it in the parser makes it a
+    /// parse decision rather than something a later filter happened to catch,
+    /// and this pins that the callback is never handed one.
+    #[test]
+    fn a_line_with_no_key_names_no_field() {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        parse(
+            "=orphan\n   = spaced orphan\nAPI_KEY=k\n=another\n",
+            |k, v| seen.push((k.to_string(), v.to_string())),
+        );
+        assert_eq!(
+            seen,
+            vec![("API_KEY".to_string(), "k".to_string())],
+            "only the line that names a field may reach the callback"
         );
     }
 

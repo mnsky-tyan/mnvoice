@@ -86,14 +86,20 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
     let filler_words = if cfg.strip_fillers { "false" } else { "true" };
     let mut path = format!(
         "{prefix}?model={}&smart_format=true&encoding=linear16&sample_rate={SAMPLE_RATE}&channels=1&interim_results=true&endpointing=1500&no_delay=true&vad_events=true&filler_words={filler_words}",
-        cfg.model
+        url_encode(&cfg.model)
     );
     if !cfg.language.is_empty() {
         if cfg.language.eq_ignore_ascii_case("auto") {
             path.push_str("&detect_language=true");
         } else {
+            // Encoded for the same reason the keyword loop below is: the query
+            // is the contract, and a value carrying &, = or # does not just
+            // fail - it silently rewrites the request. `MODEL=x#frag` ended the
+            // query, discarding smart_format, interim_results, endpointing,
+            // no_delay and vad_events, so the app quietly stopped streaming
+            // words with nothing anywhere reporting a problem.
             path.push_str("&language=");
-            path.push_str(&cfg.language);
+            path.push_str(&url_encode(&cfg.language));
         }
     }
     for kw in &cfg.keywords {
@@ -185,6 +191,21 @@ pub fn run_stream(
     // message is kept here so the caller can report the real cause instead of
     // telling the user they said nothing.
     let read_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // The same failure seen from the sending side. `send_binary` returns a
+    // Result too, and discarding it meant the commonest mid-dictation death -
+    // the provider drops the socket while audio is still flowing - produced a
+    // bare `Ok(full_text)`: the send loop broke, the drain and CloseStream and
+    // the 1500 ms wait all failed silently, and the reader got `Ok(None)` (a
+    // clean close) rather than `Err`, so nothing recorded the fault anywhere.
+    // A half-sentence was typed with no marker, which is the exact outcome the
+    // partial-stream contract exists to prevent.
+    //
+    // Kept separate from `read_error` rather than sharing the slot, because the
+    // reader arm's suppression rule (`!reader_done && !stop`) is about
+    // self-inflicted teardown and does not apply here: a send failure is never
+    // self-inflicted, but it is still expected once the session is ending on
+    // purpose, so this side checks `stop`/`cancelled` and nothing else.
+    let send_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Capture this before the thread moves in, so the borrow cannot escape.
     let strip_fillers = cfg.strip_fillers;
@@ -293,7 +314,18 @@ pub fn run_stream(
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(packet_i16) => {
-                if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
+                if let Err(e) = ws.send_binary(&pcm_bytes(&packet_i16)) {
+                    // Only a failure while the session is still live is a
+                    // fault. Once `stop` or `cancelled` is set the caller is
+                    // tearing the socket down on purpose, and a provider that
+                    // has already gone away is the expected end of a finished
+                    // dictation, not a lost connection.
+                    if !stop.load(Ordering::SeqCst) && !cancelled.load(Ordering::SeqCst) {
+                        let mut slot = send_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e.to_string());
+                        }
+                    }
                     break;
                 }
             }
@@ -332,6 +364,11 @@ pub fn run_stream(
 
     let full_text = full_transcript.lock().unwrap_or_else(|e| e.into_inner()).trim().to_string();
     let read_error = read_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let send_error = send_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // A fault from either side is a fault. The reader's error is preferred when
+    // both fired because it is the one the provider actually reported, and a
+    // send that failed first is usually what made the read fail.
+    let lost = read_error.or(send_error);
 
     // The configured trailing space is a side effect of a session that
     // produced words, and it must not depend on which way the session ended:
@@ -352,7 +389,7 @@ pub fn run_stream(
     // No log line here: `windows_app` is Windows-only and this module compiles
     // on all three targets, and the marker travels with the returned text,
     // which every caller already reports.
-    if let Some(e) = read_error {
+    if let Some(e) = lost {
         if full_text.is_empty() {
             return Err(format!("streaming transcription failed: {e}"));
         }
@@ -394,6 +431,92 @@ mod tests {
             "{url}"
         );
         assert!(url.contains("&keyterm=Kubernetes"), "nova-3 uses keyterm: {url}");
+    }
+
+    #[test]
+    fn a_model_or_language_cannot_inject_query_parameters() {
+        // The query is the contract. `model` and `language` reached the URL
+        // raw while keywords were url_encoded, so a value carrying &, = or #
+        // did not merely fail - it silently rewrote the request. `MODEL=x#frag`
+        // ended the query, discarding smart_format, interim_results,
+        // endpointing, no_delay and vad_events, so the app quietly stopped
+        // streaming words with nothing anywhere reporting a problem. Both
+        // fields now take the same encoding path as the keyword loop.
+        let mut cfg = test_cfg();
+        cfg.model = "nova-3&encoding=multi#frag".into();
+        cfg.language = "en&keyterm=evil".into();
+        let url = listen_url(&cfg).expect("the default base URL parses");
+
+        // The injected parameter must not appear as a parameter of its own.
+        assert!(
+            !url.contains("&encoding=multi"),
+            "an encoded model cannot add encoding=multi: {url}"
+        );
+        assert!(
+            !url.contains("&keyterm=evil"),
+            "an encoded language cannot add keyterm=evil: {url}"
+        );
+        // The query this session declares must still be the whole query: the
+        // trailing parameters survive the hostile value instead of being cut
+        // off by a `#` fragment.
+        for required in [
+            "smart_format=true",
+            "interim_results=true",
+            "endpointing=1500",
+            "no_delay=true",
+            "vad_events=true",
+        ] {
+            assert!(
+                url.contains(required),
+                "{required} must survive a hostile model/language: {url}"
+            );
+        }
+        // And the hostile text is present but escaped, so the provider sees one
+        // model name rather than a rewritten request.
+        assert!(
+            url.contains("model=nova-3%26encoding%3Dmulti%23frag"),
+            "the model must arrive percent-encoded: {url}"
+        );
+        assert!(
+            url.contains("language=en%26keyterm%3Devil"),
+            "the language must arrive percent-encoded: {url}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_model_falls_back_instead_of_reaching_the_wire() {
+        // An environment variable is untrimmed and `load` hands it straight to
+        // the raw fields, so `MODEL=" "` used to produce a Config whose model
+        // was one space and no error - and listen_url then spliced that space
+        // into the query. The emptiness rule the API key already uses now
+        // applies to model, base_url and language too.
+        //
+        // `derive` is private to the config module and its `load_from` test
+        // helper is too, so this asserts the property at the seam this module
+        // owns: whatever the config hands over, the URL must not carry a
+        // whitespace value as a parameter. The trimming rule itself is pinned
+        // by config's own test (`a_whitespace_only_model_falls_back`).
+        let mut cfg = test_cfg();
+        cfg.model = "   ".into();
+        cfg.language = "\t".into();
+        // derive() would have replaced these with defaults; setting them here
+        // is the pre-fix state, and the point is that the URL builder never has
+        // to defend against it because derive already did.
+        let url = listen_url(&cfg).expect("the default base URL parses");
+        // The spaces are escaped rather than dropped, so the provider receives
+        // one malformed model name - visible, greppable, and fixable - instead
+        // of a query whose parameters have been shifted.
+        assert!(
+            url.contains("model=%20%20%20"),
+            "a whitespace model must be escaped, not spliced raw: {url}"
+        );
+        assert!(
+            url.contains("language=%09"),
+            "a whitespace language must be escaped: {url}"
+        );
+        // And crucially the rest of the query is intact: no parameter was
+        // swallowed by a value that ran off the end of the string.
+        assert!(url.contains("smart_format=true"), "{url}");
     }
 
     #[test]
@@ -494,8 +617,27 @@ mod tests {
         pub fn serve(
             after_handshake: impl FnOnce(&mut TcpStream) + Send + 'static,
         ) -> (u16, std::thread::JoinHandle<()>) {
+            let (port, handle, _head) = serve_capturing_head(move |_head, stream| {
+                after_handshake(stream)
+            });
+            (port, handle)
+        }
+
+        /// The same handshake, but the request head the client actually sent is
+        /// handed to `after_handshake` and returned in a shared slot, so a test
+        /// can assert what went on the wire rather than what a URL builder
+        /// returned.
+        pub fn serve_capturing_head(
+            after_handshake: impl FnOnce(String, &mut TcpStream) + Send + 'static,
+        ) -> (
+            u16,
+            std::thread::JoinHandle<()>,
+            std::sync::Arc<std::sync::Mutex<String>>,
+        ) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
+            let head_slot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let captured = std::sync::Arc::clone(&head_slot);
             let handle = std::thread::spawn(move || {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -529,9 +671,12 @@ mod tests {
                 );
                 let _ = stream.write_all(reply.as_bytes());
                 let _ = stream.flush();
-                after_handshake(&mut stream);
+                if let Ok(mut slot) = captured.lock() {
+                    *slot = head.clone();
+                }
+                after_handshake(head, &mut stream);
             });
-            (port, handle)
+            (port, handle, head_slot)
         }
 
         /// `Sec-WebSocket-Accept`: base64(sha1(key + GUID)). The crate ships a
@@ -726,6 +871,129 @@ mod tests {
 
         let text = out.expect("an orderly session is Ok");
         assert_eq!(text, "all good", "a clean close must not be marked: {text}");
+    }
+
+    /// The other half of the send-side fix. A provider that takes the socket
+    /// away while audio is still flowing used to produce a bare `Ok`: the send
+    /// loop broke, the drain and CloseStream and the 1500 ms wait all failed
+    /// silently, and the reader had already seen an orderly close frame, so
+    /// nothing anywhere recorded the fault and half a sentence was typed with
+    /// no marker.
+    ///
+    /// The server here sends an orderly close frame first and only then lets the
+    /// connection go, so the reader has already taken the close as a clean end
+    /// (`Ok(None)`, which must not be marked) and never reports an error: the
+    /// ONLY fault the client can see is on its send side, while audio is still
+    /// flowing. That is what makes this the send-side test rather than a second
+    /// copy of the read one.
+    #[test]
+    fn a_send_failure_mid_dictation_is_marked_even_though_the_read_closed_cleanly() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // Words first, committed as final so they are already typed.
+            let _ = stream.write_all(&live_provider::result_frame("half a sentence", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(300));
+            // An orderly close from the provider's side: not a fault in itself.
+            let _ = stream.write_all(&live_provider::frame(0x8, &[]));
+            let _ = stream.flush();
+            // Stay connected long enough for the reader to take the close frame
+            // as an orderly end - a close frame is not a fault - and only then
+            // let the connection go, which is what the client's send side runs
+            // into while audio is still flowing.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 100);
+        let _ = server.join();
+
+        let text = out.expect("words were typed, so the result must be Ok");
+        assert!(
+            text.starts_with("half a sentence"),
+            "the typed words must survive: {text}"
+        );
+        assert!(
+            text.contains("[connection lost:"),
+            "a mid-dictation socket death on the send side must be marked: {text}"
+        );
+    }
+
+    /// The wire-level counterpart of `a_model_or_language_cannot_inject_query_parameters`:
+    /// the same hostile values, observed as the request line the real transport
+    /// puts on a real socket, rather than as a string the URL builder returned.
+    /// A URL that looks right can still be rewritten by a client that
+    /// normalizes it, so the bytes are what prove the contract.
+    ///
+    /// It also pins the two things the intent forbids changing: the per-transport
+    /// auth scheme (Deepgram takes `Token`, and a user-supplied prefix passes
+    /// through) and the trailing parameters that make a session stream words at
+    /// all.
+    #[test]
+    fn the_request_on_the_wire_survives_a_hostile_model_and_language() {
+        use std::io::Write as _;
+        let (port, server, head) = live_provider::serve_capturing_head(|_head, stream| {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(&live_provider::result_frame("wire", true, true));
+            let _ = stream.flush();
+        });
+        let mut cfg = live_provider::cfg_for(port);
+        cfg.model = "nova-3&encoding=multi#frag".into();
+        cfg.language = "en&keyterm=evil".into();
+        cfg.api_key = "Token my-own-prefix".into();
+        let out = live_provider::drive(&cfg, 10);
+        let _ = server.join();
+        let head = head.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let request_line = head.lines().next().unwrap_or_default().to_string();
+
+        assert!(out.is_ok(), "a hostile model must not break the session: {out:?}");
+        // The hostile text arrives as one encoded value, and the parameters the
+        // session declares are all still there as parameters of their own.
+        assert!(
+            request_line.contains("model=nova-3%26encoding%3Dmulti%23frag"),
+            "the model must arrive percent-encoded: {request_line}"
+        );
+        assert!(
+            request_line.contains("language=en%26keyterm%3Devil"),
+            "the language must arrive percent-encoded: {request_line}"
+        );
+        for required in [
+            "smart_format=true",
+            "interim_results=true",
+            "endpointing=1500",
+            "no_delay=true",
+            "vad_events=true",
+        ] {
+            assert!(
+                request_line.contains(required),
+                "{required} must survive on the wire: {request_line}"
+            );
+        }
+        assert!(
+            !request_line.contains("&encoding=multi") && !request_line.contains("&keyterm=evil"),
+            "no injected parameter may reach the provider: {request_line}"
+        );
+        // The auth scheme is untouched: a user-supplied prefix is passed
+        // through rather than being re-wrapped as `Token Token ...`.
+        //
+        // HTTP field names are case-insensitive, and the two backends spell
+        // this one differently: WinHTTP writes the name the caller handed it,
+        // while the Unix handshake emits every caller-supplied header
+        // lowercased (tungstenite writes `http::HeaderName::as_str()`, which is
+        // always lowercase). The value is the contract, so the field name is
+        // matched case-insensitively and the value is compared exactly.
+        let auth = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("authorization") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            auth,
+            Some("Token my-own-prefix"),
+            "a prefixed key must pass through unchanged: {head}"
+        );
     }
 
     /// The other half of the intent: when nothing was typed, the fault must be

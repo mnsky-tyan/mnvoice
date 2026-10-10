@@ -45,6 +45,27 @@ pub mod linux_impl;
 #[cfg(target_os = "macos")]
 pub mod macos_impl;
 
+/// A tag's version part and its platform suffix, split at the FIRST hyphen:
+/// "v0.1.15-win" -> ("0.1.15", Some("win")), "v0.1.15" -> ("0.1.15", None).
+///
+/// This is the single definition of where a version ends and a platform suffix
+/// begins. `version_of_tag` below and `update::tag_is_ours` are both expressed
+/// in terms of it: the rule used to be spelled twice - once with
+/// `split('-').next()` and once with `split_once('-')` - and nothing tied the
+/// two together, so a change to one (accepting a tag without the leading `v`,
+/// or a version containing a hyphen) would have made the updater classify a tag
+/// by a different split than the one it compares versions by. The publishing
+/// side keeps the same rule as a regex in
+/// `.github/actions/verify-release-tag/action.yml`, which is the last word
+/// among the three.
+pub fn tag_parts(tag: &str) -> (&str, Option<&str>) {
+    let bare = tag.strip_prefix('v').unwrap_or(tag);
+    match bare.split_once('-') {
+        Some((version, suffix)) => (version, Some(suffix)),
+        None => (bare, None),
+    }
+}
+
 /// The version a tag names, with the leading `v` and the platform suffix
 /// removed: "v0.1.15-win" -> "0.1.15". This is the consuming side's
 /// definition of what a tag's version is; the publishing side keeps the same
@@ -54,8 +75,7 @@ pub mod macos_impl;
 /// suffix begins. Lives in the platform seam because `update` is Windows-only
 /// but the CLI prints the version on every platform.
 pub fn version_of_tag(tag: &str) -> String {
-    let bare = tag.strip_prefix('v').unwrap_or(tag);
-    bare.split('-').next().unwrap_or(bare).to_string()
+    tag_parts(tag).0.to_string()
 }
 
 /// The version this build reports: the release tag baked by build.rs

@@ -197,11 +197,43 @@ fn kill_running_instances() {
         .unwrap_or("mnvoice.exe")
         .to_string();
     let self_pid = unsafe { GetCurrentProcessId() };
-    let _ = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
+    let reported = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
         .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
         .creation_flags(0x0800_0000)
-        .status();
-    log(&format!("restart: terminated other {name} instances"));
+        .status()
+        .map(|s| s.code());
+    // Report what the scheduler actually said. `let _ = ...status()` dropped
+    // the ExitStatus, so this line was written whether taskkill ran at all, was
+    // filtered to zero victims, or failed - a restart log claiming a teardown
+    // that never happened is worse than no log, because the next thing on
+    // screen is a hotkey-registration failure with no cause above it.
+    log(&restart_log_line(&name, reported));
+}
+
+/// What the restart teardown writes to the log, given what the scheduler
+/// actually reported: `Ok(Some(0))` is a taskkill that ran and succeeded,
+/// `Ok(Some(n))` one that ran and reported `n`, `Ok(None)` one that ended with
+/// no code at all, and `Err` one that could not be spawned.
+///
+/// Pure on purpose. The two failure arms cannot be reached through the real
+/// command without a taskkill that genuinely fails, and with
+/// `/FI "PID ne <pid>"` present a no-victim restart exits 0 - so the only
+/// benign way to a failure is a victim the caller cannot terminate, an
+/// elevated or protected process. Producing one takes an interactive UAC
+/// consent, which stalls an automated run indefinitely and leaves a prompt on
+/// the secure desktop that a non-elevated process cannot dismiss. Classifying
+/// a value means the arms are pinned by a unit test with no process spawned.
+fn restart_log_line(name: &str, reported: std::io::Result<Option<i32>>) -> String {
+    match reported {
+        Ok(Some(0)) => format!("restart: terminated other {name} instances"),
+        // taskkill exits non-zero both for "no process matched" (the ordinary
+        // first-restart case, filtered out by /FI) and for a real failure.
+        Ok(code) => format!(
+            "restart: taskkill reported {} for other {name} instances",
+            code.unwrap_or(-1)
+        ),
+        Err(e) => format!("restart: could not run taskkill ({e})"),
+    }
 }
 
 /// Where the process starts, one step per line: finish a pending update
@@ -569,8 +601,24 @@ fn tray_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
 /// NUL-terminated, so clamping is the contract, not an afterthought.
 fn fill_wide(dst: &mut [u16], text: &str) {
     let src = wide(text);
-    let n = src.len().min(dst.len());
+    // Reserve the last slot for the terminator. Copying dst.len() elements when
+    // the source is longer leaves the buffer full of data with no NUL anywhere
+    // in it, and the shell reads these fields NUL-terminated - so a truncated
+    // copy would run off the end of szTip looking for the end of the string.
+    // Nothing fed to these fields approaches their size today (szTip is 128,
+    // szInfo 256), so this is a cliff removed rather than a bug fixed, but the
+    // contract the function claims is now upheld on the truncation path too.
+    //
+    // A zero-length buffer is the one shape with no last slot to reserve: the
+    // terminator write below would index past its end, so it is skipped rather
+    // than clamped. No caller passes one, and the copy is a no-op either way.
+    if dst.is_empty() {
+        return;
+    }
+    let cap = dst.len() - 1;
+    let n = src.len().min(cap);
     dst[..n].copy_from_slice(&src[..n]);
+    dst[n] = 0;
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -705,10 +753,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // Toggle the logon task. The Run key is cleared as a side
                         // effect, and the state is re-read on next open, so the
                         // checkbox can never drift out of sync with reality.
-                        let enable = !autostart_enabled();
-                        if let Err(e) = set_autostart(enable) {
-                            log(&format!("autostart toggle failed: {e}"));
-                        }
+                        //
+                        // Runs on a worker thread, like check_for_updates_async
+                        // and migrate_autostart: this body spawns schtasks and,
+                        // whenever no task is registered, up to five reg.exe
+                        // calls, each an unbounded Command::status()/.output()
+                        // wait - std has no timeout. Doing that on the UI thread
+                        // meant doing it inside TrackPopupMenu's modal loop,
+                        // where nothing else is serviced: the tray window showed
+                        // Not Responding, the balloon stopped updating, and a
+                        // queued WM_APP_WORKER teardown was delayed by however
+                        // long the registry took. On an AV-scanned or
+                        // domain-locked machine that is a visible freeze from a
+                        // single menu click.
+                        thread::spawn(|| {
+                            let enable = !autostart_enabled();
+                            if let Err(e) = set_autostart(enable) {
+                                log(&format!("autostart toggle failed: {e}"));
+                            }
+                        });
                     }
                     IDM_RESTART => relaunch_for_restart(),
                     IDM_UPDATE => check_for_updates_async(false),
@@ -913,10 +976,27 @@ fn worker(
             // this arm used to have with it. A cancelled session is the same
             // case - dictate_rest refuses to type it, and there is no reason
             // to upload it either.
-            let capture_err = capture_done.as_ref().and_then(|done| match done.recv() {
-                Ok(Err(e)) => Some(e),
-                _ => None,
-            });
+            //
+            // Three shapes reach here and they are not the same outcome. A
+            // clean `Ok(())` with a short buffer really is no speech. But
+            // `capture_done == None` means `capture_to_channel` returned
+            // `Err` (the engine was gone before the thread started) and
+            // `Err(RecvError)` means the audio worker panicked before its
+            // `send` - both of those are a broken microphone, and reporting
+            // them as NO_SPEECH tells a user whose Windows Audio service just
+            // stopped that they said nothing, which is exactly the misleading
+            // diagnostic the four specific init_wasapi messages exist to
+            // prevent. Only the third shape is silence.
+            let capture_err = match &capture_done {
+                None => Some("capture failed: the audio engine is unavailable".to_string()),
+                Some(done) => match done.recv() {
+                    Ok(Err(e)) => Some(e),
+                    // The worker dropped its sender without sending, which for
+                    // this channel means it did not reach its own report.
+                    Err(_) => Some("capture failed: the audio worker stopped".to_string()),
+                    Ok(Ok(())) => None,
+                },
+            };
             match capture_err {
                 Some(e) => (false, e),
                 None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
@@ -992,6 +1072,13 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = SetForegroundWindow(hwnd);
     let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    // The popup is gone by the time TrackPopupMenu returns, so the menu it
+    // owns is freed here rather than at process exit. Every other resource in
+    // this crate that the shell hands out is released on the same path that
+    // used it - Orb::drop destroys its DC, bitmap and window - and a USER32
+    // menu is no different. One leaked handle per right-click, for the life of
+    // the process, was the only leak of its kind here.
+    let _ = DestroyMenu(menu);
 }
 
 const AUTOSTART_TASK: &str = r"\mnvoice";
@@ -1304,7 +1391,11 @@ fn set_autostart(enable: bool) -> Result<(), String> {
     } else {
         // The delete's own exit code is authority: a zero already means the
         // task is gone, so the scheduler is only asked when it says otherwise.
-        status.success() || delete_left_task_gone(status.success(), task_state())
+        // The helper below takes `delete_ok` only to be callable from a test
+        // that wants to exercise the failed-delete branch; the live call site
+        // is inside this `else`, where a zero already short-circuited, so the
+        // flag is always false here.
+        status.success() || delete_left_task_gone(false, task_state())
     };
     if !in_place {
         // Whatever carries the autostart until the scheduler holds the one
@@ -1400,6 +1491,21 @@ pub(crate) fn check_for_updates_async(quiet: bool) {
         }
 
         // Never install while the user is speaking or a transcript is in flight.
+        //
+        // This is the pre-download check, and it is deliberately NOT the only
+        // one: `install_and_relaunch` takes `session_active` and passes it to
+        // `stage_and_swap` as its `busy` closure, which runs after the download
+        // and the checksum verify, immediately before the two renames. That inner
+        // check is the one that can see a session that began while the bytes
+        // were in flight, because it is the one evaluated at the moment of the
+        // swap - which is why `update::tests::the_idle_gate_is_read_after_the
+        // _download_and_stops_the_swap` drives it there rather than here.
+        //
+        // A second copy of the same test used to sit below, before the download,
+        // where nothing between it and this one can change state. The review
+        // round flagged it as redundant and it was removed: two copies of one
+        // test is how the two copies drift apart, and this one only catches the
+        // case where a session is already running when the check happens.
         let state = session_state();
         if state != State::Idle {
             log(&format!(
@@ -1483,6 +1589,44 @@ fn relaunch_for_restart() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell reads szTip/szInfo/szInfoTitle NUL-terminated, so a copy that
+    /// fills the whole buffer leaves no terminator anywhere in it and the read
+    /// runs off the end of the field. Nothing fed to these fields approaches
+    /// their size today (szTip 128, szInfo 256, szInfoTitle 64), so this is a
+    /// cliff removed rather than a bug fixed - but the contract the function
+    /// claims is now upheld on the truncation path too, and this pins it.
+    #[test]
+    fn a_truncated_wide_copy_still_ends_with_a_terminator() {
+        // A destination eight slots wide and a source longer than that.
+        let mut dst = [0xAAAAu16; 8];
+        fill_wide(&mut dst, "abcdefghij");
+        // The first seven slots carry the text, and the eighth is the NUL the
+        // shell stops on - not the eighth character.
+        assert_eq!(&dst[..7], &wide("abcdefg")[..7]);
+        assert_eq!(dst[7], 0, "the last slot must be the terminator: {dst:?}");
+        assert!(
+            !dst.contains(&0xAAAA),
+            "every slot must be written, not just the ones copied: {dst:?}"
+        );
+
+        // A text that fits still terminates inside the buffer.
+        let mut dst = [0xAAAAu16; 8];
+        fill_wide(&mut dst, "short");
+        assert_eq!(&dst[..5], &wide("short")[..5]);
+        assert_eq!(dst[5], 0, "the text's own terminator survives");
+
+        // A text exactly as long as the usable width keeps its terminator in
+        // the last slot, which is the boundary the reservation exists for.
+        let mut dst = [0xAAAAu16; 8];
+        fill_wide(&mut dst, "abcdefg");
+        assert_eq!(&dst[..7], &wide("abcdefg")[..7]);
+        assert_eq!(dst[7], 0, "a text of exactly cap-1 still terminates");
+
+        // An empty buffer is not a panic: nothing is written at all.
+        let mut dst: [u16; 0] = [];
+        fill_wide(&mut dst, "anything");
+    }
 
     #[test]
     fn the_query_arguments_do_not_ask_for_a_format() {
@@ -1715,6 +1859,44 @@ mod tests {
         });
         assert!(joiner.join().is_err(), "the probe panicked as intended");
         let _mutation = autostart_lock();
+    }
+
+    /// The restart teardown's three arms, driven from the value the scheduler
+    /// returns rather than from a real taskkill.
+    ///
+    /// This is the only way to reach the two failure arms: through the real
+    /// command a failure needs a victim the caller cannot terminate, and
+    /// producing one takes an interactive UAC consent that stalls an automated
+    /// run. See `restart_log_line`.
+    #[test]
+    fn the_restart_report_names_what_the_scheduler_actually_said() {
+        // A teardown that worked, and the ordinary first restart where /FI
+        // filtered every victim out: taskkill exits 0 for both.
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Ok(Some(0))),
+            "restart: terminated other mnvoice.exe instances"
+        );
+        // A non-zero exit is reported as the number the scheduler gave. A
+        // restart log claiming a teardown that never happened is worse than no
+        // log: the next line is a hotkey-registration failure with no cause
+        // above it.
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Ok(Some(5))),
+            "restart: taskkill reported 5 for other mnvoice.exe instances"
+        );
+        // A status carrying no code at all reads as -1 rather than claiming
+        // success or panicking.
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Ok(None)),
+            "restart: taskkill reported -1 for other mnvoice.exe instances"
+        );
+        // A taskkill that could not be spawned is its own answer, and it names
+        // the reason rather than a code.
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "taskkill.exe missing");
+        assert_eq!(
+            restart_log_line("mnvoice.exe", Err(err)),
+            "restart: could not run taskkill (taskkill.exe missing)"
+        );
     }
 
     #[test]
