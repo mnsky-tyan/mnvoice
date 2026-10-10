@@ -493,18 +493,6 @@ mod tests {
         );
     }
 
-    /// The whitespace-only model is pinned here too, but as an *end-to-end*
-    /// property rather than a re-assertion of the URL builder.
-    ///
-    /// The old version of this test asserted `url.contains("model=%20%20%20")`,
-    /// which is what an *escaped* model looks like - so it was satisfied by
-    /// `url_encode` alone and passed with the escaping reverted, while its own
-    /// comment said the point was that the builder never has to defend because
-    /// `derive` already did. What it actually tested was the builder defending.
-    /// The trimming rule itself is pinned by config's
-    /// `a_whitespace_only_model_falls_back`, and the escaping that survives is
-    /// pinned by `the_request_on_the_wire_survives_a_hostile_model_and_language`
-    /// against bytes written to a real socket, so neither needed a second copy.
     #[test]
     fn an_ipv6_base_url_is_rebracketed_in_the_listen_url() {
         // parse_base_url yields the bare literal, which is what WinHTTP wants,

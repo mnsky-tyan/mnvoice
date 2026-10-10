@@ -576,17 +576,9 @@ mod tests {
         }
     }
 
-    /// The two response ceilings must be different ceilings, not one shared
-    /// number: a transcript is a few kilobytes and a release executable is
-    /// several megabytes, and the intent requires the asset path to keep
-    /// headroom the transcript path does not. This drives the real Windows
-    /// transport (`transcribe` -> `WinHttpTransport::post` -> the capped
-    /// `read_body`) against a loopback server that answers with more bytes than
-    /// `MAX_TRANSCRIPT_BYTES`, and asserts the body really was clipped there.
-    ///
-    /// It is deliberately not a test of truncation *silently* happening - that
-    /// behaviour was reviewed and declined - but of the two bounds being
-    /// distinct, which is what the split was for.
+    /// A model, language or keyterm containing a line break or the multipart
+    /// boundary is refused rather than written into the body, where it would end
+    /// its part early and let the following bytes parse as headers.
     #[test]
     fn a_value_that_would_break_out_of_its_part_is_refused() {
         // Three user-supplied values go into the body verbatim and the boundary
@@ -613,7 +605,8 @@ mod tests {
                 1 => cfg.language = "en\nContent-Disposition: form-data".into(),
                 _ => cfg.keywords = vec!["kubernetes".into(), "dock\r\ner".into()],
             }
-            let err = multipart_body(&cfg, b"RIFFxxxx").expect_err("{label} must be refused");
+            let err =
+                multipart_body(&cfg, b"RIFFxxxx").expect_err(&format!("{label} must be refused"));
             assert!(
                 err.to_ascii_uppercase().contains(&label.to_ascii_uppercase()),
                 "the message must name the field: {err}"
@@ -639,6 +632,17 @@ mod tests {
         assert!(text.ends_with(&format!("--{BOUNDARY}--\r\n")), "{text}");
     }
 
+    /// The two response ceilings must be different ceilings, not one shared
+    /// number: a transcript is a few kilobytes and a release executable is
+    /// several megabytes, and the intent requires the asset path to keep
+    /// headroom the transcript path does not. This drives the real Windows
+    /// transport (`transcribe` -> `WinHttpTransport::post` -> the capped
+    /// `read_body`) against a loopback server that answers with more bytes than
+    /// `MAX_TRANSCRIPT_BYTES`, and asserts the body really was clipped there.
+    ///
+    /// It is deliberately not a test of truncation *silently* happening - that
+    /// behaviour was reviewed and declined - but of the two bounds being
+    /// distinct, which is what the split was for.
     #[test]
     fn a_transcript_response_is_bounded_by_the_transcript_ceiling() {
         use std::io::{Read as _, Write as _};

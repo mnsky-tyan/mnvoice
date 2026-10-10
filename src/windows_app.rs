@@ -951,6 +951,28 @@ fn cancel(app: &mut App) {
     log("recording cancelled");
 }
 
+/// The capture report classified in every shape it can arrive in.
+///
+/// A clean `Ok(())` with a short buffer is silence. `None` means
+/// `capture_to_channel` returned `Err` (the engine was gone before the thread
+/// started) and `Err(RecvError)` means the audio worker dropped its sender
+/// without reporting - both are a broken microphone, and reporting either as
+/// `NO_SPEECH` tells a user whose Windows Audio service just stopped that they
+/// said nothing. The REST and streaming arms share this classifier so the two
+/// cannot drift apart again.
+fn capture_fault(done: Option<&std::sync::mpsc::Receiver<Result<(), String>>>) -> Option<String> {
+    match done {
+        None => Some("capture failed: the audio engine is unavailable".to_string()),
+        Some(done) => match done.recv() {
+            Ok(Err(e)) => Some(e),
+            // The worker dropped its sender without sending, which for this
+            // channel means it did not reach its own report.
+            Err(_) => Some("capture failed: the audio worker stopped".to_string()),
+            Ok(Ok(())) => None,
+        },
+    }
+}
+
 fn worker(
     session_id: usize,
     stop: Arc<AtomicBool>,
@@ -1009,26 +1031,9 @@ fn worker(
             // case - dictate_rest refuses to type it, and there is no reason
             // to upload it either.
             //
-            // Three shapes reach here and they are not the same outcome. A
-            // clean `Ok(())` with a short buffer really is no speech. But
-            // `capture_done == None` means `capture_to_channel` returned
-            // `Err` (the engine was gone before the thread started) and
-            // `Err(RecvError)` means the audio worker panicked before its
-            // `send` - both of those are a broken microphone, and reporting
-            // them as NO_SPEECH tells a user whose Windows Audio service just
-            // stopped that they said nothing, which is exactly the misleading
-            // diagnostic the four specific init_wasapi messages exist to
-            // prevent. Only the third shape is silence.
-            let capture_err = match &capture_done {
-                None => Some("capture failed: the audio engine is unavailable".to_string()),
-                Some(done) => match done.recv() {
-                    Ok(Err(e)) => Some(e),
-                    // The worker dropped its sender without sending, which for
-                    // this channel means it did not reach its own report.
-                    Err(_) => Some("capture failed: the audio worker stopped".to_string()),
-                    Ok(Ok(())) => None,
-                },
-            };
+            // Every shape of the report is classified by `capture_fault`, so a
+            // broken microphone is never reported as NO_SPEECH.
+            let capture_err = capture_fault(capture_done.as_ref());
             match capture_err {
                 Some(e) => (false, e),
                 None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
@@ -1040,24 +1045,12 @@ fn worker(
         }
     };
 
-    // Streaming leaves the capture report unread until here; the REST arm above
-    // has already consumed it (a second recv sees a closed channel and no-ops).
-    //
-    // Classified the same four ways the REST arm classifies it, rather than
-    // matching only `Ok(Err(e))`. The two shapes this used to drop were the ones
-    // the settled capture-fault rule exists for: `None` means the engine was gone
-    // before the thread started, and `Err(RecvError)` means the audio worker
-    // panicked before its `send`. Reporting either as the transcript tells a user
-    // whose Windows Audio service just stopped that they said nothing - under
-    // streaming only, which is what made the asymmetry worth closing. A clean
-    // `Ok(Ok(()))` with a short buffer is the one shape that really is silence.
-    if let Some(rx) = capture_done {
-        let fault = match rx.recv() {
-            Ok(Err(e)) => Some(e),
-            Err(_) => Some("capture failed: the audio worker stopped".to_string()),
-            Ok(Ok(())) => None,
-        };
-        if let Some(e) = fault {
+    // The REST arm above has already consumed the capture report; only the
+    // streaming path leaves it unread until here, so only that path classifies
+    // it a second time. Reading it on REST would consume a closed channel and
+    // overwrite a good transcript with a false capture fault.
+    if matches!(cfg.protocol, config::Protocol::Streaming) {
+        if let Some(e) = capture_fault(capture_done.as_ref()) {
             result = (false, e);
         }
     }
