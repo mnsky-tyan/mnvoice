@@ -413,8 +413,10 @@ fn current_exe() -> Result<PathBuf, String> {
 
 /// Argument that starts a second, short-lived copy of this exe to finish an
 /// install the starting process could not complete. The install to repair
-/// follows it on the command line. Handled at the top of main, before the
-/// single-instance mutex, which the app itself already holds.
+/// follows it on the command line, then the sha256 the installer verified, so
+/// the helper can re-check the staged exe before moving it into place. Handled
+/// at the top of main, before the single-instance mutex, which the app itself
+/// already holds.
 pub const FINISH_UPDATE_ARG: &str = "--finish-update";
 
 /// Argument that asks a freshly swapped-in exe to relaunch itself as the

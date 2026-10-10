@@ -615,6 +615,75 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// A send to a peer that stopped reading must be bounded, not blocked.
+    ///
+    /// The streaming loop drains queued audio through `send_binary` after the
+    /// session has ended - exactly when a provider that has gone away is least
+    /// likely to still be reading - and nothing after the drain can run until
+    /// it returns. On the Unix backend that is a blocking socket write, so
+    /// without a write deadline the drain, the close frame and the reader join
+    /// all park forever. This drives the real `websocket()` and `send_binary`
+    /// against a peer that completes the handshake and then stops reading, and
+    /// asserts the send fails within the bound instead of blocking.
+    #[test]
+    fn send_binary_is_bounded_when_the_peer_stops_reading() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let len = conn.read(&mut buf).unwrap();
+            let key = String::from_utf8_lossy(&buf[..len])
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap()
+                .trim()
+                .to_string();
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            // The handshake is answered and then the peer stops reading: the
+            // socket buffers fill and every further byte the client sends has
+            // nowhere to go. The connection is held open so the client blocks
+            // on its own send rather than on a closed peer.
+            let _ = stop_rx.recv();
+        });
+
+        let socket = websocket(&format!("ws://{addr}/"), &[]).unwrap();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            // Realistically sized PCM frames, as the post-session drain sends
+            // them, until one of them blocks.
+            let frame = vec![0u8; 3200];
+            loop {
+                if let Err(e) = socket.send_binary(&frame) {
+                    let _ = outcome_tx.send(e);
+                    return;
+                }
+            }
+        });
+
+        match outcome_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(err) => assert!(
+                err.contains("websocket send failed"),
+                "a stalled send must fail as a send error: {err}"
+            ),
+            Err(_) => panic!("send_binary blocked past its write deadline"),
+        }
+        sender.join().unwrap();
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
+
     /// A URI authority must bracket an IPv6 literal, and `Authority::host()`
     /// hands those brackets back, so the host reaching `connect_with_timeout`
     /// arrives as `[::1]`. This drives the real `websocket()` against a

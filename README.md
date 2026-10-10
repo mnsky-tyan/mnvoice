@@ -137,7 +137,7 @@ One flag is yours to use, and it is for recovery, not normal use:
 |---|---|
 | `mnvoice.exe` | Run normally |
 | `mnvoice.exe --restart` | Kill stale instances, free the hotkey, start fresh |
-| `mnvoice.exe --finish-update <dir>` | Internal recovery flag the updater itself uses: a short-lived helper copy finishes an interrupted swap. Never run it by hand. |
+| `mnvoice.exe --finish-update <dir> <sha256>` | Internal recovery flag the updater itself uses: a short-lived helper copy finishes an interrupted swap, re-checking the staged exe against the digest the installer verified. Never run it by hand. |
 
 `--restart` is what to reach for if **Alt+Space silently stops working** - almost always another app (Gemini, PowerToys, AutoHotkey) has grabbed the same hotkey and left it held. Starting with `--restart` lets mnvoice claim it again.
 
