@@ -317,11 +317,12 @@ fn feed_tags(feed: &str) -> Vec<String> {
 /// The suffix this platform's release tags carry.
 ///
 /// Windows-only, because this whole module is `#[cfg(windows)]` (see `main.rs`).
-/// The Linux and macOS builds pull their updates through the same code paths
-/// with this branch compiled out, so a `#[cfg(target_os = "linux")]` definition
-/// here would never be built - the earlier pair of them were dead code kept
-/// "for symmetry" and removed. `platform::tag_parts` is the one place the
-/// three-way split actually lives, so a new platform is added there, not here.
+/// The Linux and macOS builds have no updater at all: nothing outside this
+/// module reads a release feed or replaces a binary, so a
+/// `#[cfg(target_os = "linux")]` definition here would never be built - the
+/// earlier pair of them were dead code kept "for symmetry" and removed.
+/// `platform::tag_parts` is the one place the three-way split actually lives,
+/// so a new platform is added there, not here.
 #[cfg(windows)]
 const fn platform_release_suffix() -> &'static str {
     "win"

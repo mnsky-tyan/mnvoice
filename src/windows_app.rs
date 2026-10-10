@@ -96,12 +96,13 @@ fn state_name(s: State) -> &'static str {
 impl State {
     /// The wire form, shared with the updater's worker thread.
     ///
-    /// One encode, one decode. This used to be three spellings of the same
-    /// table: this `as u8`, the static's initializer written out as `0`, and
-    /// `from_code`'s `1 => Recording, 2 => Transcribing, _ => Idle`. Nothing
-    /// kept them in agreement but declaration order, so inserting a variant - or
-    /// reordering them - silently remapped the shared atomic. Keeping both
-    /// directions here and nowhere else is what makes the table checkable.
+    /// One encode, one decode. The encode used to be spelled out at two call
+    /// sites - the static's initializer and `set_state`'s store, both as a bare
+    /// `as u8` - while `from_code` re-spelled the table as
+    /// `1 => Recording, 2 => Transcribing, _ => Idle`. Nothing kept them in
+    /// agreement but declaration order, so inserting a variant - or reordering
+    /// them - silently remapped the shared atomic. Keeping both directions here
+    /// and nowhere else is what makes the table checkable.
     const fn as_code(self) -> u8 {
         self as u8
     }
