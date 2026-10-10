@@ -667,7 +667,10 @@ fn verify_staged(staged: &Path, expected: &[u8]) -> Result<(), String> {
 /// tampered or torn write cannot be left beside the exe for the next attempt -
 /// reached from a process that can be told the bytes' hash but not the bytes.
 fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<(), String> {
-    let expected = expected_digest.unwrap_or_default().trim().to_ascii_lowercase();
+    let expected = expected_digest
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     let is_hex = expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit());
     if !is_hex {
         // Taken away on this path too, not just on a digest mismatch: either way
@@ -1861,21 +1864,33 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         tampered[last] ^= 0xFF;
         fs::write(&staged, &tampered).unwrap();
         let err = verify_staged_digest(&staged, Some(&digest)).expect_err("a rewrite is refused");
-        assert!(err.contains("refusing to install"), "unexpected error: {err}");
+        assert!(
+            err.contains("refusing to install"),
+            "unexpected error: {err}"
+        );
         // And removed, so it cannot be left beside the exe for the next attempt.
         assert!(!staged.exists(), "a refused file must be taken away: {err}");
 
         // No digest at all: refused, not skipped.
         fs::write(&staged, &good).unwrap();
         let err = verify_staged_digest(&staged, None).expect_err("no digest is a refusal");
-        assert!(err.contains("no usable checksum"), "unexpected error: {err}");
-        assert!(!staged.exists(), "a refusal must still take the file away: {err}");
+        assert!(
+            err.contains("no usable checksum"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !staged.exists(),
+            "a refusal must still take the file away: {err}"
+        );
 
         // A digest that is not 64 hex characters: also a refusal, since the
         // command line is the only thing carrying it.
         fs::write(&staged, &good).unwrap();
         let err = verify_staged_digest(&staged, Some("nope")).expect_err("garbage is a refusal");
-        assert!(err.contains("no usable checksum"), "unexpected error: {err}");
+        assert!(
+            err.contains("no usable checksum"),
+            "unexpected error: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1987,7 +2002,10 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // The refusal names the mismatch as what it is - a file that no longer
         // holds the verified bytes - rather than a byte count, because the helper
         // spelling compares digests and never sees the bytes.
-        assert!(err.contains("refusing to install"), "unexpected error: {err}");
+        assert!(
+            err.contains("refusing to install"),
+            "unexpected error: {err}"
+        );
         assert!(
             !staged.exists(),
             "a refused staged file must not be left for the next attempt"

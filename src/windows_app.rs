@@ -615,7 +615,12 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
 unsafe fn push_tip(hwnd: HWND, app: &App) {
     set_tray_tip(
         hwnd,
-        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
+        &state_tip(
+            app.state,
+            &app.hotkey_str,
+            app.hotkey_ok,
+            app.config.is_some(),
+        ),
     );
 }
 
@@ -973,8 +978,8 @@ fn worker(
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
     // The outer Err means the request could not even be queued (the engine is
-    // gone); the original code ignored that case and so does this - it is not
-    // a capture failure the user can act on.
+    // gone). Its message is dropped here, but its shape is not: `capture_fault`
+    // classifies `None` as the engine-unavailable capture failure.
     let capture_done = audio_engine
         .capture_to_channel(
             stop_audio,

@@ -594,11 +594,7 @@ mod tests {
         };
 
         // A line break in any of the three is refused.
-        for (label, mutate) in [
-            ("model", 0usize),
-            ("language", 1),
-            ("keywords", 2),
-        ] {
+        for (label, mutate) in [("model", 0usize), ("language", 1), ("keywords", 2)] {
             let mut cfg = base();
             match mutate {
                 0 => cfg.model = "whisper\r\n--mnvoiceboundary9f2a--".into(),
@@ -608,7 +604,8 @@ mod tests {
             let err =
                 multipart_body(&cfg, b"RIFFxxxx").expect_err(&format!("{label} must be refused"));
             assert!(
-                err.to_ascii_uppercase().contains(&label.to_ascii_uppercase()),
+                err.to_ascii_uppercase()
+                    .contains(&label.to_ascii_uppercase()),
                 "the message must name the field: {err}"
             );
             assert!(
@@ -628,7 +625,10 @@ mod tests {
         let body = multipart_body(&cfg, b"RIFFxxxx").expect("ordinary values build");
         let text = String::from_utf8_lossy(&body);
         assert!(text.starts_with(&format!("--{BOUNDARY}\r\n")), "{text}");
-        assert!(text.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"), "{text}");
+        assert!(
+            text.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"),
+            "{text}"
+        );
         assert!(text.ends_with(&format!("--{BOUNDARY}--\r\n")), "{text}");
     }
 
