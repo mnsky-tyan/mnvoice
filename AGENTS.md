@@ -82,3 +82,32 @@ and direct keyboard event injection.
      passing CI run's `head_sha` equals `git rev-parse HEAD` before merging
      (`gh api repos/:owner/:repo/actions/runs/<id> --jq .head_sha`), and verify
      the final head yourself.
+   - **A bound installed on one handle may never reach the one that matters.**
+     The Windows WebSocket send bound was set on the session handle immediately
+     after `Self::open`, but `open` calls `WinHttpOpenRequest` internally and a
+     request handle inherits the session's timeouts *when it is created*, so a
+     value set afterwards may never apply. Ask for it at request creation by
+     widening the tuple the opener takes. More importantly, the platform may
+     not honour it at all: `WinHttpWebSocketSend` ignores the send timeout
+     entirely (measured - blocked past 60 s at 2 s, past 120 s at 100 ms, and
+     with `WINHTTP_OPTION_SEND_TIMEOUT` also set), so the only real bound on a
+     stalled peer is the Unix backend's `WRITE_TIMEOUT`. Verify a timeout
+     against a peer that stops reading before claiming it protects anything,
+     and keep a control run (same frames, peer reads) to prove the send path
+     itself is healthy.
+   - **A gate finding can be right about the fact and wrong about the history.**
+     A reviewer claimed `restore_old_image` "reverses two declined decisions";
+     the decisions were in fact directed fixes, one of them by the reviewer
+     itself in an earlier round. Check the recorded round history before
+     conceding a scope argument, and verify the behavioural consequence before
+     approving either way - here, that the restore consumes `mnvoice.exe.old`,
+     so `left_old_image_behind` cannot announce a failed install as a
+     successful update.
+   - **A refused install must leave *something* runnable.** The base helper
+     deleted the staged file when the digest check refused, but that path is
+     only reachable once `swap_interrupted` has proved the exe is absent - so
+     the refusal left no exe at all. Restore the previous image instead. In
+     general: on the failure path of a swap, ask what the user has left to run.
+   - **`sync --recover` needs a clean worktree.** Uncommitted local changes
+     duplicated the pipeline head and blocked recovery with
+     `safety: blocked_recover_dirty`. `git stash` first, recover, then pop.
