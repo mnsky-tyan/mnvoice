@@ -26,6 +26,15 @@ use windows::Win32::Networking::WinHttp::*;
 const WINHTTP_QUERY_STATUS: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
+/// Send timeout for a streaming WebSocket, in the milliseconds WinHTTP takes.
+///
+/// The same bound the Unix backend applies as `WRITE_TIMEOUT`, and for the same
+/// reason: a peer that stopped reading must not be able to park `send` forever.
+/// Kept as a plain constant rather than a `Duration` because
+/// `WinHttpSetTimeouts` counts milliseconds and nothing here needs the
+/// arithmetic.
+const WEBSOCKET_WRITE_TIMEOUT_MS: i32 = 2_000;
+
 /// Build a NUL-terminated UTF-16 buffer for the wide-string Win32 APIs.
 /// Shared with the tray app, which needs the same conversion for its own
 /// window and tooltip text.
@@ -67,6 +76,12 @@ impl RequestHandles {
             connect: None,
             session: Some(session),
         }
+    }
+
+    /// The session handle, for the timeouts that are set on the session rather
+    /// than the request.
+    fn session(&self) -> *mut std::ffi::c_void {
+        self.session.expect("session handle still held")
     }
 
     /// The request handle for the WinHTTP calls that take one.
@@ -313,7 +328,29 @@ impl Transport for WinHttpTransport {
             // so there is no overall timeout and the socket carries no receive
             // timeout: `read` blocks until a frame, a close, or a transport
             // error, the contract the trait documents.
+            //
+            // The send side is bounded anyway, and `open` cannot do it: its
+            // timeout tuple applies one value to both directions, so asking for
+            // a send bound through it would also put a receive bound on a socket
+            // whose whole contract is to block. WinHTTP treats 0 as "no
+            // timeout", so the pair is set explicitly right after the open -
+            // resolve 0, connect 10s, send 2s, receive 0 - with the send value
+            // matching the Unix backend's WRITE_TIMEOUT.
+            //
+            // Without it a provider that stops reading blocks `send` forever on
+            // the primary platform: the post-session drain in `stream.rs` runs
+            // exactly then, and nothing after it can run, because the close
+            // frame and the reader join come after it.
             let (mut handles, _) = Self::open("GET", url, (0, 10_000, 0))?;
+            if let Err(e) = WinHttpSetTimeouts(
+                handles.session(),
+                0,
+                10_000,
+                WEBSOCKET_WRITE_TIMEOUT_MS,
+                0,
+            ) {
+                return Err(format!("set timeouts ({e})"));
+            }
             let request = handles.request();
 
             let opt_ok =

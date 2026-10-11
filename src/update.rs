@@ -630,7 +630,18 @@ fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Resu
         restore_old_image(exe);
         return Err(e);
     }
-    finish_swap(exe)
+    // The accepting branch restores too, not just the refusing one.
+    // `swap_interrupted` proved the exe path is empty - that is the whole state
+    // this function exists for - so a failed final rename leaves exactly what
+    // `restore_old_image` was added to prevent: no exe at all, and nothing
+    // running that could put one back. Restoring on both branches means the
+    // install directory always ends up with a runnable image, whichever way the
+    // repair went.
+    if let Err(e) = finish_swap(exe) {
+        restore_old_image(exe);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Move the staged image into the exe path, which the interrupted process could
