@@ -611,7 +611,7 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
 /// was, which is the drift this prevents rather than merely tidies.
 ///
 /// Reads `app.state` rather than taking a state argument, so the tip always
-/// describes the state the app is in - at the three sites that call `set_state`
+/// describes the state the app is in - at the four sites that call `set_state`
 /// first, that is the state they were hardcoding.
 unsafe fn push_tip(hwnd: HWND, app: &App) {
     set_tray_tip(

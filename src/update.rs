@@ -355,10 +355,9 @@ fn newest_tag_for_this_platform(feed: &str) -> Option<String> {
 ///
 /// The production path needs the tag, not just the version - the asset URL is
 /// derived from it - so this is a test-only spelling of
-/// `newest_tag_for_this_platform`. It is a delegation rather than a second
-/// implementation, but it does mean the production rule is spelled out in test
-/// form, so a change there has to be mirrored here or the tests quietly test a
-/// copy of it.
+/// `newest_tag_for_this_platform`. It delegates rather than reimplementing, so
+/// the tests calling it exercise the production rule itself and there is
+/// nothing here to keep in sync with it.
 #[cfg(test)]
 pub fn parse_version_from_feed(feed: &str) -> Option<String> {
     newest_tag_for_this_platform(feed).map(|t| version_of_tag(&t))
