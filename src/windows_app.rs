@@ -67,6 +67,10 @@ const IDM_OPEN_KEYWORDS: usize = 6;
 const IDM_UPDATE: usize = 7;
 const TIMER_ORB: usize = 101;
 
+/// The tray icon's `uID`. With `TRAY_GUID` this is the icon's identity: every
+/// `Shell_NotifyIconW` call has to name the same pair.
+const TRAY_ICON_ID: u32 = 1;
+
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
 const WINDOW_NAME: PCWSTR = w!("mnvoice");
 const MUTEX_NAME: PCWSTR = w!("mnvoice-single-instance");
@@ -337,8 +341,11 @@ pub fn main() {
         } else {
             register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
         };
-        app_ref(hwnd).hotkey_ok = hotkey_ok;
-        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, app_ref(hwnd).config.is_some()));
+        if let Some(app) = app_ref(hwnd) {
+            app.hotkey_ok = hotkey_ok;
+            let configured = app.config.is_some();
+            add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, configured));
+        }
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -454,8 +461,17 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
             hIcon: app_icon(),
             ..Default::default()
         };
-        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS {
-            log("RegisterClassW failed");
+        // A duplicate registration returns ERROR_CLASS_ALREADY_EXISTS, not
+        // ERROR_ALREADY_EXISTS: window classes live in the process atom table,
+        // and "this name is taken" is the atom table's own answer. Checking the
+        // wrong code here meant a second registration of the same name logged a
+        // failure that was not one. A relaunch is a fresh process with its own
+        // atom table, so in practice the class is new each time - the tolerance
+        // is for a future in-process second window.
+        let registered = RegisterClassW(&wc) != 0;
+        let taken = !registered && GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+        if !registered && !taken {
+            log(&format!("RegisterClassW failed ({})", GetLastError().0));
             return false;
         }
     }
@@ -553,8 +569,23 @@ struct AppInit {
     audio_engine: audio::AudioEngine,
 }
 
-fn app_ref(hwnd: HWND) -> &'static mut App {
-    unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App) }
+/// The live `App`, or nothing if the window has none.
+///
+/// Returns `Option` rather than a `&'static mut` into a null pointer. Window
+/// classes live in the process atom table, so a class registered once is
+/// shared by every window of that class in the process, and `WM_CREATE` on a
+/// second one would overwrite the first window's `GWLP_USERDATA` - which a
+/// blind dereference would read as an `App` that belongs to the other window.
+/// `WM_DESTROY` is the one path that clears the slot, so the value is absent
+/// exactly when the window is going away. Nothing today creates a second tray
+/// window, but the unchecked cast is what would make that a silent aliasing bug
+/// instead of a compile error at the call site.
+fn app_ref(hwnd: HWND) -> Option<&'static mut App> {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { &mut *ptr })
 }
 
 unsafe fn add_tray(hwnd: HWND, tip: &str) {
@@ -577,11 +608,28 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     if !has_config {
         return "mnvoice - NO API KEY. Set API_KEY in mnvoice.env (see log).".to_string();
     }
+    // "Disabled" is decided in one place, `hotkey_is_disabled`, rather than
+    // by an exact string match here. The parser normalises to lowercase "none"
+    // and the window setup tests the `hk_vk == 0` sentinel - three spellings of
+    // one rule, where this third one silently degraded to "mnvoice - idle. none
+    // to dictate." if the parser's normalisation ever changed.
+    if hotkey.is_empty() || hotkey_is_disabled(hotkey) {
+        return "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string();
+    }
     match (hotkey, hotkey_ok) {
-        ("none", _) => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
         (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
         (hk, false) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
     }
+}
+
+/// Whether `hotkey` is the disabled spelling.
+///
+/// One definition for a rule the parser, the window setup and the tray tip all
+/// need. The parser normalises to lowercase `"none"` when it builds the pair,
+/// so a case-insensitive compare here agrees with it by construction rather
+/// than by the two of them happening to spell it the same way today.
+fn hotkey_is_disabled(hotkey: &str) -> bool {
+    hotkey.eq_ignore_ascii_case("none")
 }
 
 /// The tray tooltip for a given session state. Single-sourced so left-click
@@ -632,7 +680,11 @@ fn tray_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: 1,
+        // Named like every other id this file hands out. `uID` is half of the
+        // icon's identity alongside `TRAY_GUID`: every `Shell_NotifyIconW`
+        // call has to name the same pair, and a bare literal is the one thing
+        // in that struct with no name to change together.
+        uID: TRAY_ICON_ID,
         uFlags: flags,
         guidItem: TRAY_GUID,
         ..Default::default()
@@ -706,21 +758,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER => {
                 if wparam.0 == TIMER_ORB {
-                    let app = app_ref(hwnd);
-                    if let Some(orb) = &mut app.orb {
-                        orb.tick();
+                    if let Some(app) = app_ref(hwnd) {
+                        if let Some(orb) = &mut app.orb {
+                            orb.tick();
+                        }
                     }
                 }
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                let app = app_ref(hwnd);
-                match wparam.0 as i32 {
-                    HOTKEY_TOGGLE => toggle(app),
-                    // Esc cancels and hides the orb at once. It must not "finish"
-                    // the phrase, which used to leave the orb sitting on screen.
-                    HOTKEY_ESC => cancel(app),
-                    _ => {}
+                if let Some(app) = app_ref(hwnd) {
+                    match wparam.0 as i32 {
+                        HOTKEY_TOGGLE => toggle(app),
+                        // Esc cancels and hides the orb at once. It must not
+                        // "finish" the phrase, which used to leave the orb
+                        // sitting on screen.
+                        HOTKEY_ESC => cancel(app),
+                        _ => {}
+                    }
                 }
                 LRESULT(0)
             }
@@ -729,13 +784,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
-                    let app = app_ref(hwnd);
-                    push_tip(hwnd, app);
+                    if let Some(app) = app_ref(hwnd) {
+                        push_tip(hwnd, app);
+                    }
                 }
                 LRESULT(0)
             }
             WM_APP_WORKER => {
-                let app = app_ref(hwnd);
+                let Some(app) = app_ref(hwnd) else {
+                    return LRESULT(0);
+                };
                 let msg_session = wparam.0;
                 if msg_session != app.session_id {
                     // Stale outcome from an earlier session; ignore completely.
@@ -778,13 +836,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // still believing the hotkey is owned, breaking the next start.
                         let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
-                        let app = app_ref(hwnd);
-                        set_state(app, State::Idle);
+                        if let Some(app) = app_ref(hwnd) {
+                            set_state(app, State::Idle);
+                        }
                         PostQuitMessage(0);
                     }
                     IDM_DICTATE => {
-                        let app = app_ref(hwnd);
-                        toggle(app);
+                        if let Some(app) = app_ref(hwnd) {
+                            toggle(app);
+                        }
                     }
                     IDM_STARTUP => {
                         // Toggle the logon task. The Run key is cleared as a side
@@ -804,8 +864,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // domain-locked machine that is a visible freeze from a
                         // single menu click.
                         thread::spawn(|| {
-                            let enable = !autostart_enabled();
-                            if let Err(e) = set_autostart(enable) {
+                            if let Err(e) = toggle_autostart() {
                                 log(&format!("autostart toggle failed: {e}"));
                             }
                         });
@@ -856,7 +915,7 @@ fn toggle(app: &mut App) {
             // The orb appearing used to leave a gap where Esc was dead, which
             // read as "Esc does not work right after the orb shows".
             if cfg.cancel_key.1 != 0 {
-                if let Err(e) = unsafe {
+                match unsafe {
                     RegisterHotKey(
                         app.hwnd,
                         HOTKEY_ESC,
@@ -864,7 +923,25 @@ fn toggle(app: &mut App) {
                         cfg.cancel_key.1,
                     )
                 } {
-                    log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Another process already owns the combination, which
+                        // is the exact condition `register_hotkey_with_retry`
+                        // exists for on the dictate key. The orb still appears
+                        // below, and without a tip it advertises a cancel key
+                        // that was never live - so say so, the same way the
+                        // dictate key's failure does.
+                        log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
+                        unsafe {
+                            set_tray_tip(
+                                app.hwnd,
+                                &format!(
+                                    "{} could not be claimed, so there is no cancel key",
+                                    cfg.cancel_key_str
+                                ),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -917,7 +994,14 @@ fn toggle(app: &mut App) {
             unsafe { push_tip(app.hwnd, app) };
             log("recording stopped, transcribing");
         }
-        State::Transcribing => {}
+        // Pressing the dictate key again mid-transcription means "stop".
+        // This arm used to do nothing at all, and because the tray item is greyed
+        // rather than removed and the hotkey is registered regardless, the press
+        // was swallowed with no log line, no tip and no state change - the orb
+        // sat there transcribing and the user could not tell whether the press
+        // had registered. The words are already committed by the time this
+        // state is reached, so cancelling only stops the tail from typing.
+        State::Transcribing => cancel(app),
     }
 }
 
@@ -963,7 +1047,11 @@ fn capture_fault(done: Option<&std::sync::mpsc::Receiver<Result<(), String>>>) -
         Some(done) => match done.recv() {
             Ok(Err(e)) => Some(e),
             // The worker dropped its sender without sending, which for this
-            // channel means it did not reach its own report.
+            // channel means it did not reach its own report. Unreachable in a
+            // release build - `panic = "abort"` means a panicking worker takes
+            // the process down rather than unwinding out of it - so this is
+            // the defensive shape, not a case anyone has observed. Kept
+            // because a debug build can panic and the arm costs nothing.
             Err(_) => Some("capture failed: the audio worker stopped".to_string()),
             Ok(Ok(())) => None,
         },
@@ -1075,7 +1163,10 @@ fn dictate_item(state: State) -> (&'static str, bool) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let app = app_ref(hwnd);
+    let Some(app) = app_ref(hwnd) else {
+        // The window is being torn down; nothing left to show a menu for.
+        return;
+    };
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
         Err(_) => return,
@@ -1494,8 +1585,26 @@ fn retire_failure_message(enable: bool, run_key: Option<bool>) -> String {
 /// needed, and the Run key is cleared in both directions - but only once the
 /// scheduler is confirmed to hold the state that was asked for, so a toggle
 /// that did not take can never destroy the autostart the user had.
-fn set_autostart(enable: bool) -> Result<(), String> {
-    let _mutation = autostart_lock();
+///
+/// The read of the current state and the write of the new one are one operation
+/// under the autostart lock. Doing them apart - reading the state in the caller
+/// and handing the result here - let a concurrent toggle, or the startup
+/// migration, change the state between the two, so two clicks in quick
+/// succession could both read the same value and both write the same target.
+/// The lock's own contract is that a mutation holds it across its reads, so the
+/// read belongs inside it.
+///
+/// The guard is passed in rather than acquired here so a caller can hold one
+/// across its own read, which a second acquire inside could not do: the guard is
+/// not reentrant.
+fn toggle_autostart() -> Result<(), String> {
+    let mutation = autostart_lock();
+    let enable = !autostart_enabled();
+    set_autostart_guarded(mutation, enable)
+}
+
+fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Result<(), String> {
+    let _mutation = mutation;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.display().to_string();
     let mut cmd = schtasks_cmd();
