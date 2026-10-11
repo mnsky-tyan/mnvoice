@@ -500,9 +500,10 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
 ///
 /// A different image name can only come from a different file, so a copy of
 /// this exe is laid down in the temp directory and the install it has to
-/// repair is named on its command line, since the copy's own path says nothing
-/// about where the real exe lives. Both are taken from the installer, which is
-/// the only process that knows either.
+/// repair is named on its command line, with the digest the installer verified
+/// after it, since the copy's own path says nothing about where the real exe
+/// lives. The copy, the install path and the digest all come from the
+/// installer, which is the only process that knows any of them.
 fn spawn_helper(exe: &Path, expected_digest: &str) -> Result<std::process::Child, String> {
     let copy = helper_copy_path();
     fs::copy(exe, &copy).map_err(|e| format!("cannot stage the update helper ({e})"))?;

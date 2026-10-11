@@ -1943,4 +1943,76 @@ mod tests {
             "mnvoice - transcribing..."
         );
     }
+
+    /// The capture report is classified in every shape it can arrive in.
+    ///
+    /// The REST arm and the streaming arm share this one classifier, so a
+    /// broken microphone is never reported as NO_SPEECH on either - telling a
+    /// user whose Windows Audio service just stopped that they said nothing is
+    /// the misleading diagnostic the four init_wasapi messages exist to
+    /// prevent. Before B2 the streaming arm read only `Ok(Err(_))`, so a
+    /// worker that panicked before its own `send` was reported as silence
+    /// there and as a capture fault on REST.
+    #[test]
+    fn the_capture_report_is_classified_in_every_shape() {
+        // The engine was gone before the capture thread even started.
+        assert_eq!(
+            capture_fault(None).as_deref(),
+            Some("capture failed: the audio engine is unavailable")
+        );
+
+        // The worker reported its own failure: that message is the answer.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let _ = tx.send(Err("no input audio device found".to_string()));
+        assert_eq!(
+            capture_fault(Some(&rx)).as_deref(),
+            Some("no input audio device found")
+        );
+
+        // The worker dropped its sender without reporting, which is what a
+        // panic before its own `send` looks like. That is a broken
+        // microphone, not silence.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        drop(tx);
+        assert_eq!(
+            capture_fault(Some(&rx)).as_deref(),
+            Some("capture failed: the audio worker stopped")
+        );
+
+        // A clean report is the only shape that is not a fault.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let _ = tx.send(Ok(()));
+        assert_eq!(capture_fault(Some(&rx)), None);
+    }
+
+    /// The shared session state has exactly one encode and one decode, and
+    /// they agree. Nothing but declaration order kept them in agreement
+    /// before, so inserting a variant - or reordering them - silently remapped
+    /// the atomic the updater's worker thread reads to decide whether the
+    /// binary may be swapped.
+    #[test]
+    fn the_state_code_table_round_trips_every_variant() {
+        let states = [State::Idle, State::Recording, State::Transcribing];
+        let codes: Vec<u8> = states.iter().map(|s| s.as_code()).collect();
+        for (state, code) in states.iter().zip(codes.iter()) {
+            let decoded = State::from_code(*code);
+            if decoded != *state {
+                panic!("code {code} must decode back to the state that produced it");
+            }
+            if state_name(*state).is_empty() {
+                panic!("every state still has a name");
+            }
+        }
+        // Distinct codes, or two states would be indistinguishable on the wire.
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            states.len(),
+            "codes must be distinct: {codes:?}"
+        );
+        // The static's initial value is the same encode, not a second spelling.
+        assert_eq!(SESSION_STATE.load(Ordering::SeqCst), State::Idle.as_code());
+    }
 }
