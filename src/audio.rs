@@ -200,15 +200,6 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 
     let deadline = Instant::now() + Duration::from_secs(req.max_seconds as u64);
     let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
-    // A tick that does not end on a frame boundary leaves this behind for the
-    // next one, which is what the Unix engine's `take_frames` does and why the
-    // two do not disagree about the same hardware condition. WASAPI hands the
-    // device's period, and a period that is not a whole number of frames
-    // arrives exactly when the shared-mode format changes mid-session - so the
-    // tail is real, not theoretical. Refusing it instead aborted a dictation
-    // over a sample or two, which is a far worse outcome than reading it on
-    // the next tick.
-    let mut carry: Vec<u8> = Vec::new();
 
     let mut silence = SilenceWindows::new();
     let block_align = engine.format.nBlockAlign.max(1) as usize;
@@ -234,16 +225,22 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             .map_err(|e| format!("capture buffer ({e})"))?;
 
         if frames > 0 && !ptr.is_null() {
-            let tick = std::slice::from_raw_parts(ptr, frames as usize * block_align);
-            // The previous tick's tail goes in front of this one, so a frame
-            // split across two ticks is mixed as the one frame it is.
-            let bytes: Vec<u8> = carry.drain(..).chain(tick.iter().copied()).collect();
-            let block_align = block_align.max(1);
-            let whole = bytes.len() / block_align * block_align;
-            carry.extend_from_slice(&bytes[whole..]);
+            // No tail to carry here, unlike the Unix engine. `GetBuffer`
+            // reports a whole number of frames and `block_align` is the frame's
+            // byte width, so this slice always ends on a frame boundary - which
+            // is also why `convert_mix`'s length guard cannot fire on this
+            // path. A carry was added and then removed: by induction it could
+            // never become non-empty, so it added a heap copy and a full memcpy
+            // to the 2 ms capture loop for a branch that never engaged. The
+            // guard's real reach is the format-derived checks inside
+            // `convert_mix`, which carrying bytes does not address; a live
+            // mid-session format change would need the decode format taken from
+            // the packet rather than the startup copy, which is a separate
+            // change.
+            let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result.
-            let converted = convert_mix(&bytes[..whole], &engine.format, engine.kind);
+            let converted = convert_mix(bytes, &engine.format, engine.kind);
             engine
                 .capture_client
                 .ReleaseBuffer(frames)

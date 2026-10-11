@@ -414,7 +414,10 @@ impl Transport for WinHttpTransport {
                 connect,
                 session,
             };
-            socket.set_close_timeout(WEBSOCKET_WRITE_TIMEOUT_MS);
+            // A refused option leaves the teardown on WinHTTP's default, which
+            // is the bug this whole block exists to close, so it is reported
+            // rather than dropped. There is no fallback bound to install.
+            socket.set_close_timeout(WEBSOCKET_WRITE_TIMEOUT_MS)?;
             Ok(Box::new(socket))
         }
     }
@@ -461,14 +464,22 @@ impl WinHttpSocket {
     ///
     /// A private inherent method, not a trait method, because the trait is the
     /// seam both backends share and only this one has the concept.
-    fn set_close_timeout(&self, ms: i32) {
+    ///
+    /// Returns whether the option took. A refused option is not a failure the
+    /// caller can route around - `close` has no alternative bound to fall back
+    /// to - but it is the only signal that the teardown is still on WinHTTP's
+    /// default, and silently dropping it is what left this unbounded in the
+    /// first place. The comparable calls in this file propagate for the same
+    /// reason.
+    fn set_close_timeout(&self, ms: i32) -> Result<(), String> {
         unsafe {
-            let _ = WinHttpSetOption(
+            WinHttpSetOption(
                 Some(self.ws),
                 WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
                 Some(ms.to_ne_bytes().as_slice()),
-            );
+            )
         }
+        .map_err(|e| format!("set close timeout ({e})"))
     }
 }
 

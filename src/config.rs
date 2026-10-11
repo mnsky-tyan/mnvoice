@@ -153,7 +153,7 @@ fn derive(raw: RawFields) -> Result<Config, String> {
     // other. Without a toggle hotkey the tray menu still starts and stops a
     // dictation.
     let hotkey_input = raw.hotkey_str.trim().to_string();
-    let (hotkey, hotkey_actual_str) = if hotkey_input.eq_ignore_ascii_case("none") {
+    let (hotkey, hotkey_actual_str) = if hotkey_is_disabled(&hotkey_input) {
         ((0, 0), "none".to_string())
     } else {
         let parsed = parse_hotkey(&hotkey_input);
@@ -268,6 +268,13 @@ pub fn parse_auto_update(s: &str) -> bool {
 }
 
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
+    // The BOM comes off here too, not only in `parse`. These three files are the
+    // ones a Windows editor most often writes, and `lines()` does not treat the
+    // BOM as whitespace - so without the strip the first term of a Notepad-saved
+    // list becomes `\u{feff}<word>`, a boost term that can never match spoken
+    // audio, and because `seen` keys on the same string a later plain spelling
+    // is kept as a second entry.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     // A lowercase index beside the vector, so de-duplication does not have to
     // re-scan every word already collected for every new one. The dedup is
     // case-insensitive by contract, so the key is the lowercase form and the
@@ -275,13 +282,13 @@ pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
     // list is quadratic in its own length: 16k distinct words took ~17 s to
     // parse, and `load` feeds three files into the same vector before the
     // session can start.
-    let mut seen: std::collections::HashSet<String> = keywords
-        .iter()
-        .map(|k| k.to_lowercase())
-        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        keywords.iter().map(|k| k.to_lowercase()).collect();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         for part in line.split(',') {
             let word = part.trim();
             if word.is_empty() {
@@ -553,6 +560,24 @@ pub const DEFAULT_VAD_SILENCE_MS: u32 = 3000;
 /// engines compute over i16 samples (see `rms_of`), so the scale runs 0-32767.
 pub const DEFAULT_VAD_RMS_THRESHOLD: f64 = 400.0;
 
+/// Whether a configured hotkey string means "no key".
+///
+/// One definition for a rule four call sites need: the dictate-key parser, the
+/// cancel-key parser, the window setup that tests the resulting `vk == 0`
+/// sentinel, and the tray tooltip that has to say "disabled" rather than name a
+/// key. They used to spell it independently - one case-insensitive compare that
+/// stored a lowercased `"none"`, one numeric sentinel, one exact match on the
+/// display string - and agreed only because the parse happens to normalise. A
+/// change to the accepted spelling would have left the tooltip degrading to
+/// "mnvoice - idle. none to dictate."
+///
+/// Case-insensitive, and tolerant of surrounding space, because both parsers
+/// see whatever the user typed in `mnvoice.env` before they trim it.
+pub fn hotkey_is_disabled(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty() || s.eq_ignore_ascii_case("none")
+}
+
 /// The cancel key to register plus the spelling to show for it, decided in
 /// one place: the display must never advertise a key other than the pair
 /// that was registered, and the fallbacks live here rather than being
@@ -565,7 +590,7 @@ fn cancel_key_with_display(s: &str) -> ((u32, u32), String) {
             DEFAULT_CANCEL_STR.to_string(),
         );
     }
-    if s.eq_ignore_ascii_case("none") {
+    if hotkey_is_disabled(s) {
         return ((0, 0), s.to_string());
     }
     match parse_hotkey(s) {
@@ -696,6 +721,52 @@ mod tests {
     /// as whitespace, so without the strip the first key reads as
     /// `\u{feff}API_KEY` and is reported missing - which looks like a corrupted
     /// file rather than an editor artefact.
+    /// The keyword reader takes the same strip, and for the same reason.
+    ///
+    /// These three files are the ones a Windows editor most often writes. A BOM
+    /// left on the first term makes it a boost term that can never match spoken
+    /// audio, and because `seen` keys on the same string a later plain spelling
+    /// is kept as a second entry - so the file looks loaded while one word is
+    /// silently dead.
+    /// The disabled spelling is one predicate, and it accepts what the user
+    /// actually types.
+    //    ///
+    /// Four call sites consume it (both hotkey parsers, the window setup's
+    /// `vk == 0` sentinel and the tray tooltip), so its tolerance for case and
+    /// surrounding space is what keeps the tooltip from degrading to "none to
+    /// dictate" after a spelling change in only one of them.
+    #[test]
+    fn the_disabled_hotkey_spelling_is_recognised_in_one_place() {
+        for disabled in ["none", "None", "NONE", "  none  ", ""] {
+            assert!(
+                hotkey_is_disabled(disabled),
+                "{disabled:?} must read as no hotkey"
+            );
+        }
+        for enabled in ["Alt+Space", "F9", "none-ish", "none of them"] {
+            assert!(
+                !hotkey_is_disabled(enabled),
+                "{enabled:?} must read as a real hotkey"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bom_does_not_kill_the_first_keyword() {
+        let mut kw = Vec::new();
+        parse_keywords_text("\u{feff}Kubernetes, herdr", &mut kw);
+        assert_eq!(kw, vec!["Kubernetes", "herdr"]);
+
+        // And the surviving term is the one the speaker says, not the BOM'd one.
+        let mut twice = vec!["Kubernetes".to_string()];
+        parse_keywords_text("\u{feff}Kubernetes", &mut twice);
+        assert_eq!(
+            twice.len(),
+            1,
+            "the same word must not be kept twice because one spelling carried a BOM"
+        );
+    }
+
     #[test]
     fn a_bom_does_not_rename_the_first_key() {
         let mut keys = Vec::new();

@@ -75,25 +75,56 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
         return Err("the ASR endpoint returned an empty body".to_string());
     }
     if looks_like_a_refusal(trimmed) {
-        return Err(format!("the ASR endpoint returned a refusal, not a transcript: {trimmed}"));
+        // The body is previewed, not interpolated whole. The transport buffers
+        // up to MAX_TRANSCRIPT_BYTES for this response, and this string reaches
+        // the log and the CLI's stderr - so the exact shape this guard exists
+        // to catch, an 8 MiB HTML error page, would otherwise append an 8 MiB
+        // line per occurrence. Every other error sink in the crate previews
+        // 200 chars for the same reason.
+        return Err(format!(
+            "the ASR endpoint returned a refusal, not a transcript: {}",
+            preview(trimmed, 200)
+        ));
     }
     Ok(trimmed.to_string())
+}
+
+/// The first `limit` characters of `text`, with an ellipsis when it was cut.
+///
+/// Cuts on a char boundary rather than a byte one, because the body is
+/// lossy-decoded from provider bytes and slicing mid-sequence would panic -
+/// which, under `panic = "abort"`, is the whole process.
+fn preview(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((i, _)) => format!("{}...", &text[..i]),
+        None => text.to_string(),
+    }
 }
 
 /// Whether a 200 body is a provider's error payload rather than a transcript.
 ///
 /// Kept deliberately narrow. A false positive would reject a real transcript,
 /// which loses a dictation the user already spoke; a false negative types an
-/// error page, which is what the guard is for. So only the shapes that can only
-/// be an error are listed - a JSON object with an `error` member, an HTML
-/// document, and an XML one - and anything ambiguous is left to the fallback.
+/// error page, which is what the guard is for.
+///
+/// The document shapes are anchored prefixes, so they cannot match prose. The
+/// two member checks are gated on the body being a JSON object, because a bare
+/// transcript containing the quoted word "error" - `the compiler said "error"
+/// here` - is exactly the shape a `response_format=text` provider returns, and
+/// an unanchored search for `"error"` anywhere in the body refused it. An
+/// error object is an object with an `error` member, so anchoring the check to
+/// the object keeps the refusal and releases the transcript.
 fn looks_like_a_refusal(body: &str) -> bool {
     let lower = body.trim_start().to_ascii_lowercase();
-    lower.starts_with("<!doctype html")
+    if lower.starts_with("<!doctype html")
         || lower.starts_with("<html")
         || lower.starts_with("<?xml")
-        || body.contains("\"error\"")
-        || body.contains("\"message\":\"")
+    {
+        return true;
+    }
+    let trimmed = body.trim();
+    trimmed.starts_with('{')
+        && (trimmed.contains("\"error\"") || trimmed.contains("\"message\":\""))
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -402,6 +433,38 @@ mod tests {
 
         let out = fallback_transcript("   ");
         assert!(out.is_err(), "an empty body must not be typed: {out:?}");
+    }
+
+    /// A transcript that merely mentions an error must survive the guard.
+    ///
+    /// This is the false positive the guard's own doc says to avoid: the REST
+    /// request asks for a bare text body, so dictating `the compiler said
+    /// "error" here` produces exactly this shape, and an unanchored search for
+    /// `"error"` anywhere in the body refused it and lost the dictation.
+    #[test]
+    fn a_transcript_that_mentions_an_error_is_kept() {
+        let out = fallback_transcript("the compiler said \"error\" here");
+        assert_eq!(
+            out,
+            Ok("the compiler said \"error\" here".to_string()),
+            "prose containing the quoted word error is a transcript, not a refusal"
+        );
+    }
+
+    /// The refusal error is previewed, not interpolated whole.
+    //    /// The transport buffers up to MAX_TRANSCRIPT_BYTES for this response, so
+    /// the exact shape the guard catches - a large error page - would otherwise
+    /// append a multi-megabyte line to the log and the terminal per occurrence.
+    #[test]
+    fn a_refusal_is_previewed_rather_than_quoted_whole() {
+        let page = format!("<!DOCTYPE html><html><body>{}", "x".repeat(5000));
+        let err = fallback_transcript(&page).expect_err("an HTML page is a refusal");
+        assert!(
+            err.len() < 300,
+            "the refusal must be previewed, not quoted whole: {} chars",
+            err.len()
+        );
+        assert!(err.ends_with("..."), "a cut body must say it was cut: {err}");
     }
 
     /// The guard must not reject the envelope it is meant to pass through: a

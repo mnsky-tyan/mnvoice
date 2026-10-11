@@ -366,16 +366,20 @@ pub fn run_stream(
     // fails the socket can carry no more data, so the packets behind it cannot
     // be delivered either - continuing only re-pays the transport's write
     // bound for each one. Measured before this stopped: 50 queued packets cost
-    // 1.6 s against a peer that stopped reading, 500 cost 300 s, and on Windows
-    // the send is not bounded at all, so the drain could not finish and
-    // `run_stream` never returned. The intent is unchanged: ship the queued
-    // tail when the peer is healthy, and stop the moment it is not.
+    // 1.6 s against a peer that stopped reading, 500 cost 300 s.
+    //
+    // This removes the *repeat* cost, and it is the whole of what it does on
+    // Windows: `WinHttpWebSocketSend` blocks without returning `Err`, so
+    // against a peer that stalls rather than dies the first drain send parks
+    // and the break is never reached. The Windows hang needs a bound on the
+    // send or a drain that gives up, neither of which this is. The intent is
+    // unchanged: ship the queued tail when the peer is healthy, and stop the
+    // moment it is not.
     if !cancelled.load(Ordering::SeqCst) {
         while let Ok(packet_i16) = rx.try_recv() {
             if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
                 #[cfg(test)]
-                crate::test_hooks::DRAIN_BROKE_EARLY
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::test_hooks::record_drain_broke_early();
                 break;
             }
         }
@@ -676,13 +680,6 @@ mod tests {
             (port, handle, head_slot)
         }
 
-        /// A provider that completes the handshake and then never reads again.
-        ///
-        /// The kernel socket buffers absorb the first stretch of audio, so a
-        /// few frames go out; once those fill, every further send blocks. This
-        /// is the shape of a provider that stalls without closing, and it is
-        /// the only way to exercise the post-session drain against a peer that
-        /// genuinely cannot take the queued tail.
         /// `Sec-WebSocket-Accept`: base64(sha1(key + GUID)). The crate ships a
         /// SHA-1 only inside the update module's checksum helper, so the
         /// handshake digest is spelled here from the RFC 6455 magic value.
@@ -826,14 +823,36 @@ mod tests {
         /// than failing immediately. That is the difference from a provider that
         /// dropped the connection, whose dead socket answers `Err` at once and
         /// costs nothing.
-        pub fn serve_stalled() -> (u16, std::thread::JoinHandle<()>) {
-            serve(move |stream| {
+        ///
+        /// The kernel socket buffers absorb the first stretch of audio, so a
+        /// few frames go out; once those fill, every further send blocks. That
+        /// is what makes this the only way to exercise the post-session drain
+        /// against a peer that genuinely cannot take the queued tail - a peer
+        /// that closes instead makes every send fail instantly, and a drain test
+        /// against it passes whether or not the drain breaks early.
+        ///
+        /// The socket is held for a bounded time and then dropped, so the
+        /// server thread always finishes and the test cannot hang on `join`.
+        pub fn serve_stalled() -> (
+            u16,
+            std::thread::JoinHandle<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let server = serve(move |stream| {
                 let mut sink = [0u8; 64];
                 // Read once so the handshake lands, then never read again while
                 // holding the socket open.
                 let _ = stream.read(&mut sink);
-                std::thread::sleep(Duration::from_secs(20));
-            })
+                // Released on a signal rather than a fixed sleep, so the test
+                // does not pay for time the session did not need. The socket is
+                // dropped when this returns, which ends the server thread.
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            let (port, handle) = server;
+            // The signal is handed back so the caller can release the peer as
+            // soon as the session is over.
+            (port, handle, release_tx)
         }
 
         /// A session whose audio producer keeps running past `stop`, so the
@@ -896,8 +915,6 @@ mod tests {
         );
     }
 
-    /// A peer that stopped reading must not cost the drain one write timeout
-    /// per queued packet.
     /// A stalled peer must not cost the drain one write timeout per queued packet.
     ///
     /// The drain's job is to ship the queued tail so the provider can finalise
@@ -905,10 +922,12 @@ mod tests {
     /// behind it cannot be delivered either - continuing only re-pays the
     /// transport's write bound for each one. Measured before this stopped: 50
     /// queued packets cost 1.6 s against a peer that stopped reading and 500
-    /// cost 300 s, and on Windows the send is not bounded at all, so the drain
-    /// could not finish and `run_stream` never returned. The intent is
-    /// unchanged: ship the queued tail when the peer is healthy, and stop the
-    /// moment it is not.
+    /// cost 300 s.
+    ///
+    /// The repeat cost is what this removes, and it is the whole of what it
+    /// removes on Windows: `WinHttpWebSocketSend` blocks without returning
+    /// `Err`, so against a peer that stalls rather than dies the first send
+    /// parks and the break is never reached. Bounding that is a separate change.
     ///
     /// This asserts the decision rather than the clock. On Unix a peer that
     /// drops the connection makes every send fail in microseconds, so a timing
@@ -916,12 +935,16 @@ mod tests {
     /// hook is what distinguishes the two.
     #[test]
     fn the_drain_stops_at_the_first_failed_send() {
-        let (port, server) = live_provider::serve_stalled();
+        let (port, server, release) = live_provider::serve_stalled();
         let cfg = live_provider::cfg_for(port);
 
         // Far more packets than the kernel window can take, still arriving when
         // the session ends, so the drain has a real backlog to work through.
-        let _ = live_provider::drive_with_a_backlog(&cfg, 4000);
+        crate::test_hooks::reset_drain_broke_early();
+        let _ = live_provider::drive_with_a_backlog(&cfg, 2000);
+        // Release the stalled peer before joining it: its hold is what made
+        // this test cost a fixed 20 s regardless of how fast the session ended.
+        let _ = release.send(());
         let _ = server.join();
 
         assert!(

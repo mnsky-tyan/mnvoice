@@ -181,6 +181,20 @@ struct App {
     /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
     /// dictate" for a key that does nothing.
     hotkey_ok: bool,
+    /// Whether the cancel key (Esc by default) is actually live this session.
+    ///
+    /// `hotkey_ok`'s sibling, and needed because the tray tip is the only place
+    /// the user can be told a key is missing: the orb appears and advertises a
+    /// cancel key, and if that key was never registered the only honest notice
+    /// is in the tooltip. A bare `set_tray_tip` at registration time does not
+    /// work, because every state transition writes the tip again a few
+    /// statements later - so the fact has to live on `App` and come out through
+    /// `state_tip` like `hotkey_ok` does.
+    ///
+    /// False only when a registration that was attempted failed. True for
+    /// HOTKEY=none, where there is nothing to claim, and true before the first
+    /// session - the value is set when the key is claimed.
+    cancel_key_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -335,6 +349,11 @@ pub fn main() {
         // menu's Dictate item is then the only start and stop control (vk == 0
         // is the disabled sentinel). A disabled control is not a failed one,
         // so the tip may still say where dictation moved.
+        //
+        // `hk_vk == 0` is the sentinel the parser writes for the disabled
+        // spelling, and it agrees with `config::hotkey_is_disabled` because the
+        // parser derives the pair from that same predicate - so the string and
+        // the number cannot drift apart.
         let hotkey_ok = if hk_vk == 0 {
             log("hotkey disabled (HOTKEY=none); use the tray menu to dictate");
             true
@@ -608,12 +627,12 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     if !has_config {
         return "mnvoice - NO API KEY. Set API_KEY in mnvoice.env (see log).".to_string();
     }
-    // "Disabled" is decided in one place, `hotkey_is_disabled`, rather than
-    // by an exact string match here. The parser normalises to lowercase "none"
-    // and the window setup tests the `hk_vk == 0` sentinel - three spellings of
-    // one rule, where this third one silently degraded to "mnvoice - idle. none
-    // to dictate." if the parser's normalisation ever changed.
-    if hotkey.is_empty() || hotkey_is_disabled(hotkey) {
+    // "Disabled" is decided by the one predicate in `config`, which the
+    // dictate-key parser, the cancel-key parser and the window setup's `vk == 0`
+    // sentinel all consume. This arm used to match the exact string "none" - a
+    // fourth spelling of one rule, which silently degraded to "mnvoice - idle.
+    // none to dictate." if the parser's normalisation ever changed.
+    if crate::config::hotkey_is_disabled(hotkey) {
         return "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string();
     }
     match (hotkey, hotkey_ok) {
@@ -622,21 +641,24 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     }
 }
 
-/// Whether `hotkey` is the disabled spelling.
-///
-/// One definition for a rule the parser, the window setup and the tray tip all
-/// need. The parser normalises to lowercase `"none"` when it builds the pair,
-/// so a case-insensitive compare here agrees with it by construction rather
-/// than by the two of them happening to spell it the same way today.
-fn hotkey_is_disabled(hotkey: &str) -> bool {
-    hotkey.eq_ignore_ascii_case("none")
-}
-
 /// The tray tooltip for a given session state. Single-sourced so left-click
 /// polling and state transitions never disagree on tooltip text.
-fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool, has_config: bool) -> String {
+fn state_tip(
+    state: State,
+    hotkey_str: &str,
+    hotkey_ok: bool,
+    cancel_key_ok: bool,
+    has_config: bool,
+) -> String {
     match state {
         State::Idle => idle_tip(hotkey_str, hotkey_ok, has_config),
+        // A cancel key that is not live outranks what the session is doing:
+        // the orb is on screen asking to be dismissed and Esc will not dismiss
+        // it. It is said in every live state, not only Idle, because the
+        // registration happens as the session starts.
+        State::Recording | State::Transcribing if !cancel_key_ok => {
+            "mnvoice - no cancel key (Esc is in use by another app)".to_string()
+        }
         State::Recording => "mnvoice - listening (auto-stops on silence)".to_string(),
         State::Transcribing => "mnvoice - transcribing...".to_string(),
     }
@@ -668,6 +690,7 @@ unsafe fn push_tip(hwnd: HWND, app: &App) {
             app.state,
             &app.hotkey_str,
             app.hotkey_ok,
+            app.cancel_key_ok,
             app.config.is_some(),
         ),
     );
@@ -750,6 +773,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // The registration result arrives after WM_CREATE (the
                     // hwnd did not exist yet); main sets the real value.
                     hotkey_ok: true,
+                    cancel_key_ok: true,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -923,24 +947,22 @@ fn toggle(app: &mut App) {
                         cfg.cancel_key.1,
                     )
                 } {
-                    Ok(()) => {}
+                    Ok(()) => app.cancel_key_ok = true,
                     Err(e) => {
                         // Another process already owns the combination, which
                         // is the exact condition `register_hotkey_with_retry`
                         // exists for on the dictate key. The orb still appears
-                        // below, and without a tip it advertises a cancel key
-                        // that was never live - so say so, the same way the
-                        // dictate key's failure does.
-                        log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
-                        unsafe {
-                            set_tray_tip(
-                                app.hwnd,
-                                &format!(
-                                    "{} could not be claimed, so there is no cancel key",
-                                    cfg.cancel_key_str
-                                ),
-                            );
-                        }
+                        // below and advertises a cancel key that was never
+                        // live, so the fact is recorded on `App` and comes out
+                        // through `state_tip` like `hotkey_ok` does. A bare
+                        // `set_tray_tip` here does not work: the Recording arm
+                        // a few statements below writes the tip again and the
+                        // warning would never be readable.
+                        log(&format!(
+                            "RegisterHotKey({}) failed: {e}",
+                            cfg.cancel_key_str
+                        ));
+                        app.cancel_key_ok = false;
                     }
                 }
             }
@@ -999,9 +1021,24 @@ fn toggle(app: &mut App) {
         // rather than removed and the hotkey is registered regardless, the press
         // was swallowed with no log line, no tip and no state change - the orb
         // sat there transcribing and the user could not tell whether the press
-        // had registered. The words are already committed by the time this
-        // state is reached, so cancelling only stops the tail from typing.
-        State::Transcribing => cancel(app),
+        // had registered.
+        //
+        // Scoped to streaming. On REST, "transcribing" is the whole job - the
+        // audio has been uploaded and nothing is committed yet - so cancelling
+        // here throws away a dictation the user already spoke and paid for:
+        // `dictate_rest` re-checks `cancelled` after the round trip and refuses
+        // to type. On streaming the words arrive incrementally, so the tail is
+        // all that a cancel can still discard. On REST the press stays a no-op
+        // because there is no partial result to stop; naming that in the tray
+        // label would be the honest next step, and it is a product decision
+        // rather than a code fix.
+        State::Transcribing => {
+            let streaming = app.config.as_ref().map(|c| c.protocol)
+                == Some(crate::config::Protocol::Streaming);
+            if streaming {
+                cancel(app);
+            }
+        }
     }
 }
 
@@ -1073,9 +1110,11 @@ fn worker(
     let max_seconds = cfg.max_seconds;
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
-    // The outer Err means the request could not even be queued (the engine is
-    // gone). Its message is dropped here, but its shape is not: `capture_fault`
-    // classifies `None` as the engine-unavailable capture failure.
+    // The outer Err means the request could not even be queued, i.e. the audio
+    // worker thread is gone. Its message is dropped here, but its shape is not:
+    // `capture_fault` classifies `None` as that failure. It is not the engine -
+    // an engine that cannot initialise reports through the done channel and so
+    // arrives as `Some`.
     let capture_done = audio_engine
         .capture_to_channel(
             stop_audio,
@@ -1270,14 +1309,33 @@ fn autostart_starting(state: AutostartState) -> bool {
 fn autostart_enabled() -> bool {
     let state = if task_exists() {
         AutostartState::TaskPresent
-    } else if run_key_set() == Some(false) {
-        AutostartState::NoRunValue
-    } else if run_key_disabled() {
-        AutostartState::RunValueDisabled
     } else {
-        AutostartState::RunValueEnabled
+        autostart_state_from_run_key(run_key_set(), run_key_disabled())
     };
     autostart_starting(state)
+}
+
+/// Classify what the Run value alone says, given a query that may not have been
+/// answerable.
+///
+/// `None` is unanswerable, not enabled. Treating it as enabled would both draw
+/// a checkmark nothing verified and, worse, make the toggle compute
+/// `enable = false` - so a click would delete a task rather than create one,
+/// the inverse of what was asked for. That is the same collapse into two states
+/// as the `clear_run_key` defect, and it was open here too: only "absent" was
+/// named, so every other non-present value fell through to enabled.
+///
+/// Kept apart from `autostart_enabled` so the four cases can be asserted
+/// without spawning `reg.exe`.
+fn autostart_state_from_run_key(present: Option<bool>, disabled: bool) -> AutostartState {
+    match present {
+        Some(false) => AutostartState::NoRunValue,
+        Some(true) if disabled => AutostartState::RunValueDisabled,
+        Some(true) => AutostartState::RunValueEnabled,
+        // Nothing could be read, so nothing may be claimed. Reading as
+        // not-enabled is the safe click direction: the menu item enables.
+        None => AutostartState::NoRunValue,
+    }
 }
 
 /// Whether the Run value is present.
@@ -1883,10 +1941,43 @@ mod tests {
         // The logon task answers the question on its own, and so does a Run
         // value Windows still starts; an entry the user turned off in Task
         // Manager starts nothing, and so does a machine with neither.
+
         assert!(autostart_starting(AutostartState::TaskPresent));
         assert!(autostart_starting(AutostartState::RunValueEnabled));
         assert!(!autostart_starting(AutostartState::RunValueDisabled));
         assert!(!autostart_starting(AutostartState::NoRunValue));
+    }
+
+    /// An unanswerable Run-key read must not read as "enabled".
+    ///
+    /// The toggle computes `enable = !autostart_enabled()`, so a state that
+    /// wrongly reads as enabled makes a click delete a task instead of creating
+    /// one - the inverse of what the user asked for, in the one state the
+    /// three-way read was introduced to name.
+    #[test]
+    fn an_unanswerable_run_key_does_not_read_as_enabled() {
+        // reg.exe cannot be spawned: nothing was verified, so nothing is claimed.
+        assert_eq!(
+            autostart_state_from_run_key(None, false),
+            AutostartState::NoRunValue
+        );
+        assert!(!autostart_starting(autostart_state_from_run_key(
+            None, false
+        )));
+
+        // The three answerable cases still classify as before.
+        assert_eq!(
+            autostart_state_from_run_key(Some(false), false),
+            AutostartState::NoRunValue
+        );
+        assert_eq!(
+            autostart_state_from_run_key(Some(true), true),
+            AutostartState::RunValueDisabled
+        );
+        assert_eq!(
+            autostart_state_from_run_key(Some(true), false),
+            AutostartState::RunValueEnabled
+        );
     }
 
     #[test]
@@ -2062,22 +2153,43 @@ mod tests {
     #[test]
     fn the_tray_state_tip_reflects_session_state() {
         assert_eq!(
-            state_tip(State::Idle, "Alt+Space", true, true),
+            state_tip(State::Idle, "Alt+Space", true, true, true),
             "mnvoice - idle. Alt+Space to dictate."
         );
         assert_eq!(
-            state_tip(State::Recording, "Alt+Space", true, true),
+            state_tip(State::Recording, "Alt+Space", true, true, true),
             "mnvoice - listening (auto-stops on silence)"
         );
         assert_eq!(
-            state_tip(State::Transcribing, "Alt+Space", true, true),
+            state_tip(State::Transcribing, "Alt+Space", true, true, true),
             "mnvoice - transcribing..."
+        );
+    }
+
+    /// A cancel key that never registered has to say so, because the orb is on
+    /// screen asking to be dismissed and Esc will not dismiss it.
+    ///
+    /// It outranks what the session is doing, so it shows in the live states
+    /// too - and it has to come through `state_tip` rather than a one-shot
+    /// `set_tray_tip`, because every state transition writes the tip again.
+    #[test]
+    fn a_missing_cancel_key_is_named_in_every_live_state() {
+        for state in [State::Recording, State::Transcribing] {
+            assert_eq!(
+                state_tip(state, "Alt+Space", true, false, true),
+                "mnvoice - no cancel key (Esc is in use by another app)"
+            );
+        }
+        // A live cancel key leaves the normal tip alone.
+        assert_eq!(
+            state_tip(State::Recording, "Alt+Space", true, true, true),
+            "mnvoice - listening (auto-stops on silence)"
         );
     }
 
     /// The capture report is classified in every shape it can arrive in.
     ///
-    /// The REST arm and the streaming arm share this one classifier, so a
+        /// The REST arm and the streaming arm share this one classifier, so a
     /// broken microphone is never reported as NO_SPEECH on either - telling a
     /// user whose Windows Audio service just stopped that they said nothing is
     /// the misleading diagnostic the four init_wasapi messages exist to

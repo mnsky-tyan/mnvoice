@@ -628,8 +628,7 @@ fn swap_interrupted(exe: &Path) -> bool {
 /// install unverified bytes must not also throw away the copy that still runs.
 fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Result<(), String> {
     if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
-        restore_old_image(exe)?;
-        return Err(e);
+        return Err(restore_or_keep_reason(exe, e));
     }
     // The accepting branch restores too, not just the refusing one.
     // `swap_interrupted` proved the exe path is empty - that is the whole state
@@ -644,10 +643,25 @@ fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Resu
     // last thing that can repair anything, and "no exe" and "refused to
     // install" must not produce the same log line.
     if let Err(e) = finish_swap(exe) {
-        restore_old_image(exe)?;
-        return Err(e);
+        return Err(restore_or_keep_reason(exe, e));
     }
     Ok(())
+}
+
+/// Restore the swap-aside image and report both what went wrong and whether the
+/// restore worked.
+///
+/// Returning `restore_old_image(exe)?` on its own threw away the reason the
+/// install was refused, so the one log line said only that the restore failed -
+/// losing half of the two things it exists to distinguish. Combining them keeps
+/// both: what was refused, and what is now on disk.
+fn restore_or_keep_reason(exe: &Path, reason: String) -> String {
+    match restore_old_image(exe) {
+        Ok(()) => reason,
+        Err(restore_err) => {
+            format!("{reason}; and the previous image could not be put back ({restore_err})")
+        }
+    }
 }
 
 /// Move the staged image into the exe path, which the interrupted process could
@@ -663,8 +677,7 @@ fn restore_old_image(exe: &Path) -> Result<(), String> {
     if exe.exists() || !old.exists() {
         return Ok(());
     }
-    fs::rename(&old, exe)
-        .map_err(|e| format!("cannot put the previous image back ({e})"))
+    fs::rename(&old, exe).map_err(|e| format!("cannot put the previous image back ({e})"))
 }
 
 /// Re-checks the staged file against the bytes that were verified in memory.
