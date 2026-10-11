@@ -352,9 +352,20 @@ pub fn run_stream(
     // unless the session was cancelled: a cancel is a hard discard (the same
     // rule dictate_rest enforces before its upload), so the queued tail must
     // not be shipped to the provider after the user said stop.
+    //
+    // A send error ends the drain rather than skipping the packet. Once a send
+    // fails the socket can carry no more data, so the packets behind it cannot
+    // be delivered either - continuing only re-pays the transport's write
+    // bound for each one. Measured before this stopped: 50 queued packets cost
+    // 1.6 s against a peer that stopped reading, 500 cost 300 s, and on Windows
+    // the send is not bounded at all, so the drain could not finish and
+    // `run_stream` never returned. The intent is unchanged: ship the queued
+    // tail when the peer is healthy, and stop the moment it is not.
     if !cancelled.load(Ordering::SeqCst) {
         while let Ok(packet_i16) = rx.try_recv() {
-            let _ = ws.send_binary(&pcm_bytes(&packet_i16));
+            if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
+                break;
+            }
         }
     }
 

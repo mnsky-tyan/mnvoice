@@ -628,7 +628,7 @@ fn swap_interrupted(exe: &Path) -> bool {
 /// install unverified bytes must not also throw away the copy that still runs.
 fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Result<(), String> {
     if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
-        restore_old_image(exe);
+        restore_old_image(exe)?;
         return Err(e);
     }
     // The accepting branch restores too, not just the refusing one.
@@ -638,8 +638,13 @@ fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Resu
     // running that could put one back. Restoring on both branches means the
     // install directory always ends up with a runnable image, whichever way the
     // repair went.
+    //
+    // A restore that fails is reported, not folded into the refusal beside it:
+    // the parent is gone by this branch's own premise, so the helper is the
+    // last thing that can repair anything, and "no exe" and "refused to
+    // install" must not produce the same log line.
     if let Err(e) = finish_swap(exe) {
-        restore_old_image(exe);
+        restore_old_image(exe)?;
         return Err(e);
     }
     Ok(())
@@ -653,12 +658,13 @@ fn finish_swap(exe: &Path) -> Result<(), String> {
 
 /// Put the swap-aside image back when a refused staged file would otherwise
 /// leave the install with no exe at all.
-fn restore_old_image(exe: &Path) {
+fn restore_old_image(exe: &Path) -> Result<(), String> {
     let old = old_path(exe);
     if exe.exists() || !old.exists() {
-        return;
+        return Ok(());
     }
-    let _ = fs::rename(&old, exe);
+    fs::rename(&old, exe)
+        .map_err(|e| format!("cannot put the previous image back ({e})"))
 }
 
 /// Re-checks the staged file against the bytes that were verified in memory.
@@ -694,11 +700,16 @@ fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<
         ));
     }
     let on_disk = fs::read(staged).map_err(|e| format!("cannot re-read staged exe ({e})"))?;
-    if sha256::hex_digest(&on_disk) != expected {
+    // Hashed once and reused for both the comparison and the message. This
+    // function only re-hashes on the paths where the installer is being
+    // refused - the tampered, torn or AV-restored cases - and the file is
+    // deleted immediately afterwards, so hashing it a second time to build the
+    // error string was pure waste on a multi-MB file.
+    let actual = sha256::hex_digest(&on_disk);
+    if actual != expected {
         let _ = fs::remove_file(staged);
         return Err(format!(
-            "staged exe does not match the checksum the installer verified (expected {expected}, got {}); refusing to install",
-            sha256::hex_digest(&on_disk)
+            "staged exe does not match the checksum the installer verified (expected {expected}, got {actual}); refusing to install"
         ));
     }
     Ok(())
