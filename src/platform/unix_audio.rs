@@ -217,9 +217,9 @@ fn run_session(
 /// The device's 20 ms tick boundary almost never lands on a frame boundary on
 /// a stereo device, so dropping the remainder loses a sample or two about
 /// fifty times a second and reads the rest of the next tick one sample out of
-/// phase. The Windows engine instead refuses a partial frame outright, which
-/// is not an option here: the realtime callback appends whatever the device
-/// handed it, so the tail has to be carried.
+/// phase. The Windows engine carries its tail the same way, so the two agree
+/// about the same hardware condition: a split frame is mixed as the one frame
+/// it is, not refused.
 fn take_frames(buffer: &Arc<Mutex<Vec<f32>>>, channels: usize) -> Vec<f32> {
     let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
     // Only whole frames leave the buffer, so what stays is by construction a
