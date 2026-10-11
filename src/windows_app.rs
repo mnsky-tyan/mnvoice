@@ -992,9 +992,9 @@ fn worker(
         .ok();
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
-    let mut result = match cfg.protocol {
+    let result = match cfg.protocol {
         config::Protocol::Streaming => {
-            match stream::run_stream(&cfg, &stop, &cancelled, rx) {
+            let mut result = match stream::run_stream(&cfg, &stop, &cancelled, rx) {
                 Ok(text) => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
@@ -1007,7 +1007,16 @@ fn worker(
                     log(&format!("streaming error: {e}"));
                     (false, e)
                 }
+            };
+            // This is the arm that leaves the capture report unread, so it is
+            // also the arm that classifies it; the REST arm consumes its own
+            // inside the match above. Every shape other than a clean `Ok(())`
+            // is a capture failure, and reporting it as NO_SPEECH would tell a
+            // user whose audio service stopped that they said nothing.
+            if let Some(e) = capture_fault(capture_done.as_ref()) {
+                result = (false, e);
             }
+            result
         }
         config::Protocol::Rest => {
             let mut samples = Vec::new();
@@ -1035,15 +1044,6 @@ fn worker(
         }
     };
 
-    // The REST arm above has already consumed the capture report; only the
-    // streaming path leaves it unread until here, so only that path classifies
-    // it a second time. Reading it on REST would consume a closed channel and
-    // overwrite a good transcript with a false capture fault.
-    if matches!(cfg.protocol, config::Protocol::Streaming) {
-        if let Some(e) = capture_fault(capture_done.as_ref()) {
-            result = (false, e);
-        }
-    }
     *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(session_id), LPARAM(0)) };
 }

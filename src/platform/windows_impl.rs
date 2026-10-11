@@ -78,12 +78,6 @@ impl RequestHandles {
         }
     }
 
-    /// The session handle, for the timeouts that are set on the session rather
-    /// than the request.
-    fn session(&self) -> *mut std::ffi::c_void {
-        self.session.expect("session handle still held")
-    }
-
     /// The request handle for the WinHTTP calls that take one.
     fn request(&self) -> *mut std::ffi::c_void {
         self.request.expect("request handle still held")
@@ -129,10 +123,13 @@ impl WinHttpTransport {
     /// Open a session, connect, and issue a request. The handles come back
     /// in a `RequestHandles` guard whose Drop closes them in the one correct
     /// order, so every early return below needs no teardown of its own.
+    ///
+    /// `timeout_ms` is `(resolve, connect, send, receive)` in milliseconds,
+    /// with 0 meaning no timeout.
     unsafe fn open(
         method: &str,
         url: &str,
-        timeout_ms: (i32, i32, i32),
+        timeout_ms: (i32, i32, i32, i32),
     ) -> Result<(RequestHandles, bool), String> {
         let (host, port, secure, path) = parse_base_url(url)?;
 
@@ -152,7 +149,7 @@ impl WinHttpTransport {
             timeout_ms.0,
             timeout_ms.1,
             timeout_ms.2,
-            timeout_ms.2,
+            timeout_ms.3,
         ) {
             return Err(format!("set timeouts ({e})"));
         }
@@ -245,7 +242,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
-            let (handles, _) = Self::open("GET", url, (0, 15_000, 45_000))?;
+            let (handles, _) = Self::open("GET", url, (0, 15_000, 45_000, 45_000))?;
             let request = handles.request();
 
             let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: {USER_AGENT}\r\n"));
@@ -282,7 +279,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // Uploads carry audio, so the read timeout is longer than the
             // feed's: a slow provider transcoding a long clip is not an error.
-            let (handles, _) = Self::open("POST", url, (0, 10_000, 60_000))?;
+            let (handles, _) = Self::open("POST", url, (0, 10_000, 60_000, 60_000))?;
             let request = handles.request();
 
             let auth_line = auth
@@ -329,28 +326,19 @@ impl Transport for WinHttpTransport {
             // timeout: `read` blocks until a frame, a close, or a transport
             // error, the contract the trait documents.
             //
-            // The send side is bounded anyway, and `open` cannot do it: its
-            // timeout tuple applies one value to both directions, so asking for
-            // a send bound through it would also put a receive bound on a socket
-            // whose whole contract is to block. WinHTTP treats 0 as "no
-            // timeout", so the pair is set explicitly right after the open -
-            // resolve 0, connect 10s, send 2s, receive 0 - with the send value
-            // matching the Unix backend's WRITE_TIMEOUT.
+            // The send side is bounded anyway, and the bound is asked for at
+            // request creation: a request inherits the session's timeouts when
+            // it is opened, so a bound set after the open may never reach the
+            // request this socket is upgraded from. The tuple asks for resolve
+            // 0, connect 10s, send 2s, receive 0, with the send value matching
+            // the Unix backend's WRITE_TIMEOUT.
             //
             // Without it a provider that stops reading blocks `send` forever on
             // the primary platform: the post-session drain in `stream.rs` runs
             // exactly then, and nothing after it can run, because the close
             // frame and the reader join come after it.
-            let (mut handles, _) = Self::open("GET", url, (0, 10_000, 0))?;
-            if let Err(e) = WinHttpSetTimeouts(
-                handles.session(),
-                0,
-                10_000,
-                WEBSOCKET_WRITE_TIMEOUT_MS,
-                0,
-            ) {
-                return Err(format!("set timeouts ({e})"));
-            }
+            let (mut handles, _) =
+                Self::open("GET", url, (0, 10_000, WEBSOCKET_WRITE_TIMEOUT_MS, 0))?;
             let request = handles.request();
 
             let opt_ok =
