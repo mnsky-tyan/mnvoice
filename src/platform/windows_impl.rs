@@ -26,10 +26,15 @@ use windows::Win32::Networking::WinHttp::*;
 const WINHTTP_QUERY_STATUS: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
-/// Send timeout for a streaming WebSocket, in the milliseconds WinHTTP takes.
+/// The send timeout requested for a streaming WebSocket, in the milliseconds
+/// WinHTTP takes.
 ///
-/// The same bound the Unix backend applies as `WRITE_TIMEOUT`, and for the same
-/// reason: a peer that stopped reading must not be able to park `send` forever.
+/// This is a value handed to `WinHttpSetTimeouts`, not a bound WinHTTP enforces
+/// on a WebSocket send: `WinHttpWebSocketSend` ignores it, so a Windows send to
+/// a peer that stopped reading blocks anyway. The bound that actually holds on
+/// a stalled peer is the Unix backend's `WRITE_TIMEOUT`; on Windows there is no
+/// equivalent, and `websocket` records the measurement that established it.
+///
 /// Kept as a plain constant rather than a `Duration` because
 /// `WinHttpSetTimeouts` counts milliseconds and nothing here needs the
 /// arithmetic.
@@ -326,17 +331,25 @@ impl Transport for WinHttpTransport {
             // timeout: `read` blocks until a frame, a close, or a transport
             // error, the contract the trait documents.
             //
-            // The send side is bounded anyway, and the bound is asked for at
-            // request creation: a request inherits the session's timeouts when
-            // it is opened, so a bound set after the open may never reach the
-            // request this socket is upgraded from. The tuple asks for resolve
-            // 0, connect 10s, send 2s, receive 0, with the send value matching
-            // the Unix backend's WRITE_TIMEOUT.
+            // The send timeout is asked for at request creation rather than after
+            // it: a request inherits the session's timeouts when it is opened, so
+            // a bound set after the open may never reach the request this socket
+            // is upgraded from. The tuple asks for resolve 0, connect 10s, send
+            // 2s, receive 0.
             //
-            // Without it a provider that stops reading blocks `send` forever on
-            // the primary platform: the post-session drain in `stream.rs` runs
-            // exactly then, and nothing after it can run, because the close
-            // frame and the reader join come after it.
+            // It does not bound the send, and this is measured rather than
+            // assumed. Against a real loopback peer that completes the WinHTTP
+            // handshake and then stops reading, `WinHttpWebSocketSend` stayed
+            // blocked past 60s with this value at 2s, past 120s with it at 100ms,
+            // and past 90s with WINHTTP_OPTION_SEND_TIMEOUT set on the request
+            // handle as well. WinHTTP exposes no option that bounds a WebSocket
+            // send - the only WebSocket-specific timeout is
+            // WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, which bounds the close
+            // handshake - so the post-session drain in `stream.rs` still parks
+            // with the close frame and the reader join behind it on this
+            // platform. The effective bound on a stalled peer is the Unix
+            // backend's `WRITE_TIMEOUT`; that asymmetry is the reason this is
+            // written down rather than left to the constant's name.
             let (mut handles, _) =
                 Self::open("GET", url, (0, 10_000, WEBSOCKET_WRITE_TIMEOUT_MS, 0))?;
             let request = handles.request();
