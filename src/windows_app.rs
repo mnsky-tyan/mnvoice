@@ -94,6 +94,19 @@ fn state_name(s: State) -> &'static str {
 }
 
 impl State {
+    /// The wire form, shared with the updater's worker thread.
+    ///
+    /// One encode, one decode. The encode used to be spelled out at two call
+    /// sites - the static's initializer and `set_state`'s store, both as a bare
+    /// `as u8` - while `from_code` re-spelled the table as
+    /// `1 => Recording, 2 => Transcribing, _ => Idle`. Nothing kept them in
+    /// agreement but declaration order, so inserting a variant - or reordering
+    /// them - silently remapped the shared atomic. Keeping both directions here
+    /// and nowhere else is what makes the table checkable.
+    const fn as_code(self) -> u8 {
+        self as u8
+    }
+
     fn from_code(code: u8) -> State {
         match code {
             1 => State::Recording,
@@ -110,7 +123,7 @@ impl State {
 /// thread's window for the answer: that lookup handed out a raw pointer into
 /// UI-thread-owned memory that another thread then read and aliased, which is
 /// only correct by luck and disappears entirely once the window is gone.
-static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle as u8);
+static SESSION_STATE: AtomicU8 = AtomicU8::new(State::Idle.as_code());
 
 /// Set at the very start of startup, before anything could consume the
 /// swap-aside image the previous process left behind, and read once the tray
@@ -123,7 +136,7 @@ static JUST_UPDATED: AtomicBool = AtomicBool::new(false);
 /// Record a state change in both the UI's own copy and the shared atomic.
 fn set_state(app: &mut App, state: State) {
     app.state = state;
-    SESSION_STATE.store(state as u8, Ordering::SeqCst);
+    SESSION_STATE.store(state.as_code(), Ordering::SeqCst);
 }
 
 struct App {
@@ -351,7 +364,12 @@ pub fn main() {
 /// process was that finisher.
 fn finish_pending_install(args: &[String]) -> bool {
     if let Some(pos) = args.iter().position(|a| a == update::FINISH_UPDATE_ARG) {
-        update::finish_install(args.get(pos + 1).map(std::path::Path::new));
+        let install = args.get(pos + 1).map(std::path::Path::new);
+        // The digest the installer verified, passed to the helper so the staged
+        // file it may have to finish installing is re-checked against it. See
+        // `update::finish_install`.
+        let digest = args.get(pos + 2).map(String::as_str);
+        update::finish_install(install, digest);
         return true;
     }
     false
@@ -582,6 +600,31 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+/// Push the tray tip for the state `app` is in right now.
+///
+/// `state_tip`'s doc says the *text* is single-sourced "so left-click polling
+/// and state transitions never disagree on tooltip text" - and it is. The
+/// *arguments* were not: this exact four-argument expression was spelled out at
+/// five call sites (the tray left-click, the worker teardown, both toggle arms
+/// and cancel), with every input a field of the same `App`, so a field the tip
+/// should reflect had to be threaded through five places. `hotkey_ok` already
+/// was, which is the drift this prevents rather than merely tidies.
+///
+/// Reads `app.state` rather than taking a state argument, so the tip always
+/// describes the state the app is in - at the four sites that call `set_state`
+/// first, that is the state they were hardcoding.
+unsafe fn push_tip(hwnd: HWND, app: &App) {
+    set_tray_tip(
+        hwnd,
+        &state_tip(
+            app.state,
+            &app.hotkey_str,
+            app.hotkey_ok,
+            app.config.is_some(),
+        ),
+    );
+}
+
 /// The tray icon's identity, shared by every `Shell_NotifyIconW` call: the
 /// window, the id and the GUID are what make four different calls address
 /// the same icon.
@@ -687,10 +730,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
                     let app = app_ref(hwnd);
-                    set_tray_tip(
-                        hwnd,
-                        &state_tip(app.state, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                    );
+                    push_tip(hwnd, app);
                 }
                 LRESULT(0)
             }
@@ -710,10 +750,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         orb.hide();
                     }
                     set_state(app, State::Idle);
-                    set_tray_tip(
-                        hwnd,
-                        &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                    );
+                    push_tip(hwnd, app);
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription. On REST nothing
@@ -867,12 +904,7 @@ fn toggle(app: &mut App) {
                 orb.show(orb::OrbState::Recording);
             }
             let _ = unsafe { SetTimer(app.hwnd, TIMER_ORB, 33, None) };
-            unsafe {
-                set_tray_tip(
-                    app.hwnd,
-                    &state_tip(State::Recording, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                )
-            };
+            unsafe { push_tip(app.hwnd, app) };
             log("recording started");
         }
         State::Recording => {
@@ -882,12 +914,7 @@ fn toggle(app: &mut App) {
             if let Some(orb) = &mut app.orb {
                 orb.set_state(orb::OrbState::Transcribing);
             }
-            unsafe {
-                set_tray_tip(
-                    app.hwnd,
-                    &state_tip(State::Transcribing, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-                )
-            };
+            unsafe { push_tip(app.hwnd, app) };
             log("recording stopped, transcribing");
         }
         State::Transcribing => {}
@@ -910,13 +937,30 @@ fn cancel(app: &mut App) {
     if let Some(orb) = &mut app.orb {
         orb.hide();
     }
-    unsafe {
-        set_tray_tip(
-            app.hwnd,
-            &state_tip(State::Idle, &app.hotkey_str, app.hotkey_ok, app.config.is_some()),
-        )
-    };
+    unsafe { push_tip(app.hwnd, app) };
     log("recording cancelled");
+}
+
+/// The capture report classified in every shape it can arrive in.
+///
+/// A clean `Ok(())` with a short buffer is silence. `None` means
+/// `capture_to_channel` returned `Err` (the engine was gone before the thread
+/// started) and `Err(RecvError)` means the audio worker dropped its sender
+/// without reporting - both are a broken microphone, and reporting either as
+/// `NO_SPEECH` tells a user whose Windows Audio service just stopped that they
+/// said nothing. The REST and streaming arms share this classifier so the two
+/// cannot drift apart again.
+fn capture_fault(done: Option<&std::sync::mpsc::Receiver<Result<(), String>>>) -> Option<String> {
+    match done {
+        None => Some("capture failed: the audio engine is unavailable".to_string()),
+        Some(done) => match done.recv() {
+            Ok(Err(e)) => Some(e),
+            // The worker dropped its sender without sending, which for this
+            // channel means it did not reach its own report.
+            Err(_) => Some("capture failed: the audio worker stopped".to_string()),
+            Ok(Ok(())) => None,
+        },
+    }
 }
 
 fn worker(
@@ -935,8 +979,8 @@ fn worker(
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
     // The outer Err means the request could not even be queued (the engine is
-    // gone); the original code ignored that case and so does this - it is not
-    // a capture failure the user can act on.
+    // gone). Its message is dropped here, but its shape is not: `capture_fault`
+    // classifies `None` as the engine-unavailable capture failure.
     let capture_done = audio_engine
         .capture_to_channel(
             stop_audio,
@@ -948,9 +992,9 @@ fn worker(
         .ok();
 
     // 2. Concurrently run transcription (streaming WebSocket or REST fallback)
-    let mut result = match cfg.protocol {
+    let result = match cfg.protocol {
         config::Protocol::Streaming => {
-            match stream::run_stream(&cfg, &stop, &cancelled, rx) {
+            let mut result = match stream::run_stream(&cfg, &stop, &cancelled, rx) {
                 Ok(text) => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
@@ -963,7 +1007,16 @@ fn worker(
                     log(&format!("streaming error: {e}"));
                     (false, e)
                 }
+            };
+            // This is the arm that leaves the capture report unread, so it is
+            // also the arm that classifies it; the REST arm consumes its own
+            // inside the match above. Every shape other than a clean `Ok(())`
+            // is a capture failure, and reporting it as NO_SPEECH would tell a
+            // user whose audio service stopped that they said nothing.
+            if let Some(e) = capture_fault(capture_done.as_ref()) {
+                result = (false, e);
             }
+            result
         }
         config::Protocol::Rest => {
             let mut samples = Vec::new();
@@ -977,26 +1030,9 @@ fn worker(
             // case - dictate_rest refuses to type it, and there is no reason
             // to upload it either.
             //
-            // Three shapes reach here and they are not the same outcome. A
-            // clean `Ok(())` with a short buffer really is no speech. But
-            // `capture_done == None` means `capture_to_channel` returned
-            // `Err` (the engine was gone before the thread started) and
-            // `Err(RecvError)` means the audio worker panicked before its
-            // `send` - both of those are a broken microphone, and reporting
-            // them as NO_SPEECH tells a user whose Windows Audio service just
-            // stopped that they said nothing, which is exactly the misleading
-            // diagnostic the four specific init_wasapi messages exist to
-            // prevent. Only the third shape is silence.
-            let capture_err = match &capture_done {
-                None => Some("capture failed: the audio engine is unavailable".to_string()),
-                Some(done) => match done.recv() {
-                    Ok(Err(e)) => Some(e),
-                    // The worker dropped its sender without sending, which for
-                    // this channel means it did not reach its own report.
-                    Err(_) => Some("capture failed: the audio worker stopped".to_string()),
-                    Ok(Ok(())) => None,
-                },
-            };
+            // Every shape of the report is classified by `capture_fault`, so a
+            // broken microphone is never reported as NO_SPEECH.
+            let capture_err = capture_fault(capture_done.as_ref());
             match capture_err {
                 Some(e) => (false, e),
                 None => match rest::dictate_rest(&cfg, &samples, &cancelled) {
@@ -1008,13 +1044,6 @@ fn worker(
         }
     };
 
-    // Streaming leaves the capture report unread until here; the REST arm above
-    // has already consumed it (a second recv sees a closed channel and no-ops).
-    if let Some(rx) = capture_done {
-        if let Ok(Err(e)) = rx.recv() {
-            result = (false, e);
-        }
-    }
     *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(session_id), LPARAM(0)) };
 }
@@ -1913,5 +1942,77 @@ mod tests {
             state_tip(State::Transcribing, "Alt+Space", true, true),
             "mnvoice - transcribing..."
         );
+    }
+
+    /// The capture report is classified in every shape it can arrive in.
+    ///
+    /// The REST arm and the streaming arm share this one classifier, so a
+    /// broken microphone is never reported as NO_SPEECH on either - telling a
+    /// user whose Windows Audio service just stopped that they said nothing is
+    /// the misleading diagnostic the four init_wasapi messages exist to
+    /// prevent. Before B2 the streaming arm read only `Ok(Err(_))`, so a
+    /// worker that panicked before its own `send` was reported as silence
+    /// there and as a capture fault on REST.
+    #[test]
+    fn the_capture_report_is_classified_in_every_shape() {
+        // The engine was gone before the capture thread even started.
+        assert_eq!(
+            capture_fault(None).as_deref(),
+            Some("capture failed: the audio engine is unavailable")
+        );
+
+        // The worker reported its own failure: that message is the answer.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let _ = tx.send(Err("no input audio device found".to_string()));
+        assert_eq!(
+            capture_fault(Some(&rx)).as_deref(),
+            Some("no input audio device found")
+        );
+
+        // The worker dropped its sender without reporting, which is what a
+        // panic before its own `send` looks like. That is a broken
+        // microphone, not silence.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        drop(tx);
+        assert_eq!(
+            capture_fault(Some(&rx)).as_deref(),
+            Some("capture failed: the audio worker stopped")
+        );
+
+        // A clean report is the only shape that is not a fault.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let _ = tx.send(Ok(()));
+        assert_eq!(capture_fault(Some(&rx)), None);
+    }
+
+    /// The shared session state has exactly one encode and one decode, and
+    /// they agree. Nothing but declaration order kept them in agreement
+    /// before, so inserting a variant - or reordering them - silently remapped
+    /// the atomic the updater's worker thread reads to decide whether the
+    /// binary may be swapped.
+    #[test]
+    fn the_state_code_table_round_trips_every_variant() {
+        let states = [State::Idle, State::Recording, State::Transcribing];
+        let codes: Vec<u8> = states.iter().map(|s| s.as_code()).collect();
+        for (state, code) in states.iter().zip(codes.iter()) {
+            let decoded = State::from_code(*code);
+            if decoded != *state {
+                panic!("code {code} must decode back to the state that produced it");
+            }
+            if state_name(*state).is_empty() {
+                panic!("every state still has a name");
+            }
+        }
+        // Distinct codes, or two states would be indistinguishable on the wire.
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            states.len(),
+            "codes must be distinct: {codes:?}"
+        );
+        // The static's initial value is the same encode, not a second spelling.
+        assert_eq!(SESSION_STATE.load(Ordering::SeqCst), State::Idle.as_code());
     }
 }

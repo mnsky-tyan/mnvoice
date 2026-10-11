@@ -315,19 +315,17 @@ fn feed_tags(feed: &str) -> Vec<String> {
 }
 
 /// The suffix this platform's release tags carry.
+///
+/// Windows-only, because this whole module is `#[cfg(windows)]` (see `main.rs`).
+/// The Linux and macOS builds have no updater at all: nothing outside this
+/// module reads a release feed or replaces a binary, so a
+/// `#[cfg(target_os = "linux")]` definition here would never be built - the
+/// earlier pair of them were dead code kept "for symmetry" and removed.
+/// `platform::tag_parts` is the one place the three-way split actually lives,
+/// so a new platform is added there, not here.
 #[cfg(windows)]
 const fn platform_release_suffix() -> &'static str {
     "win"
-}
-
-#[cfg(target_os = "linux")]
-const fn platform_release_suffix() -> &'static str {
-    "linux"
-}
-
-#[cfg(target_os = "macos")]
-const fn platform_release_suffix() -> &'static str {
-    "macos"
 }
 
 /// True when `tag` names this platform's release.
@@ -355,9 +353,11 @@ fn newest_tag_for_this_platform(feed: &str) -> Option<String> {
 /// platform, e.g. the "0.1.10" inside ".../releases/tag/v0.1.10". Tolerates a
 /// tag written without the `v`, and one carrying a platform suffix.
 ///
-/// The production path needs the tag, not just the version - it is what the
-/// asset URL is derived from - so this is the test-time spelling of
-/// `newest_tag_for_this_platform`.
+/// The production path needs the tag, not just the version - the asset URL is
+/// derived from it - so this is a test-only spelling of
+/// `newest_tag_for_this_platform`. It delegates rather than reimplementing, so
+/// the tests calling it exercise the production rule itself and there is
+/// nothing here to keep in sync with it.
 #[cfg(test)]
 pub fn parse_version_from_feed(feed: &str) -> Option<String> {
     newest_tag_for_this_platform(feed).map(|t| version_of_tag(&t))
@@ -413,8 +413,10 @@ fn current_exe() -> Result<PathBuf, String> {
 
 /// Argument that starts a second, short-lived copy of this exe to finish an
 /// install the starting process could not complete. The install to repair
-/// follows it on the command line. Handled at the top of main, before the
-/// single-instance mutex, which the app itself already holds.
+/// follows it on the command line, then the sha256 the installer verified, so
+/// the helper can re-check the staged exe before moving it into place. Handled
+/// at the top of main, before the single-instance mutex, which the app itself
+/// already holds.
 pub const FINISH_UPDATE_ARG: &str = "--finish-update";
 
 /// Argument that asks a freshly swapped-in exe to relaunch itself as the
@@ -459,13 +461,18 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // Checked against the release's own published checksum before anything
     // moves: a download that cannot be verified never reaches the staged file.
     verify_download(url, &rel.sha256_url, &bytes)?;
+    // The same digest handed to the recovery helper, so the file it may have to
+    // finish installing is re-checked against it after this process is gone.
+    // `verify_staged` already re-hashes the file on this side; this is the
+    // helper's copy of the same rule.
+    let digest = sha256::hex_digest(&bytes);
 
     // The helper waits on the other end of this pipe, so keeping the handle open
     // is how it learns this process is still the one installing: exiting, or being
     // killed, closes it all the same. It is in place before anything is moved, so
     // it is already watching when the swap starts, and it is stopped the moment
     // this process has resolved the install either way.
-    let mut helper = spawn_helper(&exe)?;
+    let mut helper = spawn_helper(&exe, &digest)?;
 
     let old = match stage_and_swap(&bytes, &exe, &busy) {
         Ok(old) => old,
@@ -493,15 +500,17 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
 ///
 /// A different image name can only come from a different file, so a copy of
 /// this exe is laid down in the temp directory and the install it has to
-/// repair is named on its command line, since the copy's own path says nothing
-/// about where the real exe lives. Both are taken from the installer, which is
-/// the only process that knows either.
-fn spawn_helper(exe: &Path) -> Result<std::process::Child, String> {
+/// repair is named on its command line, with the digest the installer verified
+/// after it, since the copy's own path says nothing about where the real exe
+/// lives. The copy, the install path and the digest all come from the
+/// installer, which is the only process that knows any of them.
+fn spawn_helper(exe: &Path, expected_digest: &str) -> Result<std::process::Child, String> {
     let copy = helper_copy_path();
     fs::copy(exe, &copy).map_err(|e| format!("cannot stage the update helper ({e})"))?;
     match Command::new(&copy)
         .arg(FINISH_UPDATE_ARG)
         .arg(exe)
+        .arg(expected_digest)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -539,6 +548,13 @@ fn stop_helper(helper: &mut std::process::Child) {
 /// Take the helper copies left in the temp directory away. Best effort, like
 /// clean_stale: Windows will not let a copy still in use go, and one still in
 /// use has already had its chance to do its work.
+///
+/// The sweep is by prefix, so it also reaches a copy this installer did not make.
+/// That is safe here only because `helper_copy_path` is unique per installer pid
+/// and Windows refuses to unlink a running image - a concurrent installer's
+/// helper survives, but that is a property of the OS rather than of this code.
+/// It is recorded rather than narrowed because the sweep's reachability needs a
+/// second installer, which the single-instance mutex exists to prevent.
 fn reap_helpers() {
     let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -559,7 +575,7 @@ fn reap_helpers() {
 /// the install directory with no exe at all and nothing running that could
 /// repair it. This code repairs it, and does nothing at all for every swap its
 /// parent finished or rolled back, so a healthy install is never taken over.
-pub fn finish_install(install: Option<&Path>) {
+pub fn finish_install(install: Option<&Path>, expected_digest: Option<&str>) {
     // The parent holds the only other end of this pipe, so a closed pipe means
     // it is gone: killed, crashed, or finished. Waiting here also means this
     // process never touches the files while its parent could still be swapping.
@@ -574,7 +590,19 @@ pub fn finish_install(install: Option<&Path>) {
     if !swap_interrupted(exe) {
         return;
     }
-    if let Err(e) = finish_swap(exe) {
+    // Re-hash the staged file against the digest the installer verified, before
+    // moving it over the exe.
+    //
+    // This window is the one pass 7 closed for the live installer, and the
+    // parent is killed in exactly the state this serves, so the helper is the
+    // only verifier left. `verify_download` proved the bytes it downloaded; this
+    // proves the file on disk is still those bytes, across the whole interval
+    // during which the helper was the only thing holding them.
+    //
+    // A digest that cannot be read off the command line is a refusal, not a
+    // skip: the helper has no other source of truth, and installing unverified
+    // bytes is the failure this is here to prevent.
+    if let Err(e) = repair_interrupted_install(exe, expected_digest) {
         crate::windows_app::log(&format!("update helper: {e}"));
         return;
     }
@@ -593,10 +621,44 @@ fn swap_interrupted(exe: &Path) -> bool {
     !exe.exists() && staged_path(exe).exists()
 }
 
+/// Verify the staged image and move it in, or restore the previous image.
+///
+/// The helper reaches this only with the exe absent (`swap_interrupted` proved
+/// it), so the swap-aside image is the one runnable copy left: refusing to
+/// install unverified bytes must not also throw away the copy that still runs.
+fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Result<(), String> {
+    if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
+        restore_old_image(exe);
+        return Err(e);
+    }
+    // The accepting branch restores too, not just the refusing one.
+    // `swap_interrupted` proved the exe path is empty - that is the whole state
+    // this function exists for - so a failed final rename leaves exactly what
+    // `restore_old_image` was added to prevent: no exe at all, and nothing
+    // running that could put one back. Restoring on both branches means the
+    // install directory always ends up with a runnable image, whichever way the
+    // repair went.
+    if let Err(e) = finish_swap(exe) {
+        restore_old_image(exe);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Move the staged image into the exe path, which the interrupted process could
 /// not.
 fn finish_swap(exe: &Path) -> Result<(), String> {
     fs::rename(staged_path(exe), exe).map_err(|e| format!("cannot finish the install ({e})"))
+}
+
+/// Put the swap-aside image back when a refused staged file would otherwise
+/// leave the install with no exe at all.
+fn restore_old_image(exe: &Path) {
+    let old = old_path(exe);
+    if exe.exists() || !old.exists() {
+        return;
+    }
+    let _ = fs::rename(&old, exe);
 }
 
 /// Re-checks the staged file against the bytes that were verified in memory.
@@ -607,13 +669,36 @@ fn finish_swap(exe: &Path) -> Result<(), String> {
 /// A mismatch removes the staged file exactly as the `busy()` branch does, so a
 /// tampered or torn write cannot be left beside the exe for the next attempt.
 fn verify_staged(staged: &Path, expected: &[u8]) -> Result<(), String> {
-    let on_disk = fs::read(staged).map_err(|e| format!("cannot re-read staged exe ({e})"))?;
-    if on_disk != expected {
+    verify_staged_digest(staged, Some(&sha256::hex_digest(expected)))
+}
+
+/// The helper's spelling of the same check: the digest arrives as text on the
+/// command line, so the staged file is hashed and the digests are compared.
+///
+/// Same rule as `verify_staged` - a mismatch removes the staged file, so a
+/// tampered or torn write cannot be left beside the exe for the next attempt -
+/// reached from a process that can be told the bytes' hash but not the bytes.
+fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<(), String> {
+    let expected = expected_digest
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let is_hex = expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_hex {
+        // Taken away on this path too, not just on a digest mismatch: either way
+        // the helper is refusing to install, and a staged file it refuses is one
+        // the next attempt would trip over.
         let _ = fs::remove_file(staged);
         return Err(format!(
-            "staged exe changed on disk after it was written ({} bytes written, {} read); refusing to install",
-            expected.len(),
-            on_disk.len()
+            "the update helper was given no usable checksum for the staged exe ({expected_digest:?}); refusing to install"
+        ));
+    }
+    let on_disk = fs::read(staged).map_err(|e| format!("cannot re-read staged exe ({e})"))?;
+    if sha256::hex_digest(&on_disk) != expected {
+        let _ = fs::remove_file(staged);
+        return Err(format!(
+            "staged exe does not match the checksum the installer verified (expected {expected}, got {}); refusing to install",
+            sha256::hex_digest(&on_disk)
         ));
     }
     Ok(())
@@ -698,6 +783,12 @@ fn check_exe_payload(bytes: &[u8]) -> Result<(), String> {
 /// `left_old_image_behind`, which consumes it as it reads it; it must not be
 /// tidied here first or the just-updated announcement would never fire.)
 /// Best effort.
+///
+/// Deletes unconditionally, and the ordering that makes that safe lives in the
+/// caller: `startup_cleanup` runs before any helper is spawned, and a helper
+/// from an earlier install cannot still be running, because it only exists for
+/// as long as its parent's pipe is open - which closes when that parent exits.
+/// The same reasoning protects the helper copies `reap_helpers` sweeps.
 fn clean_stale(exe: &Path) {
     let _ = fs::remove_file(staged_path(exe));
 }
@@ -1755,6 +1846,145 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The recovery helper must re-hash the staged file, not just move it.
+    ///
+    /// The helper repairs the window in which the installer was killed between
+    /// the two renames. That is the same window pass 7 closed for the live
+    /// installer - and the parent is dead in exactly the state the helper
+    /// serves, so the helper is the only verifier left. It is told the digest
+    /// as text on the command line, so it hashes the file and compares digests.
+    ///
+    /// `None` is the "nothing arrived on the command line" case, which is the
+    /// shape of an older helper or a mangled spawn: refused, not skipped,
+    /// because the helper has no other source of truth.
+    #[test]
+    fn the_helper_rehashes_the_staged_file_before_finishing_the_swap() {
+        let (dir, exe) = install_folder("helper-rehash");
+        let staged = staged_path(&exe);
+        let good = downloaded_exe();
+        fs::write(&staged, &good).unwrap();
+        let digest = sha256::hex_digest(&good);
+
+        // The digest that matches the file on disk: accepted.
+        verify_staged_digest(&staged, Some(&digest)).expect("a matching digest is accepted");
+        assert!(staged.exists(), "an accepted file is left in place");
+
+        // A file rewritten after the installer verified it, same length so this
+        // is a rewrite rather than a truncation.
+        let mut tampered = good.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        fs::write(&staged, &tampered).unwrap();
+        let err = verify_staged_digest(&staged, Some(&digest)).expect_err("a rewrite is refused");
+        assert!(
+            err.contains("refusing to install"),
+            "unexpected error: {err}"
+        );
+        // And removed, so it cannot be left beside the exe for the next attempt.
+        assert!(!staged.exists(), "a refused file must be taken away: {err}");
+
+        // No digest at all: refused, not skipped.
+        fs::write(&staged, &good).unwrap();
+        let err = verify_staged_digest(&staged, None).expect_err("no digest is a refusal");
+        assert!(
+            err.contains("no usable checksum"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !staged.exists(),
+            "a refusal must still take the file away: {err}"
+        );
+
+        // A digest that is not 64 hex characters: also a refusal, since the
+        // command line is the only thing carrying it.
+        fs::write(&staged, &good).unwrap();
+        let err = verify_staged_digest(&staged, Some("nope")).expect_err("garbage is a refusal");
+        assert!(
+            err.contains("no usable checksum"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A helper that refuses the staged file must put the previous image back.
+    ///
+    /// The helper runs only in the interrupted state, where the exe path is
+    /// empty and the swap-aside image is the one runnable copy left. A staged
+    /// file altered in that window (the AV/EDR restore the re-hash exists for)
+    /// is refused - but deleting the last staged copy and stopping would leave
+    /// the install with no exe at all, which nothing auto-recovers. Refusing
+    /// the bytes must not throw away the copy that still runs.
+    #[test]
+    fn a_helper_refusal_restores_the_previous_image_instead_of_bricking_the_install() {
+        let good = downloaded_exe();
+        let digest = sha256::hex_digest(&good);
+        let mut tampered = good.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+
+        // A tampered staged file with the matching-digest shape, then the two
+        // unusable-digest shapes: every refusal the helper can reach.
+        for (name, on_disk, expected) in [
+            (
+                "helper-refusal-tampered",
+                tampered.as_slice(),
+                Some(digest.as_str()),
+            ),
+            ("helper-refusal-none", good.as_slice(), None),
+            (
+                "helper-refusal-garbage",
+                good.as_slice(),
+                Some("not-a-digest"),
+            ),
+        ] {
+            let (dir, exe) = install_folder(name);
+            // The interrupted state: the running image was moved aside and the
+            // process died before the staged image landed.
+            fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+            fs::write(staged_path(&exe), on_disk).unwrap();
+            assert!(
+                swap_interrupted(&exe),
+                "the interrupted state must be recognised"
+            );
+
+            let err = repair_interrupted_install(&exe, expected).unwrap_err();
+            assert!(
+                err.contains("refusing to install") || err.contains("no usable checksum"),
+                "unexpected error: {err}"
+            );
+            // The install is runnable again, and it is the previous image, not
+            // the refused bytes.
+            assert!(
+                exe.exists(),
+                "a refusal must not leave the install with no exe"
+            );
+            assert_eq!(fs::read(&exe).unwrap(), installed_exe());
+            assert!(
+                !staged_path(&exe).exists(),
+                "the refused staged file is gone"
+            );
+            assert!(!swap_interrupted(&exe), "nothing is left half-done");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The accepted path still installs the staged image and leaves no `.old`
+    /// behind, so the refusal recovery above did not change the ordinary swap.
+    #[test]
+    fn a_helper_that_accepts_the_staged_file_installs_it() {
+        let (dir, exe) = install_folder("helper-accept");
+        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        let good = downloaded_exe();
+        fs::write(staged_path(&exe), &good).unwrap();
+
+        repair_interrupted_install(&exe, Some(&sha256::hex_digest(&good))).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), good);
+        assert!(!staged_path(&exe).exists());
+        // The swap-aside image survives for the just-updated handshake.
+        assert!(dir.join("mnvoice.exe.old").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The staged file is what actually gets renamed over the exe, so the bytes
     /// that were verified in memory are re-read from disk and compared before
     /// the swap. A file rewritten in that window - an AV/EDR restore or
@@ -1778,7 +2008,14 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         tampered[last] ^= 0xFF;
         let err = verify_staged(&staged, &tampered).unwrap_err();
         assert!(
-            err.contains("staged exe changed on disk"),
+            err.contains("does not match the checksum the installer verified"),
+            "unexpected error: {err}"
+        );
+        // The refusal names the mismatch as what it is - a file that no longer
+        // holds the verified bytes - rather than a byte count, because the helper
+        // spelling compares digests and never sees the bytes.
+        assert!(
+            err.contains("refusing to install"),
             "unexpected error: {err}"
         );
         assert!(

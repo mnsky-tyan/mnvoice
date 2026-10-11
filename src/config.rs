@@ -50,6 +50,15 @@ pub fn load() -> Result<Config, String> {
     let mut raw = RawFields::new();
 
     // Check for keywords.txt beside the executable
+    //
+    // Three filenames, one fixed order, and they ADD to each other rather than
+    // overriding: all of them push into the same `raw.keywords` and the
+    // de-duplication further down is case-insensitive. So `vocabulary.txt` does
+    // not become the keyword list, it extends whatever `keywords.txt` already
+    // said, and `words.txt` extends both. That is deliberate - it lets a user
+    // keep a private keyterm file beside a shared one - but it is not obvious
+    // from the loop, and a user who writes a `vocabulary.txt` expecting it to be
+    // their list also sends the words from the other two.
     if let Ok(exe) = std::env::current_exe() {
         for filename in ["keywords.txt", "vocabulary.txt", "words.txt"] {
             let path = exe.with_file_name(filename);
@@ -234,6 +243,14 @@ fn auto_update_from_file() -> Option<String> {
 
 /// The `AUTO_UPDATE` value out of an env file body, or `None` if it never names
 /// one. `Some("")` means the key was present but empty, which is "off".
+///
+/// Matched case-insensitively, unlike the `FIELDS` lookup that reads every other
+/// key, which is case-sensitive. The asymmetry is deliberate - `AUTO_UPDATE` is
+/// read on a path where the rest of the config has already been rejected, so a
+/// config that fails to parse still gets its update decision honoured - but it
+/// does mean `auto_update=1` in a file arms automatic installs while a
+/// lowercased `api_key=` in the same file is silently ignored. Pinned by a test
+/// rather than being an accident.
 pub fn parse_auto_update_text(text: &str) -> Option<String> {
     let mut found = None;
     parse(text, |k, v| {
