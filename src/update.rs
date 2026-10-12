@@ -628,8 +628,7 @@ fn swap_interrupted(exe: &Path) -> bool {
 /// install unverified bytes must not also throw away the copy that still runs.
 fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Result<(), String> {
     if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
-        restore_old_image(exe)?;
-        return Err(e);
+        return Err(restore_or_keep_reason(exe, e));
     }
     // The accepting branch restores too, not just the refusing one.
     // `swap_interrupted` proved the exe path is empty - that is the whole state
@@ -642,12 +641,29 @@ fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Resu
     // A restore that fails is reported, not folded into the refusal beside it:
     // the parent is gone by this branch's own premise, so the helper is the
     // last thing that can repair anything, and "no exe" and "refused to
-    // install" must not produce the same log line.
+    // install" must not produce the same log line. Both halves are kept on
+    // every path, because `restore_old_image(exe)?` alone threw away the
+    // refusal reason - the one fact an operator needs about a staged file that
+    // failed its checksum and is about to be deleted.
     if let Err(e) = finish_swap(exe) {
-        restore_old_image(exe)?;
-        return Err(e);
+        return Err(restore_or_keep_reason(exe, e));
     }
     Ok(())
+}
+
+/// Restore the swap-aside image and report both what went wrong and whether the
+/// restore worked.
+///
+/// Composes rather than replaces: the refusal reason and the restore outcome are
+/// separate evidence, and losing either makes the single log line say less than
+/// the helper knows.
+fn restore_or_keep_reason(exe: &Path, reason: String) -> String {
+    match restore_old_image(exe) {
+        Ok(()) => reason,
+        Err(restore_err) => {
+            format!("{reason}; and the previous image could not be put back ({restore_err})")
+        }
+    }
 }
 
 /// Move the staged image into the exe path, which the interrupted process could
