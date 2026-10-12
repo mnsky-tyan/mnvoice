@@ -98,22 +98,17 @@ impl AudioEngine {
     }
 }
 
+/// The live capture session.
+///
+/// `format` is a copy, not a pointer: `GetMixFormat` returns a
+/// `CoTaskMemAlloc`'d block that is released as soon as it has been copied and
+/// read, so nothing here has to free it and `Drop` has nothing to do. The two
+/// clients below release their own handles.
 struct EngineState {
     client: IAudioClient,
     capture_client: IAudioCaptureClient,
     format: WAVEFORMATEX,
     kind: SampleKind,
-    mix_ptr: *mut WAVEFORMATEX,
-}
-
-impl Drop for EngineState {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.mix_ptr.is_null() {
-                CoTaskMemFree(Some(self.mix_ptr as *const std::ffi::c_void));
-            }
-        }
-    }
 }
 
 unsafe fn init_wasapi() -> Result<EngineState, String> {
@@ -130,6 +125,14 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
     let mix_ptr = client
         .GetMixFormat()
         .map_err(|e| format!("GetMixFormat ({e})"))?;
+    // The format is copied out for `EngineState`, but `Initialize` still gets
+    // the original allocation - not this copy. WASAPI reads the format's `cbSize`
+    // bytes, and an extensible mix format's `WAVEFORMATEXTENSIBLE` is 40 bytes
+    // where `WAVEFORMATEX` is 18: handing `Initialize` a `WAVEFORMATEX` on the
+    // stack makes it read past the object. Passing the allocation is what the
+    // caller is entitled to, and `Initialize` copies what it needs, so the
+    // allocation is released straight afterwards - which is also why exactly one
+    // site frees it and no early return can leak it.
     let format = *mix_ptr;
     let kind = match sample_kind(&format, mix_ptr) {
         Ok(kind) => kind,
@@ -139,9 +142,11 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
         }
     };
 
-    client
-        .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None)
-        .map_err(|e| format!("audio client init ({e})"))?;
+    if let Err(e) = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None) {
+        unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
+        return Err(format!("audio client init ({e})"));
+    }
+    unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
 
     let capture_client: IAudioCaptureClient = client
         .GetService()
@@ -152,7 +157,6 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
         capture_client,
         format,
         kind,
-        mix_ptr,
     })
 }
 
@@ -224,6 +228,18 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             .map_err(|e| format!("capture buffer ({e})"))?;
 
         if frames > 0 && !ptr.is_null() {
+            // No tail to carry here, unlike the Unix engine. `GetBuffer`
+            // reports a whole number of frames and `block_align` is the frame's
+            // byte width, so this slice always ends on a frame boundary - which
+            // is also why `convert_mix`'s length guard cannot fire on this
+            // path. A carry was added and then removed: by induction it could
+            // never become non-empty, so it added a heap copy and a full memcpy
+            // to the 2 ms capture loop for a branch that never engaged. The
+            // guard's real reach is the format-derived checks inside
+            // `convert_mix`, which carrying bytes does not address; a live
+            // mid-session format change would need the decode format taken from
+            // the packet rather than the startup copy, which is a separate
+            // change.
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result.

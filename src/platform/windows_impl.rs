@@ -405,12 +405,20 @@ impl Transport for WinHttpTransport {
                 return Err("WebSocket upgrade failed".into());
             }
             let (connect, session) = handles.take_parents();
-
-            Ok(Box::new(WinHttpSocket {
+            // Bounded here, before the handle is boxed, so the close handshake
+            // `close()` performs cannot outlive the session on a peer that never
+            // answers it. Same value as the send bound above - but unlike that
+            // one, this option is honoured.
+            let socket = WinHttpSocket {
                 ws,
                 connect,
                 session,
-            }))
+            };
+            // A refused option leaves the teardown on WinHTTP's default, which
+            // is the bug this whole block exists to close, so it is reported
+            // rather than dropped. There is no fallback bound to install.
+            socket.set_close_timeout(WEBSOCKET_WRITE_TIMEOUT_MS)?;
+            Ok(Box::new(socket))
         }
     }
 }
@@ -438,6 +446,42 @@ struct WinHttpSocket {
 // thread sends audio.
 unsafe impl Send for WinHttpSocket {}
 unsafe impl Sync for WinHttpSocket {}
+
+impl WinHttpSocket {
+    /// Bound the close handshake this socket performs when `close` runs.
+    ///
+    /// `WinHttpWebSocketClose` is not a fire-and-forget: it exchanges a close
+    /// frame with the peer, and the only thing that bounds that exchange is
+    /// `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`. Left unset it takes WinHTTP's
+    /// default rather than this caller's, which is what let `close` block on a
+    /// peer that never answers - the Windows half of a drift the Unix backend
+    /// does not have, because it terminates the socket outright
+    /// (`shutdown(Both)`) instead of negotiating.
+    ///
+    /// Set on the socket rather than the request: the option belongs to the
+    /// WebSocket handle, and by the time this runs the request has already been
+    /// closed and handed over.
+    ///
+    /// A private inherent method, not a trait method, because the trait is the
+    /// seam both backends share and only this one has the concept.
+    ///
+    /// Returns whether the option took. A refused option is not a failure the
+    /// caller can route around - `close` has no alternative bound to fall back
+    /// to - but it is the only signal that the teardown is still on WinHTTP's
+    /// default, and silently dropping it is what left this unbounded in the
+    /// first place. The comparable calls in this file propagate for the same
+    /// reason.
+    fn set_close_timeout(&self, ms: i32) -> Result<(), String> {
+        unsafe {
+            WinHttpSetOption(
+                Some(self.ws),
+                WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+                Some(ms.to_ne_bytes().as_slice()),
+            )
+        }
+        .map_err(|e| format!("set close timeout ({e})"))
+    }
+}
 
 impl WebSocket for WinHttpSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {

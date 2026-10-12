@@ -628,8 +628,7 @@ fn swap_interrupted(exe: &Path) -> bool {
 /// install unverified bytes must not also throw away the copy that still runs.
 fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Result<(), String> {
     if let Err(e) = verify_staged_digest(&staged_path(exe), expected_digest) {
-        restore_old_image(exe);
-        return Err(e);
+        return Err(restore_or_keep_reason(exe, e));
     }
     // The accepting branch restores too, not just the refusing one.
     // `swap_interrupted` proved the exe path is empty - that is the whole state
@@ -638,11 +637,31 @@ fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Resu
     // running that could put one back. Restoring on both branches means the
     // install directory always ends up with a runnable image, whichever way the
     // repair went.
+    //
+    // A restore that fails is reported, not folded into the refusal beside it:
+    // the parent is gone by this branch's own premise, so the helper is the
+    // last thing that can repair anything, and "no exe" and "refused to
+    // install" must not produce the same log line.
     if let Err(e) = finish_swap(exe) {
-        restore_old_image(exe);
-        return Err(e);
+        return Err(restore_or_keep_reason(exe, e));
     }
     Ok(())
+}
+
+/// Restore the swap-aside image and report both what went wrong and whether the
+/// restore worked.
+///
+/// Returning `restore_old_image(exe)?` on its own threw away the reason the
+/// install was refused, so the one log line said only that the restore failed -
+/// losing half of the two things it exists to distinguish. Combining them keeps
+/// both: what was refused, and what is now on disk.
+fn restore_or_keep_reason(exe: &Path, reason: String) -> String {
+    match restore_old_image(exe) {
+        Ok(()) => reason,
+        Err(restore_err) => {
+            format!("{reason}; and the previous image could not be put back ({restore_err})")
+        }
+    }
 }
 
 /// Move the staged image into the exe path, which the interrupted process could
@@ -653,12 +672,12 @@ fn finish_swap(exe: &Path) -> Result<(), String> {
 
 /// Put the swap-aside image back when a refused staged file would otherwise
 /// leave the install with no exe at all.
-fn restore_old_image(exe: &Path) {
+fn restore_old_image(exe: &Path) -> Result<(), String> {
     let old = old_path(exe);
     if exe.exists() || !old.exists() {
-        return;
+        return Ok(());
     }
-    let _ = fs::rename(&old, exe);
+    fs::rename(&old, exe).map_err(|e| format!("cannot put the previous image back ({e})"))
 }
 
 /// Re-checks the staged file against the bytes that were verified in memory.
@@ -694,11 +713,16 @@ fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<
         ));
     }
     let on_disk = fs::read(staged).map_err(|e| format!("cannot re-read staged exe ({e})"))?;
-    if sha256::hex_digest(&on_disk) != expected {
+    // Hashed once and reused for both the comparison and the message. This
+    // function only re-hashes on the paths where the installer is being
+    // refused - the tampered, torn or AV-restored cases - and the file is
+    // deleted immediately afterwards, so hashing it a second time to build the
+    // error string was pure waste on a multi-MB file.
+    let actual = sha256::hex_digest(&on_disk);
+    if actual != expected {
         let _ = fs::remove_file(staged);
         return Err(format!(
-            "staged exe does not match the checksum the installer verified (expected {expected}, got {}); refusing to install",
-            sha256::hex_digest(&on_disk)
+            "staged exe does not match the checksum the installer verified (expected {expected}, got {actual}); refusing to install"
         ));
     }
     Ok(())
@@ -1197,16 +1221,23 @@ mod tests {
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-linux"/></entry>
         </feed>"#;
         assert_eq!(feed_tags(feed).len(), 2);
-        if cfg!(windows) {
-            assert!(newest_tag_for_this_platform(feed).is_none());
-            assert!(parse_version_from_feed(feed).is_none());
-        }
+        // The tags are other platforms' releases, so there is nothing here for
+        // this install to take on any platform. The module is Windows-only
+        // today, but the assertion is written to hold everywhere rather than
+        // hidden behind a `cfg!` whose body still compiles - and would still
+        // run its asserts - on a platform that cannot reach it.
+        assert!(newest_tag_for_this_platform(feed).is_none());
+        assert!(parse_version_from_feed(feed).is_none());
     }
 
     #[test]
     fn a_bare_tag_after_the_split_still_updates_windows() {
         // The legacy shape, and the shape the current Windows installs run:
-        // a bare tag is Windows' own release, however new the feed is.
+        // a bare tag is Windows' own release, however new the feed is. The
+        // expected tag names Windows explicitly because the rule being pinned
+        // is Windows' - a bare tag means "the one release that predates the
+        // per-platform split", which is this install's.
+        #![cfg(windows)]
         let feed = r#"<feed>
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-linux"/></entry>
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-win"/></entry>
@@ -1636,10 +1667,12 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
             !staged_path(&exe).exists(),
             "a rejected download reached the staged file"
         );
-        let mut old = exe.clone().into_os_string();
-        old.push(".old");
+        // The `.old` path comes from `old_path`, whose doc makes it the one
+        // definition. Rebuilding it here by hand meant a change to the suffix
+        // would leave this assertion checking a path nothing writes - green
+        // while covering nothing.
         assert!(
-            !PathBuf::from(old).exists(),
+            !old_path(&exe).exists(),
             "the running image was moved aside"
         );
         assert_eq!(

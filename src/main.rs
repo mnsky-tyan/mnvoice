@@ -23,6 +23,8 @@ mod paste;
 mod platform;
 mod rest;
 mod stream;
+#[cfg(test)]
+mod test_hooks;
 #[cfg(windows)]
 mod update;
 #[cfg(windows)]

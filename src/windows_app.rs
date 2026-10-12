@@ -67,6 +67,10 @@ const IDM_OPEN_KEYWORDS: usize = 6;
 const IDM_UPDATE: usize = 7;
 const TIMER_ORB: usize = 101;
 
+/// The tray icon's `uID`. With `TRAY_GUID` this is the icon's identity: every
+/// `Shell_NotifyIconW` call has to name the same pair.
+const TRAY_ICON_ID: u32 = 1;
+
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
 const WINDOW_NAME: PCWSTR = w!("mnvoice");
 const MUTEX_NAME: PCWSTR = w!("mnvoice-single-instance");
@@ -177,6 +181,20 @@ struct App {
     /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
     /// dictate" for a key that does nothing.
     hotkey_ok: bool,
+    /// Whether the cancel key (Esc by default) is actually live this session.
+    ///
+    /// `hotkey_ok`'s sibling, and needed because the tray tip is the only place
+    /// the user can be told a key is missing: the orb appears and advertises a
+    /// cancel key, and if that key was never registered the only honest notice
+    /// is in the tooltip. A bare `set_tray_tip` at registration time does not
+    /// work, because every state transition writes the tip again a few
+    /// statements later - so the fact has to live on `App` and come out through
+    /// `state_tip` like `hotkey_ok` does.
+    ///
+    /// False only when a registration that was attempted failed. True for
+    /// HOTKEY=none, where there is nothing to claim, and true before the first
+    /// session - the value is set when the key is claimed.
+    cancel_key_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -331,14 +349,22 @@ pub fn main() {
         // menu's Dictate item is then the only start and stop control (vk == 0
         // is the disabled sentinel). A disabled control is not a failed one,
         // so the tip may still say where dictation moved.
+        //
+        // `hk_vk == 0` is the sentinel the parser writes for the disabled
+        // spelling, and it agrees with `config::hotkey_is_disabled` because the
+        // parser derives the pair from that same predicate - so the string and
+        // the number cannot drift apart.
         let hotkey_ok = if hk_vk == 0 {
             log("hotkey disabled (HOTKEY=none); use the tray menu to dictate");
             true
         } else {
             register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
         };
-        app_ref(hwnd).hotkey_ok = hotkey_ok;
-        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, app_ref(hwnd).config.is_some()));
+        if let Some(app) = app_ref(hwnd) {
+            app.hotkey_ok = hotkey_ok;
+            let configured = app.config.is_some();
+            add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, configured));
+        }
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -454,8 +480,17 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
             hIcon: app_icon(),
             ..Default::default()
         };
-        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS {
-            log("RegisterClassW failed");
+        // A duplicate registration returns ERROR_CLASS_ALREADY_EXISTS, not
+        // ERROR_ALREADY_EXISTS: window classes live in the process atom table,
+        // and "this name is taken" is the atom table's own answer. Checking the
+        // wrong code here meant a second registration of the same name logged a
+        // failure that was not one. A relaunch is a fresh process with its own
+        // atom table, so in practice the class is new each time - the tolerance
+        // is for a future in-process second window.
+        let registered = RegisterClassW(&wc) != 0;
+        let taken = !registered && GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+        if !registered && !taken {
+            log(&format!("RegisterClassW failed ({})", GetLastError().0));
             return false;
         }
     }
@@ -553,8 +588,23 @@ struct AppInit {
     audio_engine: audio::AudioEngine,
 }
 
-fn app_ref(hwnd: HWND) -> &'static mut App {
-    unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App) }
+/// The live `App`, or nothing if the window has none.
+///
+/// Returns `Option` rather than a `&'static mut` into a null pointer. Window
+/// classes live in the process atom table, so a class registered once is
+/// shared by every window of that class in the process, and `WM_CREATE` on a
+/// second one would overwrite the first window's `GWLP_USERDATA` - which a
+/// blind dereference would read as an `App` that belongs to the other window.
+/// `WM_DESTROY` is the one path that clears the slot, so the value is absent
+/// exactly when the window is going away. Nothing today creates a second tray
+/// window, but the unchecked cast is what would make that a silent aliasing bug
+/// instead of a compile error at the call site.
+fn app_ref(hwnd: HWND) -> Option<&'static mut App> {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { &mut *ptr })
 }
 
 unsafe fn add_tray(hwnd: HWND, tip: &str) {
@@ -577,8 +627,15 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     if !has_config {
         return "mnvoice - NO API KEY. Set API_KEY in mnvoice.env (see log).".to_string();
     }
+    // "Disabled" is decided by the one predicate in `config`, which the
+    // dictate-key parser, the cancel-key parser and the window setup's `vk == 0`
+    // sentinel all consume. This arm used to match the exact string "none" - a
+    // fourth spelling of one rule, which silently degraded to "mnvoice - idle.
+    // none to dictate." if the parser's normalisation ever changed.
+    if crate::config::hotkey_is_disabled(hotkey) {
+        return "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string();
+    }
     match (hotkey, hotkey_ok) {
-        ("none", _) => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
         (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
         (hk, false) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
     }
@@ -586,9 +643,22 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
 
 /// The tray tooltip for a given session state. Single-sourced so left-click
 /// polling and state transitions never disagree on tooltip text.
-fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool, has_config: bool) -> String {
+fn state_tip(
+    state: State,
+    hotkey_str: &str,
+    hotkey_ok: bool,
+    cancel_key_ok: bool,
+    has_config: bool,
+) -> String {
     match state {
         State::Idle => idle_tip(hotkey_str, hotkey_ok, has_config),
+        // A cancel key that is not live outranks what the session is doing:
+        // the orb is on screen asking to be dismissed and Esc will not dismiss
+        // it. It is said in every live state, not only Idle, because the
+        // registration happens as the session starts.
+        State::Recording | State::Transcribing if !cancel_key_ok => {
+            "mnvoice - no cancel key (Esc is in use by another app)".to_string()
+        }
         State::Recording => "mnvoice - listening (auto-stops on silence)".to_string(),
         State::Transcribing => "mnvoice - transcribing...".to_string(),
     }
@@ -620,6 +690,7 @@ unsafe fn push_tip(hwnd: HWND, app: &App) {
             app.state,
             &app.hotkey_str,
             app.hotkey_ok,
+            app.cancel_key_ok,
             app.config.is_some(),
         ),
     );
@@ -632,7 +703,11 @@ fn tray_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: 1,
+        // Named like every other id this file hands out. `uID` is half of the
+        // icon's identity alongside `TRAY_GUID`: every `Shell_NotifyIconW`
+        // call has to name the same pair, and a bare literal is the one thing
+        // in that struct with no name to change together.
+        uID: TRAY_ICON_ID,
         uFlags: flags,
         guidItem: TRAY_GUID,
         ..Default::default()
@@ -698,6 +773,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // The registration result arrives after WM_CREATE (the
                     // hwnd did not exist yet); main sets the real value.
                     hotkey_ok: true,
+                    cancel_key_ok: true,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -706,21 +782,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER => {
                 if wparam.0 == TIMER_ORB {
-                    let app = app_ref(hwnd);
-                    if let Some(orb) = &mut app.orb {
-                        orb.tick();
+                    if let Some(app) = app_ref(hwnd) {
+                        if let Some(orb) = &mut app.orb {
+                            orb.tick();
+                        }
                     }
                 }
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                let app = app_ref(hwnd);
-                match wparam.0 as i32 {
-                    HOTKEY_TOGGLE => toggle(app),
-                    // Esc cancels and hides the orb at once. It must not "finish"
-                    // the phrase, which used to leave the orb sitting on screen.
-                    HOTKEY_ESC => cancel(app),
-                    _ => {}
+                if let Some(app) = app_ref(hwnd) {
+                    match wparam.0 as i32 {
+                        HOTKEY_TOGGLE => toggle(app),
+                        // Esc cancels and hides the orb at once. It must not
+                        // "finish" the phrase, which used to leave the orb
+                        // sitting on screen.
+                        HOTKEY_ESC => cancel(app),
+                        _ => {}
+                    }
                 }
                 LRESULT(0)
             }
@@ -729,13 +808,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
-                    let app = app_ref(hwnd);
-                    push_tip(hwnd, app);
+                    if let Some(app) = app_ref(hwnd) {
+                        push_tip(hwnd, app);
+                    }
                 }
                 LRESULT(0)
             }
             WM_APP_WORKER => {
-                let app = app_ref(hwnd);
+                let Some(app) = app_ref(hwnd) else {
+                    return LRESULT(0);
+                };
                 let msg_session = wparam.0;
                 if msg_session != app.session_id {
                     // Stale outcome from an earlier session; ignore completely.
@@ -778,13 +860,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // still believing the hotkey is owned, breaking the next start.
                         let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
-                        let app = app_ref(hwnd);
-                        set_state(app, State::Idle);
+                        if let Some(app) = app_ref(hwnd) {
+                            set_state(app, State::Idle);
+                        }
                         PostQuitMessage(0);
                     }
                     IDM_DICTATE => {
-                        let app = app_ref(hwnd);
-                        toggle(app);
+                        if let Some(app) = app_ref(hwnd) {
+                            toggle(app);
+                        }
                     }
                     IDM_STARTUP => {
                         // Toggle the logon task. The Run key is cleared as a side
@@ -804,8 +888,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // domain-locked machine that is a visible freeze from a
                         // single menu click.
                         thread::spawn(|| {
-                            let enable = !autostart_enabled();
-                            if let Err(e) = set_autostart(enable) {
+                            if let Err(e) = toggle_autostart() {
                                 log(&format!("autostart toggle failed: {e}"));
                             }
                         });
@@ -856,7 +939,7 @@ fn toggle(app: &mut App) {
             // The orb appearing used to leave a gap where Esc was dead, which
             // read as "Esc does not work right after the orb shows".
             if cfg.cancel_key.1 != 0 {
-                if let Err(e) = unsafe {
+                match unsafe {
                     RegisterHotKey(
                         app.hwnd,
                         HOTKEY_ESC,
@@ -864,7 +947,23 @@ fn toggle(app: &mut App) {
                         cfg.cancel_key.1,
                     )
                 } {
-                    log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
+                    Ok(()) => app.cancel_key_ok = true,
+                    Err(e) => {
+                        // Another process already owns the combination, which
+                        // is the exact condition `register_hotkey_with_retry`
+                        // exists for on the dictate key. The orb still appears
+                        // below and advertises a cancel key that was never
+                        // live, so the fact is recorded on `App` and comes out
+                        // through `state_tip` like `hotkey_ok` does. A bare
+                        // `set_tray_tip` here does not work: the Recording arm
+                        // a few statements below writes the tip again and the
+                        // warning would never be readable.
+                        log(&format!(
+                            "RegisterHotKey({}) failed: {e}",
+                            cfg.cancel_key_str
+                        ));
+                        app.cancel_key_ok = false;
+                    }
                 }
             }
 
@@ -917,7 +1016,29 @@ fn toggle(app: &mut App) {
             unsafe { push_tip(app.hwnd, app) };
             log("recording stopped, transcribing");
         }
-        State::Transcribing => {}
+        // Pressing the dictate key again mid-transcription means "stop".
+        // This arm used to do nothing at all, and because the tray item is greyed
+        // rather than removed and the hotkey is registered regardless, the press
+        // was swallowed with no log line, no tip and no state change - the orb
+        // sat there transcribing and the user could not tell whether the press
+        // had registered.
+        //
+        // Scoped to streaming. On REST, "transcribing" is the whole job - the
+        // audio has been uploaded and nothing is committed yet - so cancelling
+        // here throws away a dictation the user already spoke and paid for:
+        // `dictate_rest` re-checks `cancelled` after the round trip and refuses
+        // to type. On streaming the words arrive incrementally, so the tail is
+        // all that a cancel can still discard. On REST the press stays a no-op
+        // because there is no partial result to stop; naming that in the tray
+        // label would be the honest next step, and it is a product decision
+        // rather than a code fix.
+        State::Transcribing => {
+            let streaming = app.config.as_ref().map(|c| c.protocol)
+                == Some(crate::config::Protocol::Streaming);
+            if streaming {
+                cancel(app);
+            }
+        }
     }
 }
 
@@ -943,20 +1064,31 @@ fn cancel(app: &mut App) {
 
 /// The capture report classified in every shape it can arrive in.
 ///
-/// A clean `Ok(())` with a short buffer is silence. `None` means
-/// `capture_to_channel` returned `Err` (the engine was gone before the thread
-/// started) and `Err(RecvError)` means the audio worker dropped its sender
-/// without reporting - both are a broken microphone, and reporting either as
-/// `NO_SPEECH` tells a user whose Windows Audio service just stopped that they
-/// said nothing. The REST and streaming arms share this classifier so the two
-/// cannot drift apart again.
+/// A clean `Ok(())` with a short buffer is silence. `None` and `Err(RecvError)`
+/// both mean the audio worker is gone: `None` is the request channel refusing
+/// the hand-off (the only `Err` `capture_to_channel` can return), and
+/// `Err(RecvError)` is the worker dropping its sender without ever reporting.
+/// Both are a broken microphone, and reporting either as `NO_SPEECH` tells a
+/// user whose Windows Audio service just stopped that they said nothing. The
+/// REST and streaming arms share this classifier so the two cannot drift apart
+/// again.
+///
+/// `None` is deliberately named as the worker rather than the audio engine: an
+/// engine that fails to initialise still reports through the channel, as
+/// `Ok(Err(why))`, so it arrives as `Some` here with its own message. Naming
+/// the engine pointed a reader at the wrong subsystem for the one failure the
+/// `None` arm actually reports.
 fn capture_fault(done: Option<&std::sync::mpsc::Receiver<Result<(), String>>>) -> Option<String> {
     match done {
-        None => Some("capture failed: the audio engine is unavailable".to_string()),
+        None => Some("capture failed: the audio worker is not running".to_string()),
         Some(done) => match done.recv() {
             Ok(Err(e)) => Some(e),
             // The worker dropped its sender without sending, which for this
-            // channel means it did not reach its own report.
+            // channel means it did not reach its own report. Unreachable in a
+            // release build - `panic = "abort"` means a panicking worker takes
+            // the process down rather than unwinding out of it - so this is
+            // the defensive shape, not a case anyone has observed. Kept
+            // because a debug build can panic and the arm costs nothing.
             Err(_) => Some("capture failed: the audio worker stopped".to_string()),
             Ok(Ok(())) => None,
         },
@@ -978,9 +1110,11 @@ fn worker(
     let max_seconds = cfg.max_seconds;
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
-    // The outer Err means the request could not even be queued (the engine is
-    // gone). Its message is dropped here, but its shape is not: `capture_fault`
-    // classifies `None` as the engine-unavailable capture failure.
+    // The outer Err means the request could not even be queued, i.e. the audio
+    // worker thread is gone. Its message is dropped here, but its shape is not:
+    // `capture_fault` classifies `None` as that failure. It is not the engine -
+    // an engine that cannot initialise reports through the done channel and so
+    // arrives as `Some`.
     let capture_done = audio_engine
         .capture_to_channel(
             stop_audio,
@@ -1066,7 +1200,10 @@ fn dictate_item(state: State) -> (&'static str, bool) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let app = app_ref(hwnd);
+    let Some(app) = app_ref(hwnd) else {
+        // The window is being torn down; nothing left to show a menu for.
+        return;
+    };
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
         Err(_) => return,
@@ -1172,34 +1309,64 @@ fn autostart_starting(state: AutostartState) -> bool {
 fn autostart_enabled() -> bool {
     let state = if task_exists() {
         AutostartState::TaskPresent
-    } else if !run_key_set() {
-        AutostartState::NoRunValue
-    } else if run_key_disabled() {
-        AutostartState::RunValueDisabled
     } else {
-        AutostartState::RunValueEnabled
+        autostart_state_from_run_key(run_key_set(), run_key_disabled())
     };
     autostart_starting(state)
 }
 
-fn run_key_set() -> bool {
-    reg_cmd()
+/// Classify what the Run value alone says, given a query that may not have been
+/// answerable.
+///
+/// `None` is unanswerable, not enabled. Treating it as enabled would both draw
+/// a checkmark nothing verified and, worse, make the toggle compute
+/// `enable = false` - so a click would delete a task rather than create one,
+/// the inverse of what was asked for. That is the same collapse into two states
+/// as the `clear_run_key` defect, and it was open here too: only "absent" was
+/// named, so every other non-present value fell through to enabled.
+///
+/// Kept apart from `autostart_enabled` so the four cases can be asserted
+/// without spawning `reg.exe`.
+fn autostart_state_from_run_key(present: Option<bool>, disabled: bool) -> AutostartState {
+    match present {
+        Some(false) => AutostartState::NoRunValue,
+        Some(true) if disabled => AutostartState::RunValueDisabled,
+        Some(true) => AutostartState::RunValueEnabled,
+        // Nothing could be read, so nothing may be claimed. Reading as
+        // not-enabled is the safe click direction: the menu item enables.
+        None => AutostartState::NoRunValue,
+    }
+}
+
+/// Whether the Run value is present.
+///
+/// Three states, not two: `reg.exe` that cannot be spawned at all is
+/// *unanswerable*, and collapsing that into "absent" is what let
+/// `clear_run_key` report success for a delete that never ran. `task_state`
+/// spells the same distinction out with an explicit `Unknown` variant; this
+/// returns the same shape without needing an enum, because only the caller
+/// below has to care.
+fn run_key_set() -> Option<bool> {
+    match reg_cmd()
         .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) => Some(out.status.success()),
+        Err(_) => None,
+    }
 }
 
 /// Remove the pre-migration Run key entry, reporting whether it is gone.
 ///
-/// True when the value is not there any more, which is what `reg query`
-/// confirms afterwards: a delete that did not take against a policy or a
-/// security product leaves it in place, and nothing may read that as success.
-fn clear_run_key() -> bool {
+/// True only when a query that could be answered confirms the value is no
+/// longer there: a delete that did not take against a policy or a security
+/// product leaves it in place, and a query that cannot be run at all confirms
+/// nothing. Neither may read as success.
+fn clear_run_key() -> Option<bool> {
     let _ = reg_cmd()
         .args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
         .output();
-    !run_key_set()
+    run_key_set().map(|present| !present)
 }
 
 /// Whether the user has turned the Run-key autostart off in Task Manager.
@@ -1355,7 +1522,7 @@ fn autostart_lock() -> MutexGuard<'static, ()> {
 /// place, so the swap only ever runs in this direction.
 pub fn migrate_autostart() {
     let _mutation = autostart_lock();
-    if task_exists() || !run_key_set() {
+    if task_exists() || run_key_set() != Some(true) {
         return;
     }
     if run_key_disabled() {
@@ -1375,7 +1542,7 @@ pub fn migrate_autostart() {
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
-        if clear_run_key() {
+        if clear_run_key() == Some(true) {
             log("autostart moved from the Run key to a logon task");
         } else {
             // The logon task holds the autostart, but the Run value survived
@@ -1391,21 +1558,40 @@ pub fn migrate_autostart() {
 
 /// Whether turning autostart off left the logon task gone.
 ///
-/// A delete that exited zero did its job. One that failed has to be
-/// classified rather than trusted: a task that was never there already leaves
+/// One parameter, because that is the only question this answers: a delete
+/// that exited zero already did its job, and one that did not has to be
+/// classified rather than trusted - a task that was never there already leaves
 /// the requested state in place, while one that is still registered, or a
-/// question the scheduler could not answer, is a toggle that did not take -
-/// and there the Run key is still the only autostart the user has.
-fn delete_left_task_gone(delete_ok: bool, after: TaskState) -> bool {
-    delete_ok || after == TaskState::Absent
+/// question the scheduler could not answer, is a toggle that did not take, and
+/// there the Run key is still the only autostart the user has.
+fn delete_left_task_gone(after: TaskState) -> bool {
+    after == TaskState::Absent
 }
 
 /// Register or remove the at-logon autostart task. Reversible, no admin rights
 /// needed, and the Run key is cleared in both directions - but only once the
 /// scheduler is confirmed to hold the state that was asked for, so a toggle
 /// that did not take can never destroy the autostart the user had.
-fn set_autostart(enable: bool) -> Result<(), String> {
-    let _mutation = autostart_lock();
+///
+/// The read of the current state and the write of the new one are one operation
+/// under the autostart lock. Doing them apart - reading the state in the caller
+/// and handing the result here - let a concurrent toggle, or the startup
+/// migration, change the state between the two, so two clicks in quick
+/// succession could both read the same value and both write the same target.
+/// The lock's own contract is that a mutation holds it across its reads, so the
+/// read belongs inside it.
+///
+/// The guard is passed in rather than acquired here so a caller can hold one
+/// across its own read, which a second acquire inside could not do: the guard is
+/// not reentrant.
+fn toggle_autostart() -> Result<(), String> {
+    let mutation = autostart_lock();
+    let enable = !autostart_enabled();
+    set_autostart_guarded(mutation, enable)
+}
+
+fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Result<(), String> {
+    let _mutation = mutation;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.display().to_string();
     let mut cmd = schtasks_cmd();
@@ -1420,27 +1606,32 @@ fn set_autostart(enable: bool) -> Result<(), String> {
     } else {
         // The delete's own exit code is authority: a zero already means the
         // task is gone, so the scheduler is only asked when it says otherwise.
-        // The helper below takes `delete_ok` only to be callable from a test
-        // that wants to exercise the failed-delete branch; the live call site
-        // is inside this `else`, where a zero already short-circuited, so the
-        // flag is always false here.
-        status.success() || delete_left_task_gone(false, task_state())
+        status.success() || delete_left_task_gone(task_state())
     };
     if !in_place {
         // Whatever carries the autostart until the scheduler holds the one
         // that was asked for stays as it is, and the toggle reports what did
-        // not take rather than naming a fallback that is not there.
+        // not take rather than naming a fallback that is not there. So the
+        // enable branch checks before it claims the Run key: naming it
+        // unconditionally reported a fallback that may itself have been
+        // retired, which is the exact thing this branch exists to avoid.
         return Err(if enable {
-            "schtasks.exe could not create the logon task, keeping the Run key".into()
-        } else if run_key_set() {
+            if run_key_set() == Some(true) {
+                "schtasks.exe could not create the logon task, keeping the Run key".into()
+            } else {
+                "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
+                    .into()
+            }
+        } else if run_key_set() == Some(true) {
             "schtasks.exe could not remove the logon task, keeping the Run key".into()
         } else {
             "the logon task could not be confirmed removed".into()
         });
     }
-    if !clear_run_key() {
-        // The Run value survived, so the app still starts at logon however
-        // the task reads, and the log must not claim a move that half failed.
+    if clear_run_key() != Some(true) {
+        // The Run value survived, or its removal could not be confirmed, so
+        // the app still starts at logon however the task reads, and the log
+        // must not claim a move that half failed.
         return Err(if enable {
             "the Run key could not be retired, so mnvoice starts twice at logon".into()
         } else {
@@ -1750,10 +1941,43 @@ mod tests {
         // The logon task answers the question on its own, and so does a Run
         // value Windows still starts; an entry the user turned off in Task
         // Manager starts nothing, and so does a machine with neither.
+
         assert!(autostart_starting(AutostartState::TaskPresent));
         assert!(autostart_starting(AutostartState::RunValueEnabled));
         assert!(!autostart_starting(AutostartState::RunValueDisabled));
         assert!(!autostart_starting(AutostartState::NoRunValue));
+    }
+
+    /// An unanswerable Run-key read must not read as "enabled".
+    ///
+    /// The toggle computes `enable = !autostart_enabled()`, so a state that
+    /// wrongly reads as enabled makes a click delete a task instead of creating
+    /// one - the inverse of what the user asked for, in the one state the
+    /// three-way read was introduced to name.
+    #[test]
+    fn an_unanswerable_run_key_does_not_read_as_enabled() {
+        // reg.exe cannot be spawned: nothing was verified, so nothing is claimed.
+        assert_eq!(
+            autostart_state_from_run_key(None, false),
+            AutostartState::NoRunValue
+        );
+        assert!(!autostart_starting(autostart_state_from_run_key(
+            None, false
+        )));
+
+        // The three answerable cases still classify as before.
+        assert_eq!(
+            autostart_state_from_run_key(Some(false), false),
+            AutostartState::NoRunValue
+        );
+        assert_eq!(
+            autostart_state_from_run_key(Some(true), true),
+            AutostartState::RunValueDisabled
+        );
+        assert_eq!(
+            autostart_state_from_run_key(Some(true), false),
+            AutostartState::RunValueEnabled
+        );
     }
 
     #[test]
@@ -1762,6 +1986,39 @@ mod tests {
         assert_eq!(mods.0, config::DEFAULT_HOTKEY_MOD);
         assert_eq!(vk, config::DEFAULT_HOTKEY_VK);
         assert_eq!(s, config::DEFAULT_HOTKEY_STR);
+    }
+
+    /// An omitted HOTKEY keeps the default; only `none` disables it.
+    ///
+    /// The regression this pins is silent: folding "empty" into the disabled
+    /// predicate switched the documented Alt+Space default off for any config
+    /// that never mentioned HOTKEY, so the key stopped working with nothing in
+    /// the log saying why.
+    #[test]
+    fn an_omitted_hotkey_keeps_the_default_and_none_disables_it() {
+        // Through `derive`, which is what turns a raw HOTKEY line into the pair
+        // and the display string the tray shows.
+        let derive = |hotkey: &str| {
+            let cfg = config::load_from(&format!("HOTKEY={hotkey}\n"));
+            hotkey_of(&Some(std::sync::Arc::new(cfg)))
+        };
+
+        for empty in ["", "   "] {
+            let (mods, vk, s) = derive(empty);
+            assert_eq!(
+                (mods.0, vk, s.as_str()),
+                (
+                    config::DEFAULT_HOTKEY_MOD,
+                    config::DEFAULT_HOTKEY_VK,
+                    config::DEFAULT_HOTKEY_STR
+                ),
+                "{empty:?} must keep the default, not disable the key"
+            );
+        }
+
+        let (_mods, vk, s) = derive("none");
+        assert_eq!(vk, 0, "none must disable the toggle hotkey");
+        assert_eq!(s, "none");
     }
 
     #[test]
@@ -1839,15 +2096,13 @@ mod tests {
 
     #[test]
     fn a_failed_disable_only_counts_when_the_task_is_really_gone() {
-        // The delete's own exit code is authority, so a follow-up question
-        // that could not be answered changes nothing.
-        assert!(delete_left_task_gone(true, TaskState::Unknown));
-        assert!(delete_left_task_gone(true, TaskState::Absent));
-        // A delete that failed says nothing on its own: a task that was never
-        // there already leaves the requested state in place.
-        assert!(delete_left_task_gone(false, TaskState::Absent));
-        assert!(!delete_left_task_gone(false, TaskState::Present));
-        assert!(!delete_left_task_gone(false, TaskState::Unknown));
+        // A task that was never there already leaves the requested state in
+        // place, so a failed delete is not always a failed toggle.
+        assert!(delete_left_task_gone(TaskState::Absent));
+        // One that is still registered, or a question the scheduler could not
+        // answer, is a toggle that did not take.
+        assert!(!delete_left_task_gone(TaskState::Present));
+        assert!(!delete_left_task_gone(TaskState::Unknown));
     }
 
     #[test]
@@ -1931,22 +2186,43 @@ mod tests {
     #[test]
     fn the_tray_state_tip_reflects_session_state() {
         assert_eq!(
-            state_tip(State::Idle, "Alt+Space", true, true),
+            state_tip(State::Idle, "Alt+Space", true, true, true),
             "mnvoice - idle. Alt+Space to dictate."
         );
         assert_eq!(
-            state_tip(State::Recording, "Alt+Space", true, true),
+            state_tip(State::Recording, "Alt+Space", true, true, true),
             "mnvoice - listening (auto-stops on silence)"
         );
         assert_eq!(
-            state_tip(State::Transcribing, "Alt+Space", true, true),
+            state_tip(State::Transcribing, "Alt+Space", true, true, true),
             "mnvoice - transcribing..."
+        );
+    }
+
+    /// A cancel key that never registered has to say so, because the orb is on
+    /// screen asking to be dismissed and Esc will not dismiss it.
+    ///
+    /// It outranks what the session is doing, so it shows in the live states
+    /// too - and it has to come through `state_tip` rather than a one-shot
+    /// `set_tray_tip`, because every state transition writes the tip again.
+    #[test]
+    fn a_missing_cancel_key_is_named_in_every_live_state() {
+        for state in [State::Recording, State::Transcribing] {
+            assert_eq!(
+                state_tip(state, "Alt+Space", true, false, true),
+                "mnvoice - no cancel key (Esc is in use by another app)"
+            );
+        }
+        // A live cancel key leaves the normal tip alone.
+        assert_eq!(
+            state_tip(State::Recording, "Alt+Space", true, true, true),
+            "mnvoice - listening (auto-stops on silence)"
         );
     }
 
     /// The capture report is classified in every shape it can arrive in.
     ///
-    /// The REST arm and the streaming arm share this one classifier, so a
+        /// The REST arm and the streaming arm share this one classifier, so a
     /// broken microphone is never reported as NO_SPEECH on either - telling a
     /// user whose Windows Audio service just stopped that they said nothing is
     /// the misleading diagnostic the four init_wasapi messages exist to
@@ -1955,10 +2231,13 @@ mod tests {
     /// there and as a capture fault on REST.
     #[test]
     fn the_capture_report_is_classified_in_every_shape() {
-        // The engine was gone before the capture thread even started.
+        // The audio worker could not be handed the request at all, which is
+        // the only Err capture_to_channel can return - and is the worker being
+        // gone, not the audio engine, which would have reported through the
+        // channel with its own message.
         assert_eq!(
             capture_fault(None).as_deref(),
-            Some("capture failed: the audio engine is unavailable")
+            Some("capture failed: the audio worker is not running")
         );
 
         // The worker reported its own failure: that message is the answer.

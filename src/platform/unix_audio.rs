@@ -217,9 +217,9 @@ fn run_session(
 /// The device's 20 ms tick boundary almost never lands on a frame boundary on
 /// a stereo device, so dropping the remainder loses a sample or two about
 /// fifty times a second and reads the rest of the next tick one sample out of
-/// phase. The Windows engine instead refuses a partial frame outright, which
-/// is not an option here: the realtime callback appends whatever the device
-/// handed it, so the tail has to be carried.
+/// phase. The Windows engine has no equivalent tail to carry, because WASAPI's
+/// `GetBuffer` reports a whole number of frames: the two agree that a partial
+/// frame must not be dropped, and only this side can actually produce one.
 fn take_frames(buffer: &Arc<Mutex<Vec<f32>>>, channels: usize) -> Vec<f32> {
     let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
     // Only whole frames leave the buffer, so what stays is by construction a
