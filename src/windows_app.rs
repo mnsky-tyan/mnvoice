@@ -1475,6 +1475,10 @@ fn schtasks_failure_message(enable: bool, run_key: Option<bool>) -> String {
 
 /// The message for a Run-key delete whose outcome the confirming read did not
 /// confirm. Same totality rule as `schtasks_failure_message`.
+///
+/// The caller settles a confirmed-absent read before calling, so the
+/// `Some(false)` arm exists to keep the match total over the read, not because
+/// a caller can still reach it.
 fn retire_failure_message(enable: bool, run_key: Option<bool>) -> String {
     match run_key {
         Some(true) if enable => {
@@ -1522,10 +1526,17 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         return Err(schtasks_failure_message(enable, run_key_set()));
     }
     if clear_run_key() != Some(true) {
-        // Either the Run value survived, or its removal could not be confirmed -
-        // and the message must not claim the first when the read returned the
-        // second, because that is a machine state the code cannot see.
-        return Err(retire_failure_message(enable, run_key_set()));
+        // The delete's outcome was not confirmed on the first read. A fresh
+        // read settles it: a key that is now confirmed gone means the retire
+        // took - the first read was the unanswerable one - and the toggle
+        // falls through to success. Only a key still present, or still
+        // unanswerable, fails it, and the message must not claim the first
+        // when the read returned the second, because that is a machine state
+        // the code cannot see.
+        let read = run_key_set();
+        if read != Some(false) {
+            return Err(retire_failure_message(enable, read));
+        }
     }
     log(if enable { "autostart enabled" } else { "autostart disabled" });
     Ok(())
@@ -1998,6 +2009,8 @@ mod tests {
             retire_failure_message(false, Some(true)),
             "the Run key could not be retired, so mnvoice still starts at logon"
         );
+        // A confirmed-absent fresh read settles the retire at the caller, so
+        // these two pin the arm's totality, not a reachable caller state.
         assert_eq!(
             retire_failure_message(true, Some(false)),
             "the Run key could not be confirmed removed"
