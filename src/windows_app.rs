@@ -1431,10 +1431,6 @@ pub fn migrate_autostart() {
     }
 }
 
-/// Register or remove the at-logon autostart task. Reversible, no admin rights
-/// needed, and the Run key is cleared in both directions - but only once the
-/// scheduler is confirmed to hold the state that was asked for, so a toggle
-/// that did not take can never destroy the autostart the user had.
 /// Whether a disable attempt left the logon task gone.
 ///
 /// The one place the delete's exit code and the scheduler's answer are combined,
@@ -1448,6 +1444,10 @@ fn disable_left_it_gone(exited_zero: bool, after: impl FnOnce() -> TaskState) ->
     exited_zero || after() == TaskState::Absent
 }
 
+/// Register or remove the at-logon autostart task. Reversible, no admin rights
+/// needed, and the Run key is cleared in both directions - but only once the
+/// scheduler is confirmed to hold the state that was asked for, so a toggle
+/// that did not take can never destroy the autostart the user had.
 fn set_autostart(enable: bool) -> Result<(), String> {
     let _mutation = autostart_lock();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
