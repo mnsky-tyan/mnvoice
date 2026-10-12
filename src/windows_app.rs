@@ -1988,6 +1988,39 @@ mod tests {
         assert_eq!(s, config::DEFAULT_HOTKEY_STR);
     }
 
+    /// An omitted HOTKEY keeps the default; only `none` disables it.
+    ///
+    /// The regression this pins is silent: folding "empty" into the disabled
+    /// predicate switched the documented Alt+Space default off for any config
+    /// that never mentioned HOTKEY, so the key stopped working with nothing in
+    /// the log saying why.
+    #[test]
+    fn an_omitted_hotkey_keeps_the_default_and_none_disables_it() {
+        // Through `derive`, which is what turns a raw HOTKEY line into the pair
+        // and the display string the tray shows.
+        let derive = |hotkey: &str| {
+            let cfg = config::load_from(&format!("HOTKEY={hotkey}\n"));
+            hotkey_of(&Some(std::sync::Arc::new(cfg)))
+        };
+
+        for empty in ["", "   "] {
+            let (mods, vk, s) = derive(empty);
+            assert_eq!(
+                (mods.0, vk, s.as_str()),
+                (
+                    config::DEFAULT_HOTKEY_MOD,
+                    config::DEFAULT_HOTKEY_VK,
+                    config::DEFAULT_HOTKEY_STR
+                ),
+                "{empty:?} must keep the default, not disable the key"
+            );
+        }
+
+        let (_mods, vk, s) = derive("none");
+        assert_eq!(vk, 0, "none must disable the toggle hotkey");
+        assert_eq!(s, "none");
+    }
+
     #[test]
     fn the_tray_dictate_item_matches_the_session_state() {
         // The single tray item must be honest about the one action it offers:

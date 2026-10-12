@@ -125,13 +125,15 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
     let mix_ptr = client
         .GetMixFormat()
         .map_err(|e| format!("GetMixFormat ({e})"))?;
+    // The format is copied out for `EngineState`, but `Initialize` still gets
+    // the original allocation - not this copy. WASAPI reads the format's `cbSize`
+    // bytes, and an extensible mix format's `WAVEFORMATEXTENSIBLE` is 40 bytes
+    // where `WAVEFORMATEX` is 18: handing `Initialize` a `WAVEFORMATEX` on the
+    // stack makes it read past the object. Passing the allocation is what the
+    // caller is entitled to, and `Initialize` copies what it needs, so the
+    // allocation is released straight afterwards - which is also why exactly one
+    // site frees it and no early return can leak it.
     let format = *mix_ptr;
-    // The format is copied out and the allocation released before anything
-    // below can return, so exactly one site frees it. `Initialize` takes the
-    // pointer by value and copies the format internally, so the engine does not
-    // need it afterwards - and holding a raw pointer in the struct meant a
-    // second `CoTaskMemFree` twenty lines away, where an early return between
-    // here and the struct literal would have leaked it.
     let kind = match sample_kind(&format, mix_ptr) {
         Ok(kind) => kind,
         Err(e) => {
@@ -139,11 +141,12 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
             return Err(e);
         }
     };
-    unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
 
-    client
-        .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, &format, None)
-        .map_err(|e| format!("audio client init ({e})"))?;
+    if let Err(e) = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None) {
+        unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
+        return Err(format!("audio client init ({e})"));
+    }
+    unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
 
     let capture_client: IAudioCaptureClient = client
         .GetService()

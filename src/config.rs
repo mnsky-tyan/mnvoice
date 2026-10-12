@@ -571,11 +571,17 @@ pub const DEFAULT_VAD_RMS_THRESHOLD: f64 = 400.0;
 /// change to the accepted spelling would have left the tooltip degrading to
 /// "mnvoice - idle. none to dictate."
 ///
-/// Case-insensitive, and tolerant of surrounding space, because both parsers
-/// see whatever the user typed in `mnvoice.env` before they trim it.
+/// Case-insensitive, and tolerant of surrounding space, because both parsers see
+/// whatever the user typed in `mnvoice.env` before they trim it.
+///
+/// An empty string is NOT "no key" here. The two keys need the opposite answer
+/// for it: an omitted `CANCEL_KEY` keeps Esc, while an omitted `HOTKEY` falls
+/// through to the Alt+Space default - and folding "empty" into "disabled"
+/// silently switched off the documented default for any config that never
+/// mentioned HOTKEY. Only `cancel_key_with_display` treats empty as its own
+/// case, before it reaches this.
 pub fn hotkey_is_disabled(s: &str) -> bool {
-    let s = s.trim();
-    s.is_empty() || s.eq_ignore_ascii_case("none")
+    s.trim().eq_ignore_ascii_case("none")
 }
 
 /// The cancel key to register plus the spelling to show for it, decided in
@@ -712,6 +718,27 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// Runs the real file pass over `text` and the real derivation, standing in for
+/// the mnvoice.env beside the exe. The API key `derive` demands is always
+/// supplied so the config derives instead of erroring.
+///
+/// Crate-visible rather than test-only: `windows_app` asserts on the derived
+/// pair and display string, and a test helper that only one module can reach
+/// would push that test to rebuild the derivation by hand.
+#[cfg(test)]
+pub(crate) fn load_from(text: &str) -> Config {
+    let mut raw = RawFields::new();
+    parse(text, |k, v| {
+        if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
+            raw.set(*field, k, v, true);
+        }
+    });
+    if raw.api_key.trim().is_empty() {
+        raw.api_key = "test-key".to_string();
+    }
+    derive(raw).expect("test config should derive")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,12 +764,19 @@ mod tests {
     /// dictate" after a spelling change in only one of them.
     #[test]
     fn the_disabled_hotkey_spelling_is_recognised_in_one_place() {
-        for disabled in ["none", "None", "NONE", "  none  ", ""] {
+        for disabled in ["none", "None", "NONE", "  none  "] {
             assert!(
                 hotkey_is_disabled(disabled),
                 "{disabled:?} must read as no hotkey"
             );
         }
+        // An omitted HOTKEY is not a disabled one: it falls through to the
+        // Alt+Space default. Folding "empty" into "disabled" silently switched
+        // the default off for any config that never mentioned HOTKEY.
+        assert!(
+            !hotkey_is_disabled(""),
+            "an omitted hotkey must keep the default, not disable the key"
+        );
         for enabled in ["Alt+Space", "F9", "none-ish", "none of them"] {
             assert!(
                 !hotkey_is_disabled(enabled),
@@ -1088,21 +1122,6 @@ mod tests {
         assert_eq!(raw.hotkey_str, "Ctrl+Shift+D");
     }
 
-    /// Runs the real file pass over `text` and the real derivation, standing
-    /// in for the mnvoice.env beside the exe. The API key load() demands is
-    /// always supplied so the config derives instead of erroring.
-    fn load_from(text: &str) -> Config {
-        let mut raw = RawFields::new();
-        parse(text, |k, v| {
-            if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
-                raw.set(*field, k, v, true);
-            }
-        });
-        if raw.api_key.trim().is_empty() {
-            raw.api_key = "test-key".to_string();
-        }
-        derive(raw).expect("test config should derive")
-    }
 
     /// The merged setter keeps both sources' semantics: an alias from the
     /// file yields to the canonical name, the same alias from the environment
