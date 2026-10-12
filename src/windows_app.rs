@@ -1182,7 +1182,7 @@ fn autostart_enabled() -> bool {
     let state = if task_exists() {
         AutostartState::TaskPresent
     } else {
-        autostart_state(run_key_set(), run_key_disabled())
+        autostart_state(run_key_set(), run_key_disabled)
     };
     autostart_starting(state)
 }
@@ -1198,11 +1198,14 @@ fn autostart_enabled() -> bool {
 /// has to be as total as the producer.
 ///
 /// Kept apart from `autostart_enabled` so all four cases can be asserted
-/// without spawning `reg.exe`.
-fn autostart_state(present: Option<bool>, disabled: bool) -> AutostartState {
+/// without spawning `reg.exe`. The override query arrives as a closure and is
+/// read only inside the `Some(true)` arm, because that is the only arm it
+/// changes - so the spawn behind it is paid only while a Run value is actually
+/// there.
+fn autostart_state(present: Option<bool>, disabled: impl FnOnce() -> bool) -> AutostartState {
     match present {
         Some(false) => AutostartState::NoRunValue,
-        Some(true) if disabled => AutostartState::RunValueDisabled,
+        Some(true) if disabled() => AutostartState::RunValueDisabled,
         Some(true) => AutostartState::RunValueEnabled,
         // Nothing could be read, so nothing is claimed. Reading as not-enabled
         // is the safe click direction: the menu item enables.
@@ -1438,9 +1441,11 @@ pub fn migrate_autostart() {
 /// kept as a function because the combination is the rule: the exit code is
 /// authority when it is zero, and a non-zero one has to be classified rather
 /// than trusted. `Unknown` counts as not-gone, so an unanswerable query fails
-/// closed instead of reporting a disable nobody confirmed.
-fn disable_left_it_gone(exited_zero: bool, after: TaskState) -> bool {
-    exited_zero || after == TaskState::Absent
+/// closed instead of reporting a disable nobody confirmed. The scheduler query
+/// arrives as a closure and is read only once the exit code has already said
+/// "not gone", so a delete that worked never asks the scheduler anything.
+fn disable_left_it_gone(exited_zero: bool, after: impl FnOnce() -> TaskState) -> bool {
+    exited_zero || after() == TaskState::Absent
 }
 
 fn set_autostart(enable: bool) -> Result<(), String> {
@@ -1463,7 +1468,7 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         // place; one that is still registered, or a question the scheduler
         // could not answer, is a toggle that did not take - and there the Run
         // key is still the only autostart the user has.
-        disable_left_it_gone(status.success(), task_state())
+        disable_left_it_gone(status.success(), task_state)
     };
     if !in_place {
         // Whatever carries the autostart until the scheduler holds the one
@@ -1808,19 +1813,19 @@ mod tests {
     /// the three-way read exists to name.
     #[test]
     fn an_unanswerable_run_key_does_not_read_as_enabled() {
-        assert_eq!(autostart_state(None, false), AutostartState::NoRunValue);
-        assert!(!autostart_starting(autostart_state(None, false)));
+        assert_eq!(autostart_state(None, || false), AutostartState::NoRunValue);
+        assert!(!autostart_starting(autostart_state(None, || false)));
 
         assert_eq!(
-            autostart_state(Some(false), false),
+            autostart_state(Some(false), || false),
             AutostartState::NoRunValue
         );
         assert_eq!(
-            autostart_state(Some(true), true),
+            autostart_state(Some(true), || true),
             AutostartState::RunValueDisabled
         );
         assert_eq!(
-            autostart_state(Some(true), false),
+            autostart_state(Some(true), || false),
             AutostartState::RunValueEnabled
         );
     }
@@ -1921,15 +1926,15 @@ mod tests {
     fn a_failed_disable_only_counts_when_the_task_is_really_gone() {
         // A task that was never there already leaves the requested state in
         // place, so a failed delete is not always a failed toggle.
-        assert!(disable_left_it_gone(false, TaskState::Absent));
-        assert!(disable_left_it_gone(true, TaskState::Absent));
+        assert!(disable_left_it_gone(false, || TaskState::Absent));
+        assert!(disable_left_it_gone(true, || TaskState::Absent));
         // One that is still registered, or a question the scheduler could not
         // answer, is a toggle that did not take - so an unanswerable query
         // fails closed rather than reporting a disable nobody confirmed.
-        assert!(!disable_left_it_gone(false, TaskState::Present));
-        assert!(!disable_left_it_gone(false, TaskState::Unknown));
-        assert!(disable_left_it_gone(true, TaskState::Present));
-        assert!(disable_left_it_gone(true, TaskState::Unknown));
+        assert!(!disable_left_it_gone(false, || TaskState::Present));
+        assert!(!disable_left_it_gone(false, || TaskState::Unknown));
+        assert!(disable_left_it_gone(true, || TaskState::Present));
+        assert!(disable_left_it_gone(true, || TaskState::Unknown));
     }
 
     #[test]
