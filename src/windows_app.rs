@@ -1420,8 +1420,9 @@ pub fn migrate_autostart() {
         if clear_run_key() == Some(true) {
             log("autostart moved from the Run key to a logon task");
         } else {
-            // The logon task holds the autostart, but the Run value survived
-            // the delete, so both mechanisms are still registered.
+            // The delete's outcome was not confirmed - the value may have
+            // survived or the confirming read may have failed - so both
+            // mechanisms can still be registered.
             log("autostart moved to a logon task, but the Run key could not be retired");
         }
     } else {
@@ -1438,10 +1439,51 @@ pub fn migrate_autostart() {
 /// authority when it is zero, and a non-zero one has to be classified rather
 /// than trusted. `Unknown` counts as not-gone, so an unanswerable query fails
 /// closed instead of reporting a disable nobody confirmed. The scheduler query
-/// arrives as a closure and is read only once the exit code has already said
-/// "not gone", so a delete that worked never asks the scheduler anything.
+/// arrives as a closure and is read only when the delete's exit code was
+/// non-zero, so a delete that worked never asks the scheduler anything.
 fn disable_left_it_gone(exited_zero: bool, after: impl FnOnce() -> TaskState) -> bool {
     exited_zero || after() == TaskState::Absent
+}
+
+/// The message for a scheduler command that did not take, classified by a
+/// fresh Run-key read of what the machine still holds.
+///
+/// Total over the read: every arm names what was actually seen, and a query
+/// that cannot be answered says "unconfirmed" instead of asserting a machine
+/// state nothing observed. Claiming either "no Run key" or "the key survived"
+/// would assert something the read cannot support.
+fn schtasks_failure_message(enable: bool, run_key: Option<bool>) -> String {
+    match run_key {
+        // Present: the Run key is the autostart that survived, and naming it
+        // is accurate.
+        Some(true) if enable => {
+            "schtasks.exe could not create the logon task, keeping the Run key".into()
+        }
+        Some(true) => "schtasks.exe could not remove the logon task, keeping the Run key".into(),
+        // Absent: confirmed by a query that ran.
+        Some(false) if enable => {
+            "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
+                .into()
+        }
+        Some(false) => "the logon task could not be confirmed removed".into(),
+        // Unanswerable: reg.exe could not be spawned, so the machine state is
+        // unknown. The same distinction `task_state` spells out with its
+        // `Unknown` variant.
+        None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
+    }
+}
+
+/// The message for a Run-key delete whose outcome the confirming read did not
+/// confirm. Same totality rule as `schtasks_failure_message`.
+fn retire_failure_message(enable: bool, run_key: Option<bool>) -> String {
+    match run_key {
+        Some(true) if enable => {
+            "the Run key could not be retired, so mnvoice starts twice at logon".into()
+        }
+        Some(true) => "the Run key could not be retired, so mnvoice still starts at logon".into(),
+        Some(false) => "the Run key could not be confirmed removed".into(),
+        None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
+    }
 }
 
 /// Register or remove the at-logon autostart task. Reversible, no admin rights
@@ -1477,35 +1519,13 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         // enable branch checks before it claims the Run key: naming it
         // unconditionally reported a fallback that may itself have been
         // retired, which is the exact thing this branch exists to avoid.
-        return Err(match run_key_set() {
-            // Present: the Run key is the autostart that survived, and naming it
-            // is accurate.
-            Some(true) if enable => "schtasks.exe could not create the logon task, keeping the Run key".into(),
-            Some(true) => "schtasks.exe could not remove the logon task, keeping the Run key".into(),
-            // Absent: confirmed by a query that ran.
-            Some(false) if enable => "schtasks.exe could not create the logon task, and no Run key is left to fall back on".into(),
-            Some(false) => "the logon task could not be confirmed removed".into(),
-            // Unanswerable: reg.exe could not be spawned, so the machine state
-            // is unknown. Claiming either "no Run key" or "the key survived"
-            // would assert something the read cannot support - the same
-            // distinction `task_state` spells out with its `Unknown` variant.
-            None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
-        });
+        return Err(schtasks_failure_message(enable, run_key_set()));
     }
     if clear_run_key() != Some(true) {
         // Either the Run value survived, or its removal could not be confirmed -
         // and the message must not claim the first when the read returned the
         // second, because that is a machine state the code cannot see.
-        return Err(match run_key_set() {
-            Some(true) if enable => {
-                "the Run key could not be retired, so mnvoice starts twice at logon".into()
-            }
-            Some(true) => {
-                "the Run key could not be retired, so mnvoice still starts at logon".into()
-            }
-            Some(false) => "the Run key could not be confirmed removed".into(),
-            None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
-        });
+        return Err(retire_failure_message(enable, run_key_set()));
     }
     log(if enable { "autostart enabled" } else { "autostart disabled" });
     Ok(())
@@ -1806,7 +1826,7 @@ mod tests {
     }
 
     /// An unanswerable Run-key read must not read as "enabled".
-    //    ///
+    ///
     /// The toggle computes `enable = !autostart_enabled()`, so a state that
     /// wrongly reads as enabled makes a click run `schtasks /delete` on a task
     /// the user asked to create - the inverse of the request, in the one state
@@ -1933,8 +1953,67 @@ mod tests {
         // fails closed rather than reporting a disable nobody confirmed.
         assert!(!disable_left_it_gone(false, || TaskState::Present));
         assert!(!disable_left_it_gone(false, || TaskState::Unknown));
-        assert!(disable_left_it_gone(true, || TaskState::Present));
-        assert!(disable_left_it_gone(true, || TaskState::Unknown));
+        // A zero exit code is authority and is not overturned by the scheduler:
+        // the closure is not even read, which the panicking closure pins - if
+        // it were evaluated the test would die.
+        assert!(disable_left_it_gone(true, || panic!(
+            "the scheduler is not asked when the delete exited zero"
+        )));
+    }
+
+    /// Every message `set_autostart` can return names what the Run-key read
+    /// actually saw, and an unanswerable read is reported as unconfirmed
+    /// rather than as an absent or surviving key.
+    #[test]
+    fn autostart_failure_messages_name_what_was_seen() {
+        assert_eq!(
+            schtasks_failure_message(true, Some(true)),
+            "schtasks.exe could not create the logon task, keeping the Run key"
+        );
+        assert_eq!(
+            schtasks_failure_message(false, Some(true)),
+            "schtasks.exe could not remove the logon task, keeping the Run key"
+        );
+        assert_eq!(
+            schtasks_failure_message(true, Some(false)),
+            "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
+        );
+        assert_eq!(
+            schtasks_failure_message(false, Some(false)),
+            "the logon task could not be confirmed removed"
+        );
+        assert_eq!(
+            schtasks_failure_message(true, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
+        assert_eq!(
+            schtasks_failure_message(false, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
+        assert_eq!(
+            retire_failure_message(true, Some(true)),
+            "the Run key could not be retired, so mnvoice starts twice at logon"
+        );
+        assert_eq!(
+            retire_failure_message(false, Some(true)),
+            "the Run key could not be retired, so mnvoice still starts at logon"
+        );
+        assert_eq!(
+            retire_failure_message(true, Some(false)),
+            "the Run key could not be confirmed removed"
+        );
+        assert_eq!(
+            retire_failure_message(false, Some(false)),
+            "the Run key could not be confirmed removed"
+        );
+        assert_eq!(
+            retire_failure_message(true, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
+        assert_eq!(
+            retire_failure_message(false, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
     }
 
     #[test]

@@ -656,13 +656,12 @@ fn repair_interrupted_install(exe: &Path, expected_digest: Option<&str>) -> Resu
 ///
 /// Composes rather than replaces: the refusal reason and the restore outcome are
 /// separate evidence, and losing either makes the single log line say less than
-/// the helper knows.
+/// the helper knows. The halves compose without repeating the restore sentence,
+/// because `restore_old_image`'s own message already names that fact.
 fn restore_or_keep_reason(exe: &Path, reason: String) -> String {
     match restore_old_image(exe) {
         Ok(()) => reason,
-        Err(restore_err) => {
-            format!("{reason}; and the previous image could not be put back ({restore_err})")
-        }
+        Err(restore_err) => format!("{reason}; and {restore_err}"),
     }
 }
 

@@ -40,6 +40,14 @@ const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 /// arithmetic.
 const WEBSOCKET_WRITE_TIMEOUT_MS: i32 = 2_000;
 
+/// The close handshake bound handed to `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`.
+///
+/// Deliberately not shared with the send bound: that one is recorded as
+/// ignored by `WinHttpWebSocketSend`, this one has no measurement either
+/// way, and folding them into one name would make one claim bleed into
+/// the other.
+const WEBSOCKET_CLOSE_TIMEOUT_MS: i32 = 2_000;
+
 /// Build a NUL-terminated UTF-16 buffer for the wide-string Win32 APIs.
 /// Shared with the tray app, which needs the same conversion for its own
 /// window and tooltip text.
@@ -407,21 +415,28 @@ impl Transport for WinHttpTransport {
             let (connect, session) = handles.take_parents();
             // Bounded here, before the handle is boxed, so the close handshake
             // `close()` performs cannot outlive the session on a peer that never
-            // answers it. Same value as the send bound above.
+            // answers it.
             //
             // Requested, not proven: unlike the send bound, which this file
             // measured as ignored by `WinHttpWebSocketSend`, no measurement
             // against a peer that never answers a close frame exists yet - so
-            // the option is set and its result propagated, and the claim that
-            // the handshake is actually bounded stays open. A refused option is
-            // surfaced rather than dropped, because it is the only signal that
-            // the teardown is still on WinHTTP's default.
+            // the option is set and the claim that the handshake is actually
+            // bounded stays open.
+            //
+            // A refusal is logged rather than propagated: killing the session
+            // over a missing bound trades a working (if unbounded) close for no
+            // dictation at all, and the default teardown is what every earlier
+            // release shipped with.
             let socket = WinHttpSocket {
                 ws,
                 connect,
                 session,
             };
-            socket.set_close_timeout(WEBSOCKET_WRITE_TIMEOUT_MS)?;
+            if let Err(e) = socket.set_close_timeout(WEBSOCKET_CLOSE_TIMEOUT_MS) {
+                crate::windows_app::log(&format!(
+                    "close timeout not set, teardown stays on WinHTTP's default ({e})"
+                ));
+            }
             Ok(Box::new(socket))
         }
     }
@@ -469,12 +484,13 @@ impl WinHttpSocket {
     /// A private inherent method, not a trait method, because the trait is the
     /// seam both backends share and only this one has the concept.
     ///
-    /// Returns whether the option took, and the caller propagates it. A refused
-    /// option is not something `close` can route around - there is no second
-    /// bound to fall back to - but it is the only signal that the handshake is
-    /// still on WinHTTP's default, and dropping it reproduces at a smaller
-    /// scale the defect this exists to close. The sibling calls in `websocket`
-    /// propagate for the same reason.
+    /// Returns whether the option took, so the caller can log a refusal. A
+    /// refused option is not something `close` can route around - there is no
+    /// second bound to fall back to - but it is the only signal that the
+    /// handshake is still on WinHTTP's default, and the caller records it
+    /// rather than dropping it. It is deliberately not propagated: the default
+    /// teardown still works, and failing the whole session over a missing bound
+    /// would turn a slower close into no dictation at all.
     ///
     /// The bound is *requested* here, not proven. This file already recorded
     /// that `WINHTTP_OPTION_SEND_TIMEOUT` and `WinHttpSetTimeouts` are set and
