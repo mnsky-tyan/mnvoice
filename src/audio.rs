@@ -131,8 +131,8 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
     // where `WAVEFORMATEX` is 18: handing `Initialize` a `WAVEFORMATEX` on the
     // stack makes it read past the object. Passing the allocation is what the
     // caller is entitled to, and `Initialize` copies what it needs, so the
-    // allocation is released straight afterwards - which is also why exactly one
-    // site frees it and no early return can leak it.
+    // allocation is released straight afterwards - every exit path frees it
+    // exactly once, and no early return can leak it.
     let format = *mix_ptr;
     let kind = match sample_kind(&format, mix_ptr) {
         Ok(kind) => kind,

@@ -54,6 +54,11 @@ fn endpoint_url(base_url: &str) -> Result<String, String> {
 
 /// Turns a 200 body into the transcript, or refuses it.
 ///
+/// The order of the checks is the guard. The BOM comes off first, an empty body
+/// is refused, the JSON key scan runs only on a body that opens as a JSON
+/// object, the refusal shapes are checked, and only then is the whole body
+/// taken as the transcript.
+///
 /// The fallback is load-bearing and cannot be dropped: a provider that honours
 /// `response_format=text` returns the transcript as a bare body, with no JSON
 /// envelope at all, and that body has to be taken verbatim. But a 200 is not
@@ -67,12 +72,24 @@ fn endpoint_url(base_url: &str) -> Result<String, String> {
 /// checked in the body rather than by a content-type header, because a proxy
 /// that returns an error page has no obligation to label it one.
 fn fallback_transcript(raw: &str) -> Result<String, String> {
-    if let Some(transcript) = parse_json_transcript(raw) {
-        return Ok(transcript);
-    }
+    // A byte-order mark is not part of any transcript: str::trim does not
+    // strip U+FEFF (the same property config.rs documents), and a BOM left
+    // in place evades every clause below - a BOM'd error page or JSON
+    // error object would be typed into the user's window as the result.
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("the ASR endpoint returned an empty body".to_string());
+    }
+    // The JSON key scan is a heuristic, so it runs only on a body that
+    // opens as a JSON object. Over an arbitrary text body the scan let a
+    // dictated sentence containing "text": "..." be replaced by the one
+    // quoted word, and an HTML page's type="text" attribute satisfy the
+    // parser before the refusal guard ever ran.
+    if trimmed.starts_with('{') {
+        if let Some(transcript) = parse_json_transcript(trimmed) {
+            return Ok(transcript);
+        }
     }
     if looks_like_a_refusal(trimmed) {
         return Err(format!(
@@ -454,6 +471,68 @@ mod tests {
                 "a bare transcript that mentions an error must not be refused"
             );
         }
+    }
+
+    /// The JSON key scan is a heuristic over the whole body, so it runs only
+    /// when the body opens as a JSON object. A provider honouring
+    /// `response_format=text` returns the dictated words bare, and a sentence
+    /// containing `"text": "..."` was collapsed to the one quoted word by the
+    /// scan before the refusal guard ever ran - a whole dictation replaced by
+    /// one word, silently.
+    #[test]
+    fn a_bare_transcript_containing_a_json_key_is_taken_whole() {
+        let body = r#"set the field "text": "name" in the schema"#;
+        assert_eq!(
+            fallback_transcript(body),
+            Ok(body.to_string()),
+            "a dictated sentence must not be replaced by a quoted word inside it"
+        );
+    }
+
+    /// The same scan also mined an HTML page: `type="text"` satisfies it, and
+    /// the first quoted string after any later colon came back as a transcript.
+    /// The page is a refusal, not a dictation.
+    #[test]
+    fn an_html_page_that_satisfies_the_json_key_scan_is_refused() {
+        let page = r#"<!DOCTYPE html><html><body><input type="text" name="q"><p>error: "503 Service Unavailable"</p></body></html>"#;
+        let out = fallback_transcript(page);
+        assert!(out.is_err(), "an HTML page must not be typed: {out:?}");
+    }
+
+    /// A byte-order mark is not part of any transcript, and it also defeats
+    /// every anchored check: `str::trim` does not strip U+FEFF, so a BOM'd
+    /// error page or JSON error object passed the refusal guard and was typed
+    /// into the user's window with the mark in front.
+    #[test]
+    fn a_bom_does_not_smuggle_a_refusal_past_the_guard() {
+        let json = "\u{feff}{\"error\":{\"message\":\"insufficient quota\"}}";
+        let out = fallback_transcript(json);
+        assert!(
+            out.is_err(),
+            "a BOM'd JSON error must not be typed: {out:?}"
+        );
+
+        let html = "\u{feff}<!DOCTYPE html><html><body>502 Bad Gateway</body></html>";
+        let out = fallback_transcript(html);
+        assert!(out.is_err(), "a BOM'd HTML page must not be typed: {out:?}");
+
+        // A body that is nothing but a BOM is an empty body, not a transcript.
+        let out = fallback_transcript("\u{feff}");
+        assert!(out.is_err(), "a lone BOM must not be typed: {out:?}");
+    }
+
+    /// The BOM comes off a real transcript too, rather than being typed as an
+    /// invisible character in front of the user's words.
+    #[test]
+    fn a_bom_is_stripped_from_a_real_transcript() {
+        assert_eq!(
+            fallback_transcript("\u{feff}hello world"),
+            Ok("hello world".to_string())
+        );
+        assert_eq!(
+            fallback_transcript("\u{feff}{\"text\":\"hello\"}"),
+            Ok("hello".to_string())
+        );
     }
 
     /// A refusal names the body it rejected without carrying it: the message
