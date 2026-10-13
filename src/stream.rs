@@ -373,11 +373,15 @@ pub fn run_stream(
     // unchanged: ship the queued tail when the peer is healthy, and stop the
     // moment it is not.
     if !cancelled.load(Ordering::SeqCst) {
-        while let Ok(packet_i16) = rx.try_recv() {
+        loop {
+            let Ok(packet_i16) = rx.try_recv() else {
+                #[cfg(test)]
+                crate::test_hooks::record_drain_backlog_exhausted();
+                break;
+            };
             if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
                 #[cfg(test)]
-                crate::test_hooks::DRAIN_BROKE_EARLY
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::test_hooks::record_drain_broke_early();
                 break;
             }
         }
@@ -939,6 +943,7 @@ mod tests {
             let _ = release.send(());
         });
 
+        crate::test_hooks::reset_drain_observation();
         // Far more packets than the kernel window can take, still arriving when
         // the session ends, so the drain has a real backlog to work through.
         let _ = live_provider::drive_with_a_backlog(&cfg, 4000);
@@ -948,6 +953,10 @@ mod tests {
         assert!(
             crate::test_hooks::drain_broke_early(),
             "the drain must stop at the first failed send, not keep paying the write bound"
+        );
+        assert!(
+            !crate::test_hooks::drain_backlog_exhausted(),
+            "the drain must not walk the whole backlog after a failed send - if this fails, the break is gone but the record is not"
         );
     }
 

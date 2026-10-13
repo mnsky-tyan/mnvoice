@@ -2151,8 +2151,8 @@ mod tests {
         )));
     }
 
-    /// Every message `set_autostart` can return names what the Run-key read
-    /// actually saw, and an unanswerable read is reported as unconfirmed
+    /// Every message `set_autostart_guarded` can return names what the Run-key
+    /// read actually saw, and an unanswerable read is reported as unconfirmed
     /// rather than as an absent or surviving key.
     #[test]
     fn autostart_failure_messages_name_what_was_seen() {
