@@ -352,9 +352,22 @@ pub fn run_stream(
     // unless the session was cancelled: a cancel is a hard discard (the same
     // rule dictate_rest enforces before its upload), so the queued tail must
     // not be shipped to the provider after the user said stop.
+    //
+    // A send error ends the drain rather than skipping the packet. Once a send
+    // fails the socket can carry no more data, so the packets behind it cannot
+    // be delivered either - each continued send would stall exactly as long as
+    // the one that failed, paid once per packet. The break removes that repeat
+    // cost, and on Windows it removes only that: a Windows send to a stalled
+    // peer blocks without returning `Err`, so the first drain send parks and
+    // this `break` is never reached - the Windows hang needs a bound on the
+    // send or a drain that gives up, neither of which this is. The intent is
+    // unchanged: ship the queued tail when the peer is healthy, and stop the
+    // moment it is not.
     if !cancelled.load(Ordering::SeqCst) {
         while let Ok(packet_i16) = rx.try_recv() {
-            let _ = ws.send_binary(&pcm_bytes(&packet_i16));
+            if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
+                break;
+            }
         }
     }
 

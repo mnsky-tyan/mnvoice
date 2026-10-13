@@ -268,12 +268,26 @@ pub fn parse_auto_update(s: &str) -> bool {
 }
 
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
+    // A lowercase index beside the vector, so de-duplication does not have to
+    // re-scan every word already collected for every new one. The dedup is
+    // case-insensitive by contract, so the key is the lowercase form and the
+    // vector keeps the spelling the user wrote. Without this a pasted vendor
+    // list is quadratic in its own length: 16k distinct words took ~17 s to
+    // parse, and `load` feeds three files into the same vector before the
+    // session can start.
+    let mut seen: std::collections::HashSet<String> = keywords
+        .iter()
+        .map(|k| k.to_lowercase())
+        .collect();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         for part in line.split(',') {
             let word = part.trim();
-            if !word.is_empty() && !keywords.iter().any(|k| k.eq_ignore_ascii_case(word)) {
+            if word.is_empty() {
+                continue;
+            }
+            if seen.insert(word.to_lowercase()) {
                 keywords.push(word.to_string());
             }
         }

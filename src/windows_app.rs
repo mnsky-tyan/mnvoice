@@ -943,16 +943,23 @@ fn cancel(app: &mut App) {
 
 /// The capture report classified in every shape it can arrive in.
 ///
-/// A clean `Ok(())` with a short buffer is silence. `None` means
-/// `capture_to_channel` returned `Err` (the engine was gone before the thread
-/// started) and `Err(RecvError)` means the audio worker dropped its sender
-/// without reporting - both are a broken microphone, and reporting either as
-/// `NO_SPEECH` tells a user whose Windows Audio service just stopped that they
-/// said nothing. The REST and streaming arms share this classifier so the two
-/// cannot drift apart again.
+/// A clean `Ok(())` with a short buffer is silence. `None` and `Err(RecvError)`
+/// both mean the audio worker is gone: `None` is the request channel refusing
+/// the hand-off (the only `Err` `capture_to_channel` can return), and
+/// `Err(RecvError)` is the worker dropping its sender without ever reporting.
+/// Both are a broken microphone, and reporting either as `NO_SPEECH` tells a
+/// user whose Windows Audio service just stopped that they said nothing. The
+/// REST and streaming arms share this classifier so the two cannot drift apart
+/// again.
+///
+/// `None` is deliberately named as the worker rather than the audio engine: an
+/// engine that fails to initialise still reports through the channel, as
+/// `Ok(Err(why))`, so it arrives as `Some` here with its own message. Naming
+/// the engine pointed a reader at the wrong subsystem for the one failure the
+/// `None` arm actually reports.
 fn capture_fault(done: Option<&std::sync::mpsc::Receiver<Result<(), String>>>) -> Option<String> {
     match done {
-        None => Some("capture failed: the audio engine is unavailable".to_string()),
+        None => Some("capture failed: the audio worker is not running".to_string()),
         Some(done) => match done.recv() {
             Ok(Err(e)) => Some(e),
             // The worker dropped its sender without sending, which for this
@@ -978,9 +985,11 @@ fn worker(
     let max_seconds = cfg.max_seconds;
 
     // 1. Immediately activate capture via pre-initialized standby WASAPI engine (latency ~4ms!)
-    // The outer Err means the request could not even be queued (the engine is
-    // gone). Its message is dropped here, but its shape is not: `capture_fault`
-    // classifies `None` as the engine-unavailable capture failure.
+    // The outer Err means the request could not even be queued, i.e. the audio
+    // worker thread is gone. Its message is dropped here, but its shape is not:
+    // `capture_fault` classifies `None` as that failure. It is not the engine -
+    // an engine that cannot initialise reports through the done channel and so
+    // arrives as `Some`.
     let capture_done = audio_engine
         .capture_to_channel(
             stop_audio,
@@ -1172,34 +1181,67 @@ fn autostart_starting(state: AutostartState) -> bool {
 fn autostart_enabled() -> bool {
     let state = if task_exists() {
         AutostartState::TaskPresent
-    } else if !run_key_set() {
-        AutostartState::NoRunValue
-    } else if run_key_disabled() {
-        AutostartState::RunValueDisabled
     } else {
-        AutostartState::RunValueEnabled
+        autostart_state(run_key_set(), run_key_disabled)
     };
     autostart_starting(state)
 }
 
-fn run_key_set() -> bool {
-    reg_cmd()
+/// Classify what the Run value alone says, given a query that may not have been
+/// answerable.
+///
+/// All three answers, not two. `None` is *unanswerable*, and letting it fall
+/// through to "enabled" both draws a checkmark nothing verified and makes the
+/// toggle compute `enable = false` - so a click would run `schtasks /delete` on
+/// a task the user asked to create, the inverse of the request. The
+/// `Option<bool>` was introduced for exactly this distinction, so the consumer
+/// has to be as total as the producer.
+///
+/// Kept apart from `autostart_enabled` so all four cases can be asserted
+/// without spawning `reg.exe`. The override query arrives as a closure and is
+/// read only inside the `Some(true)` arm, because that is the only arm it
+/// changes - so the spawn behind it is paid only while a Run value is actually
+/// there.
+fn autostart_state(present: Option<bool>, disabled: impl FnOnce() -> bool) -> AutostartState {
+    match present {
+        Some(false) => AutostartState::NoRunValue,
+        Some(true) if disabled() => AutostartState::RunValueDisabled,
+        Some(true) => AutostartState::RunValueEnabled,
+        // Nothing could be read, so nothing is claimed. Reading as not-enabled
+        // is the safe click direction: the menu item enables.
+        None => AutostartState::NoRunValue,
+    }
+}
+
+/// Whether the Run value is present.
+///
+/// Three states, not two: `reg.exe` that cannot be spawned at all is
+/// *unanswerable*, and collapsing that into "absent" is what let
+/// `clear_run_key` report success for a delete that never ran. `task_state`
+/// spells the same distinction out with an explicit `Unknown` variant; this
+/// returns the same shape without needing an enum, because only the caller
+/// below has to care.
+fn run_key_set() -> Option<bool> {
+    match reg_cmd()
         .args(["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) => Some(out.status.success()),
+        Err(_) => None,
+    }
 }
 
 /// Remove the pre-migration Run key entry, reporting whether it is gone.
 ///
-/// True when the value is not there any more, which is what `reg query`
-/// confirms afterwards: a delete that did not take against a policy or a
-/// security product leaves it in place, and nothing may read that as success.
-fn clear_run_key() -> bool {
+/// True only when a query that could be answered confirms the value is no
+/// longer there: a delete that did not take against a policy or a security
+/// product leaves it in place, and a query that cannot be run at all confirms
+/// nothing. Neither may read as success.
+fn clear_run_key() -> Option<bool> {
     let _ = reg_cmd()
         .args(["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
         .output();
-    !run_key_set()
+    run_key_set().map(|present| !present)
 }
 
 /// Whether the user has turned the Run-key autostart off in Task Manager.
@@ -1355,7 +1397,7 @@ fn autostart_lock() -> MutexGuard<'static, ()> {
 /// place, so the swap only ever runs in this direction.
 pub fn migrate_autostart() {
     let _mutation = autostart_lock();
-    if task_exists() || !run_key_set() {
+    if task_exists() || run_key_set() != Some(true) {
         return;
     }
     if run_key_disabled() {
@@ -1375,11 +1417,12 @@ pub fn migrate_autostart() {
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
-        if clear_run_key() {
+        if clear_run_key() == Some(true) {
             log("autostart moved from the Run key to a logon task");
         } else {
-            // The logon task holds the autostart, but the Run value survived
-            // the delete, so both mechanisms are still registered.
+            // The delete's outcome was not confirmed - the value may have
+            // survived or the confirming read may have failed - so both
+            // mechanisms can still be registered.
             log("autostart moved to a logon task, but the Run key could not be retired");
         }
     } else {
@@ -1389,15 +1432,62 @@ pub fn migrate_autostart() {
     }
 }
 
-/// Whether turning autostart off left the logon task gone.
+/// Whether a disable attempt left the logon task gone.
 ///
-/// A delete that exited zero did its job. One that failed has to be
-/// classified rather than trusted: a task that was never there already leaves
-/// the requested state in place, while one that is still registered, or a
-/// question the scheduler could not answer, is a toggle that did not take -
-/// and there the Run key is still the only autostart the user has.
-fn delete_left_task_gone(delete_ok: bool, after: TaskState) -> bool {
-    delete_ok || after == TaskState::Absent
+/// The one place the delete's exit code and the scheduler's answer are combined,
+/// kept as a function because the combination is the rule: the exit code is
+/// authority when it is zero, and a non-zero one has to be classified rather
+/// than trusted. `Unknown` counts as not-gone, so an unanswerable query fails
+/// closed instead of reporting a disable nobody confirmed. The scheduler query
+/// arrives as a closure and is read only when the delete's exit code was
+/// non-zero, so a delete that worked never asks the scheduler anything.
+fn disable_left_it_gone(exited_zero: bool, after: impl FnOnce() -> TaskState) -> bool {
+    exited_zero || after() == TaskState::Absent
+}
+
+/// The message for a scheduler command that did not take, classified by a
+/// fresh Run-key read of what the machine still holds.
+///
+/// Total over the read: every arm names what was actually seen, and a query
+/// that cannot be answered says "unconfirmed" instead of asserting a machine
+/// state nothing observed. Claiming either "no Run key" or "the key survived"
+/// would assert something the read cannot support.
+fn schtasks_failure_message(enable: bool, run_key: Option<bool>) -> String {
+    match run_key {
+        // Present: the Run key is the autostart that survived, and naming it
+        // is accurate.
+        Some(true) if enable => {
+            "schtasks.exe could not create the logon task, keeping the Run key".into()
+        }
+        Some(true) => "schtasks.exe could not remove the logon task, keeping the Run key".into(),
+        // Absent: confirmed by a query that ran.
+        Some(false) if enable => {
+            "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
+                .into()
+        }
+        Some(false) => "the logon task could not be confirmed removed".into(),
+        // Unanswerable: reg.exe could not be spawned, so the machine state is
+        // unknown. The same distinction `task_state` spells out with its
+        // `Unknown` variant.
+        None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
+    }
+}
+
+/// The message for a Run-key delete whose outcome the confirming read did not
+/// confirm. Same totality rule as `schtasks_failure_message`.
+///
+/// The caller settles a confirmed-absent read before calling, so the
+/// `Some(false)` arm exists to keep the match total over the read, not because
+/// a caller can still reach it.
+fn retire_failure_message(enable: bool, run_key: Option<bool>) -> String {
+    match run_key {
+        Some(true) if enable => {
+            "the Run key could not be retired, so mnvoice starts twice at logon".into()
+        }
+        Some(true) => "the Run key could not be retired, so mnvoice still starts at logon".into(),
+        Some(false) => "the Run key could not be confirmed removed".into(),
+        None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
+    }
 }
 
 /// Register or remove the at-logon autostart task. Reversible, no admin rights
@@ -1420,32 +1510,33 @@ fn set_autostart(enable: bool) -> Result<(), String> {
     } else {
         // The delete's own exit code is authority: a zero already means the
         // task is gone, so the scheduler is only asked when it says otherwise.
-        // The helper below takes `delete_ok` only to be callable from a test
-        // that wants to exercise the failed-delete branch; the live call site
-        // is inside this `else`, where a zero already short-circuited, so the
-        // flag is always false here.
-        status.success() || delete_left_task_gone(false, task_state())
+        // A task that was never there already leaves the requested state in
+        // place; one that is still registered, or a question the scheduler
+        // could not answer, is a toggle that did not take - and there the Run
+        // key is still the only autostart the user has.
+        disable_left_it_gone(status.success(), task_state)
     };
     if !in_place {
         // Whatever carries the autostart until the scheduler holds the one
         // that was asked for stays as it is, and the toggle reports what did
-        // not take rather than naming a fallback that is not there.
-        return Err(if enable {
-            "schtasks.exe could not create the logon task, keeping the Run key".into()
-        } else if run_key_set() {
-            "schtasks.exe could not remove the logon task, keeping the Run key".into()
-        } else {
-            "the logon task could not be confirmed removed".into()
-        });
+        // not take rather than naming a fallback that is not there. So the
+        // enable branch checks before it claims the Run key: naming it
+        // unconditionally reported a fallback that may itself have been
+        // retired, which is the exact thing this branch exists to avoid.
+        return Err(schtasks_failure_message(enable, run_key_set()));
     }
-    if !clear_run_key() {
-        // The Run value survived, so the app still starts at logon however
-        // the task reads, and the log must not claim a move that half failed.
-        return Err(if enable {
-            "the Run key could not be retired, so mnvoice starts twice at logon".into()
-        } else {
-            "the Run key could not be retired, so mnvoice still starts at logon".into()
-        });
+    if clear_run_key() != Some(true) {
+        // The delete's outcome was not confirmed on the first read. A fresh
+        // read settles it: a key that is now confirmed gone means the retire
+        // took - the first read was the unanswerable one - and the toggle
+        // falls through to success. Only a key still present, or still
+        // unanswerable, fails it, and the message must not claim the first
+        // when the read returned the second, because that is a machine state
+        // the code cannot see.
+        let read = run_key_set();
+        if read != Some(false) {
+            return Err(retire_failure_message(enable, read));
+        }
     }
     log(if enable { "autostart enabled" } else { "autostart disabled" });
     Ok(())
@@ -1745,6 +1836,51 @@ mod tests {
         assert!(!startup_approved_disabled(&[]), "no blob is no override");
     }
 
+    /// An unanswerable Run-key read must not read as "enabled".
+    ///
+    /// The toggle computes `enable = !autostart_enabled()`, so a state that
+    /// wrongly reads as enabled makes a click run `schtasks /delete` on a task
+    /// the user asked to create - the inverse of the request, in the one state
+    /// the three-way read exists to name.
+    #[test]
+    fn an_unanswerable_run_key_does_not_read_as_enabled() {
+        assert_eq!(autostart_state(None, || false), AutostartState::NoRunValue);
+        assert!(!autostart_starting(autostart_state(None, || false)));
+
+        assert_eq!(
+            autostart_state(Some(false), || false),
+            AutostartState::NoRunValue
+        );
+        assert_eq!(
+            autostart_state(Some(true), || true),
+            AutostartState::RunValueDisabled
+        );
+        assert_eq!(
+            autostart_state(Some(true), || false),
+            AutostartState::RunValueEnabled
+        );
+
+        // Two of the four answers settle without reading the Task Manager
+        // override at all, which is the whole reason the override arrives as a
+        // closure: behind it is a `reg.exe` spawn on the UI thread, paid on
+        // every tray-menu open. A read that is evaluated and then discarded
+        // still costs that spawn, so the panicking closure is the only check
+        // that says whether the staging holds - if the second read were an
+        // eager argument again, this test would die rather than pass.
+        assert_eq!(
+            autostart_state(Some(false), || panic!(
+                "the override is not read when the Run value is confirmed absent"
+            )),
+            AutostartState::NoRunValue
+        );
+        assert_eq!(
+            autostart_state(None, || panic!(
+                "the override is not read when nothing could be read at all"
+            )),
+            AutostartState::NoRunValue
+        );
+    }
+
     #[test]
     fn the_tray_checkmark_follows_what_actually_starts() {
         // The logon task answers the question on its own, and so does a Run
@@ -1839,15 +1975,78 @@ mod tests {
 
     #[test]
     fn a_failed_disable_only_counts_when_the_task_is_really_gone() {
-        // The delete's own exit code is authority, so a follow-up question
-        // that could not be answered changes nothing.
-        assert!(delete_left_task_gone(true, TaskState::Unknown));
-        assert!(delete_left_task_gone(true, TaskState::Absent));
-        // A delete that failed says nothing on its own: a task that was never
-        // there already leaves the requested state in place.
-        assert!(delete_left_task_gone(false, TaskState::Absent));
-        assert!(!delete_left_task_gone(false, TaskState::Present));
-        assert!(!delete_left_task_gone(false, TaskState::Unknown));
+        // A task that was never there already leaves the requested state in
+        // place, so a failed delete is not always a failed toggle.
+        assert!(disable_left_it_gone(false, || TaskState::Absent));
+        assert!(disable_left_it_gone(true, || TaskState::Absent));
+        // One that is still registered, or a question the scheduler could not
+        // answer, is a toggle that did not take - so an unanswerable query
+        // fails closed rather than reporting a disable nobody confirmed.
+        assert!(!disable_left_it_gone(false, || TaskState::Present));
+        assert!(!disable_left_it_gone(false, || TaskState::Unknown));
+        // A zero exit code is authority and is not overturned by the scheduler:
+        // the closure is not even read, which the panicking closure pins - if
+        // it were evaluated the test would die.
+        assert!(disable_left_it_gone(true, || panic!(
+            "the scheduler is not asked when the delete exited zero"
+        )));
+    }
+
+    /// Every message `set_autostart` can return names what the Run-key read
+    /// actually saw, and an unanswerable read is reported as unconfirmed
+    /// rather than as an absent or surviving key.
+    #[test]
+    fn autostart_failure_messages_name_what_was_seen() {
+        assert_eq!(
+            schtasks_failure_message(true, Some(true)),
+            "schtasks.exe could not create the logon task, keeping the Run key"
+        );
+        assert_eq!(
+            schtasks_failure_message(false, Some(true)),
+            "schtasks.exe could not remove the logon task, keeping the Run key"
+        );
+        assert_eq!(
+            schtasks_failure_message(true, Some(false)),
+            "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
+        );
+        assert_eq!(
+            schtasks_failure_message(false, Some(false)),
+            "the logon task could not be confirmed removed"
+        );
+        assert_eq!(
+            schtasks_failure_message(true, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
+        assert_eq!(
+            schtasks_failure_message(false, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
+        assert_eq!(
+            retire_failure_message(true, Some(true)),
+            "the Run key could not be retired, so mnvoice starts twice at logon"
+        );
+        assert_eq!(
+            retire_failure_message(false, Some(true)),
+            "the Run key could not be retired, so mnvoice still starts at logon"
+        );
+        // A confirmed-absent fresh read settles the retire at the caller, so
+        // these two pin the arm's totality, not a reachable caller state.
+        assert_eq!(
+            retire_failure_message(true, Some(false)),
+            "the Run key could not be confirmed removed"
+        );
+        assert_eq!(
+            retire_failure_message(false, Some(false)),
+            "the Run key could not be confirmed removed"
+        );
+        assert_eq!(
+            retire_failure_message(true, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
+        assert_eq!(
+            retire_failure_message(false, None),
+            "the Run key could not be read, so the autostart state is unconfirmed"
+        );
     }
 
     #[test]
@@ -1955,10 +2154,13 @@ mod tests {
     /// there and as a capture fault on REST.
     #[test]
     fn the_capture_report_is_classified_in_every_shape() {
-        // The engine was gone before the capture thread even started.
+        // The audio worker could not be handed the request at all, which is
+        // the only Err capture_to_channel can return - and is the worker being
+        // gone, not the audio engine, which would have reported through the
+        // channel with its own message.
         assert_eq!(
             capture_fault(None).as_deref(),
-            Some("capture failed: the audio engine is unavailable")
+            Some("capture failed: the audio worker is not running")
         );
 
         // The worker reported its own failure: that message is the answer.

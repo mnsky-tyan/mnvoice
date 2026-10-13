@@ -40,6 +40,14 @@ const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 /// arithmetic.
 const WEBSOCKET_WRITE_TIMEOUT_MS: i32 = 2_000;
 
+/// The close handshake bound handed to `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`.
+///
+/// Deliberately not shared with the send bound: that one is recorded as
+/// ignored by `WinHttpWebSocketSend`, this one has no measurement either
+/// way, and folding them into one name would make one claim bleed into
+/// the other.
+const WEBSOCKET_CLOSE_TIMEOUT_MS: i32 = 2_000;
+
 /// Build a NUL-terminated UTF-16 buffer for the wide-string Win32 APIs.
 /// Shared with the tray app, which needs the same conversion for its own
 /// window and tooltip text.
@@ -405,12 +413,31 @@ impl Transport for WinHttpTransport {
                 return Err("WebSocket upgrade failed".into());
             }
             let (connect, session) = handles.take_parents();
-
-            Ok(Box::new(WinHttpSocket {
+            // Bounded here, before the handle is boxed, so the close handshake
+            // `close()` performs cannot outlive the session on a peer that never
+            // answers it.
+            //
+            // Requested, not proven: unlike the send bound, which this file
+            // measured as ignored by `WinHttpWebSocketSend`, no measurement
+            // against a peer that never answers a close frame exists yet - so
+            // the option is set and the claim that the handshake is actually
+            // bounded stays open.
+            //
+            // A refusal is logged rather than propagated: killing the session
+            // over a missing bound trades a working (if unbounded) close for no
+            // dictation at all, and the default teardown is what every earlier
+            // release shipped with.
+            let socket = WinHttpSocket {
                 ws,
                 connect,
                 session,
-            }))
+            };
+            if let Err(e) = socket.set_close_timeout(WEBSOCKET_CLOSE_TIMEOUT_MS) {
+                crate::windows_app::log(&format!(
+                    "close timeout not set, teardown stays on WinHTTP's default ({e})"
+                ));
+            }
+            Ok(Box::new(socket))
         }
     }
 }
@@ -438,6 +465,49 @@ struct WinHttpSocket {
 // thread sends audio.
 unsafe impl Send for WinHttpSocket {}
 unsafe impl Sync for WinHttpSocket {}
+
+impl WinHttpSocket {
+    /// Bound the close handshake this socket performs when `close` runs.
+    ///
+    /// `WinHttpWebSocketClose` is not a fire-and-forget: it exchanges a close
+    /// frame with the peer, and the only thing that bounds that exchange is
+    /// `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`. Left unset it takes WinHTTP's
+    /// default rather than this caller's, which is what let `close` block on a
+    /// peer that never answers - the Windows half of a drift the Unix backend
+    /// does not have, because it terminates the socket outright
+    /// (`shutdown(Both)`) instead of negotiating.
+    ///
+    /// Set on the socket rather than the request: the option belongs to the
+    /// WebSocket handle, and by the time this runs the request has already been
+    /// closed and handed over.
+    ///
+    /// A private inherent method, not a trait method, because the trait is the
+    /// seam both backends share and only this one has the concept.
+    ///
+    /// Returns whether the option took, so the caller can log a refusal. A
+    /// refused option is not something `close` can route around - there is no
+    /// second bound to fall back to - but it is the only signal that the
+    /// handshake is still on WinHTTP's default, and the caller records it
+    /// rather than dropping it. It is deliberately not propagated: the default
+    /// teardown still works, and failing the whole session over a missing bound
+    /// would turn a slower close into no dictation at all.
+    ///
+    /// The bound is *requested* here, not proven. This file already recorded
+    /// that `WINHTTP_OPTION_SEND_TIMEOUT` and `WinHttpSetTimeouts` are set and
+    /// ignored for a WebSocket send, so nothing here may be asserted as
+    /// honoured without a measurement against a peer that never answers a close
+    /// frame - which this change does not contain.
+    fn set_close_timeout(&self, ms: i32) -> Result<(), String> {
+        unsafe {
+            WinHttpSetOption(
+                Some(self.ws),
+                WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+                Some(ms.to_ne_bytes().as_slice()),
+            )
+        }
+        .map_err(|e| format!("set close timeout ({e})"))
+    }
+}
 
 impl WebSocket for WinHttpSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
