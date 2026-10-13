@@ -1859,6 +1859,26 @@ mod tests {
             autostart_state(Some(true), || false),
             AutostartState::RunValueEnabled
         );
+
+        // Two of the four answers settle without reading the Task Manager
+        // override at all, which is the whole reason the override arrives as a
+        // closure: behind it is a `reg.exe` spawn on the UI thread, paid on
+        // every tray-menu open. A read that is evaluated and then discarded
+        // still costs that spawn, so the panicking closure is the only check
+        // that says whether the staging holds - if the second read were an
+        // eager argument again, this test would die rather than pass.
+        assert_eq!(
+            autostart_state(Some(false), || panic!(
+                "the override is not read when the Run value is confirmed absent"
+            )),
+            AutostartState::NoRunValue
+        );
+        assert_eq!(
+            autostart_state(None, || panic!(
+                "the override is not read when nothing could be read at all"
+            )),
+            AutostartState::NoRunValue
+        );
     }
 
     #[test]

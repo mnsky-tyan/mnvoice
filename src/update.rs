@@ -678,8 +678,7 @@ fn restore_old_image(exe: &Path) -> Result<(), String> {
     if exe.exists() || !old.exists() {
         return Ok(());
     }
-    fs::rename(&old, exe)
-        .map_err(|e| format!("cannot put the previous image back ({e})"))
+    fs::rename(&old, exe).map_err(|e| format!("cannot put the previous image back ({e})"))
 }
 
 /// Re-checks the staged file against the bytes that were verified in memory.
