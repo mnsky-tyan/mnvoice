@@ -693,7 +693,7 @@ fn cancel_warning(app: &App) -> Option<String> {
 ///
 /// `state_tip`'s doc says the *text* is single-sourced "so left-click polling
 /// and state transitions never disagree on tooltip text" - and it is. The
-/// *arguments* were not: this exact four-argument expression was spelled out at
+/// *arguments* were not: this exact expression was spelled out at
 /// five call sites (the tray left-click, the worker teardown, both toggle arms
 /// and cancel), with every input a field of the same `App`, so a field the tip
 /// should reflect had to be threaded through five places. `hotkey_ok` already

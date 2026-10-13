@@ -464,7 +464,10 @@ mod tests {
 
         let html = "<!DOCTYPE html><html><body>502 Bad Gateway</body></html>";
         let out = fallback_transcript(html);
-        assert!(out.is_err(), "an HTML error page must not be typed: {out:?}");
+        assert!(
+            out.is_err(),
+            "an HTML error page must not be typed: {out:?}"
+        );
 
         let out = fallback_transcript("   ");
         assert!(out.is_err(), "an empty body must not be typed: {out:?}");
