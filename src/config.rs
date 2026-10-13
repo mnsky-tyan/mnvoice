@@ -268,6 +268,13 @@ pub fn parse_auto_update(s: &str) -> bool {
 }
 
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
+    // The same BOM that `parse` strips: `load` feeds keywords.txt,
+    // vocabulary.txt and words.txt straight through here, so a file saved by
+    // Windows Notepad would otherwise read its first keyword as
+    // `\u{feff}kubernetes`. That keyword is kept as a distinct word and goes on
+    // the wire as `%EF%BB%BFkubernetes`, boosting nothing and reporting no
+    // error anywhere.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     // A lowercase index beside the vector, so de-duplication does not have to
     // re-scan every word already collected for every new one. The dedup is
     // case-insensitive by contract, so the key is the lowercase form and the
@@ -716,6 +723,16 @@ mod tests {
         ";
         parse_keywords_text(input, &mut kw);
         assert_eq!(kw, vec!["mnvoice", "herdr", "Kubernetes", "TypeScript"]);
+    }
+
+    /// The keyword files are edited on this platform with the same editors that
+    /// write a BOM, and the first word is the one they corrupt. Order is part
+    /// of the contract too: the list is sent to the provider as a prompt.
+    #[test]
+    fn a_bom_does_not_rename_the_first_keyword() {
+        let mut kw = Vec::new();
+        parse_keywords_text("\u{feff}alpha\nbeta", &mut kw);
+        assert_eq!(kw, vec!["alpha", "beta"]);
     }
 
     #[test]

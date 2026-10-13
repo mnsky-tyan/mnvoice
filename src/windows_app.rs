@@ -181,6 +181,14 @@ struct App {
     /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
     /// dictate" for a key that does nothing.
     hotkey_ok: bool,
+    /// Whether the cancel key for the current session could be claimed. The
+    /// counterpart of `hotkey_ok` on the cancel side, and held as a field for
+    /// the same reason: a one-off `set_tray_tip` from the failed registration
+    /// was overwritten by the very next state tip, so the session went on
+    /// advertising a cancel key that was never live. True when the key
+    /// registered, and true when there is no cancel key to register
+    /// (CANCEL_KEY=none is the configured state, not a failed one).
+    cancel_key_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -634,11 +642,28 @@ fn hotkey_is_disabled(hotkey: &str) -> bool {
 
 /// The tray tooltip for a given session state. Single-sourced so left-click
 /// polling and state transitions never disagree on tooltip text.
-fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool, has_config: bool) -> String {
-    match state {
+///
+/// `cancel_warning` is the sentence naming a cancel key that could not be
+/// claimed, and it is carried in every state, the way an unregistered dictate
+/// key is: the condition lasts until a later session claims the key, so a tip
+/// written once at the failed registration would be overwritten by the very
+/// next state change and the session would go on advertising a key that does
+/// nothing.
+fn state_tip(
+    state: State,
+    hotkey_str: &str,
+    hotkey_ok: bool,
+    has_config: bool,
+    cancel_warning: Option<&str>,
+) -> String {
+    let tip = match state {
         State::Idle => idle_tip(hotkey_str, hotkey_ok, has_config),
         State::Recording => "mnvoice - listening (auto-stops on silence)".to_string(),
         State::Transcribing => "mnvoice - transcribing...".to_string(),
+    };
+    match cancel_warning {
+        Some(warning) => format!("{tip} - {warning}"),
+        None => tip,
     }
 }
 
@@ -646,6 +671,22 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let mut nid = tray_nid(hwnd, NIF_TIP | NIF_GUID);
     fill_wide(&mut nid.szTip, tip);
     let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+/// The warning naming a cancel key this app could not claim, or `None` when
+/// there is nothing to warn about: either the key registered, or there is no
+/// cancel key to claim. Owned here because this is the only place the sentence
+/// is composed - `toggle` records the failure and every tip reads it back from
+/// that record, so the warning cannot be written to the tip once and then be
+/// overwritten by the next state change.
+fn cancel_warning(app: &App) -> Option<String> {
+    match (app.cancel_key_ok, app.config.as_ref()) {
+        (false, Some(cfg)) => Some(format!(
+            "{} could not be claimed, so there is no cancel key",
+            cfg.cancel_key_str
+        )),
+        _ => None,
+    }
 }
 
 /// Push the tray tip for the state `app` is in right now.
@@ -662,6 +703,9 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
 /// describes the state the app is in - at the four sites that call `set_state`
 /// first, that is the state they were hardcoding.
 unsafe fn push_tip(hwnd: HWND, app: &App) {
+    // Read from the record `toggle` writes, so no call site has to thread the
+    // cancel-key state through and no transition can erase the warning.
+    let warning = cancel_warning(app);
     set_tray_tip(
         hwnd,
         &state_tip(
@@ -669,6 +713,7 @@ unsafe fn push_tip(hwnd: HWND, app: &App) {
             &app.hotkey_str,
             app.hotkey_ok,
             app.config.is_some(),
+            warning.as_deref(),
         ),
     );
 }
@@ -750,6 +795,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // The registration result arrives after WM_CREATE (the
                     // hwnd did not exist yet); main sets the real value.
                     hotkey_ok: true,
+                    // No session has started, so nothing has failed to claim.
+                    cancel_key_ok: true,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -923,24 +970,19 @@ fn toggle(app: &mut App) {
                         cfg.cancel_key.1,
                     )
                 } {
-                    Ok(()) => {}
+                    Ok(()) => app.cancel_key_ok = true,
                     Err(e) => {
                         // Another process already owns the combination, which
                         // is the exact condition `register_hotkey_with_retry`
                         // exists for on the dictate key. The orb still appears
                         // below, and without a tip it advertises a cancel key
-                        // that was never live - so say so, the same way the
-                        // dictate key's failure does.
+                        // that was never live - so record it on the app, the
+                        // same way the dictate key's failure is recorded, and
+                        // let `state_tip` keep saying it for as long as it is
+                        // true. Writing the tip here instead was overwritten
+                        // by the state push a few lines below.
                         log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
-                        unsafe {
-                            set_tray_tip(
-                                app.hwnd,
-                                &format!(
-                                    "{} could not be claimed, so there is no cancel key",
-                                    cfg.cancel_key_str
-                                ),
-                            );
-                        }
+                        app.cancel_key_ok = false;
                     }
                 }
             }
@@ -1150,10 +1192,13 @@ fn worker(
 /// One item carries every direction: with HOTKEY=none this is the only way to
 /// start a dictation, and it must never be a grayed-out stop item while idle.
 /// The label and enablement follow the state so the single action stays
-/// honest: Transcribing has no click action at all (toggle's arm is a
-/// deliberate no-op), so it shows a disabled status label rather than an
-/// enabled "Dictate" that would silently do nothing. Pure so the mapping is
-/// testable without a live window.
+/// honest. The Transcribing arm of `toggle` cancels a session, and it cancels a
+/// Streaming one: a REST session is not cancelled there because `dictate_rest`
+/// has finished uploading by the time this state is reached and a cancel
+/// discards a fully-uploaded, untyped dictation. Naming that Streaming-only
+/// cancel in this item is a deferred product decision, so for now the item
+/// shows a disabled status label rather than an enabled "Dictate" that would
+/// silently do nothing. Pure so the mapping is testable without a live window.
 fn dictate_item(state: State) -> (&'static str, bool) {
     match state {
         State::Idle => ("Dictate", true),
@@ -2013,9 +2058,10 @@ mod tests {
     fn the_tray_dictate_item_matches_the_session_state() {
         // The single tray item must be honest about the one action it offers:
         // idle starts a dictation, recording stops it, and while a session is
-        // finishing there is no click action (toggle's Transcribing arm is a
-        // no-op), so it is shown disabled rather than as an enabled "Dictate"
-        // that silently does nothing.
+        // finishing the click action is the Streaming-only cancel in `toggle`'
+        // Transcribing arm, which is not what a REST session does, so the item
+        // is shown disabled rather than as an enabled "Dictate" that silently
+        // does nothing for the protocol in use.
         assert_eq!(dictate_item(State::Idle), ("Dictate", true));
         assert_eq!(dictate_item(State::Recording), ("Stop && transcribe", true));
         assert_eq!(
@@ -2239,16 +2285,38 @@ mod tests {
     #[test]
     fn the_tray_state_tip_reflects_session_state() {
         assert_eq!(
-            state_tip(State::Idle, "Alt+Space", true, true),
+            state_tip(State::Idle, "Alt+Space", true, true, None),
             "mnvoice - idle. Alt+Space to dictate."
         );
         assert_eq!(
-            state_tip(State::Recording, "Alt+Space", true, true),
+            state_tip(State::Recording, "Alt+Space", true, true, None),
             "mnvoice - listening (auto-stops on silence)"
         );
         assert_eq!(
-            state_tip(State::Transcribing, "Alt+Space", true, true),
+            state_tip(State::Transcribing, "Alt+Space", true, true, None),
             "mnvoice - transcribing..."
+        );
+    }
+
+    /// The cancel-key warning has to survive the tip that follows it. A state
+    /// push happens on every transition, so a warning written once at the
+    /// failed registration is gone within microseconds and the rest of the
+    /// session advertises a key that does nothing.
+    #[test]
+    fn a_cancel_key_that_was_never_claimed_keeps_saying_so() {
+        let warning = "Escape could not be claimed, so there is no cancel key";
+        for state in [State::Idle, State::Recording, State::Transcribing] {
+            let tip = state_tip(state, "Alt+Space", true, true, Some(warning));
+            assert!(
+                tip.contains(warning),
+                "the warning must be present in {}: {tip:?}",
+                state_name(state)
+            );
+        }
+        // And it drops out the moment the key is claimed again.
+        assert_eq!(
+            state_tip(State::Recording, "Alt+Space", true, true, None),
+            "mnvoice - listening (auto-stops on silence)"
         );
     }
 

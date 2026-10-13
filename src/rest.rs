@@ -75,9 +75,28 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
         return Err("the ASR endpoint returned an empty body".to_string());
     }
     if looks_like_a_refusal(trimmed) {
-        return Err(format!("the ASR endpoint returned a refusal, not a transcript: {trimmed}"));
+        return Err(format!(
+            "the ASR endpoint returned a refusal, not a transcript: {}",
+            preview(trimmed)
+        ));
     }
     Ok(trimmed.to_string())
+}
+
+/// A bounded, char-safe prefix of a body, for the messages that quote one.
+///
+/// The only cap on what comes back is the transport's (`MAX_TRANSCRIPT_BYTES`,
+/// 8 MiB), and this string is appended verbatim to `%TEMP%\mnvoice.log` by the
+/// tray and printed by the CLI on a failed dictation, so a whole proxy page
+/// must not ride along with a one-line diagnosis. The sibling that turns a
+/// non-200 into an error (`Response::error_for_status`) bounds its preview the
+/// same way.
+fn preview(body: &str) -> String {
+    const LIMIT: usize = 200;
+    match body.char_indices().nth(LIMIT) {
+        Some((i, _)) => format!("{}...", &body[..i]),
+        None => body.to_string(),
+    }
 }
 
 /// Whether a 200 body is a provider's error payload rather than a transcript.
@@ -87,13 +106,20 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
 /// error page, which is what the guard is for. So only the shapes that can only
 /// be an error are listed - a JSON object with an `error` member, an HTML
 /// document, and an XML one - and anything ambiguous is left to the fallback.
+///
+/// The JSON clauses are read only when the body opens as a JSON object, for
+/// that same reason: a provider honouring `response_format=text` returns the
+/// words the user dictated, and a dictated bug report or commit body happily
+/// contains `"error"`. Quoted-key shapes found anywhere in a bare transcript
+/// would throw away a dictation that was actually heard.
 fn looks_like_a_refusal(body: &str) -> bool {
-    let lower = body.trim_start().to_ascii_lowercase();
+    let start = body.trim_start();
+    let lower = start.to_ascii_lowercase();
     lower.starts_with("<!doctype html")
         || lower.starts_with("<html")
         || lower.starts_with("<?xml")
-        || body.contains("\"error\"")
-        || body.contains("\"message\":\"")
+        || (start.starts_with('{')
+            && (start.contains("\"error\"") || start.contains("\"message\":\"")))
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -410,6 +436,48 @@ mod tests {
     fn a_json_transcript_still_comes_out_of_the_parser() {
         let out = fallback_transcript(r#"{"text":"half a sentence"}"#);
         assert_eq!(out, Ok("half a sentence".to_string()));
+    }
+
+    /// The false positive this guard cannot afford: a bare transcript that
+    /// mentions an error is the user's own words, and refusing it loses a
+    /// dictation they already spoke. So the quoted-key shapes are only read in
+    /// a body that opens as a JSON object.
+    #[test]
+    fn a_transcript_that_names_an_error_is_still_typed() {
+        for body in [
+            "the error was in the parser",
+            "the log prints \"error\" and \"message\":\"failed to start\"",
+        ] {
+            assert_eq!(
+                fallback_transcript(body),
+                Ok(body.to_string()),
+                "a bare transcript that mentions an error must not be refused"
+            );
+        }
+    }
+
+    /// A refusal names the body it rejected without carrying it: the message
+    /// goes to the log and the CLI's stdout, and the body is bounded only by
+    /// the transport's 8 MiB.
+    #[test]
+    fn a_refusal_reports_a_preview_not_the_whole_body() {
+        let mut json = String::from(r#"{"error":{"message":"quota"}}"#);
+        json.push_str(&"x".repeat(200 * 1024));
+        let err = fallback_transcript(&json).expect_err("a JSON error object is a refusal");
+        assert!(
+            err.len() < 300,
+            "the message must stay bounded, got {} bytes: {}",
+            err.len(),
+            &err[..err.len().min(80)]
+        );
+        assert!(
+            !err.contains(&"x".repeat(300)),
+            "the tail of the body must not be carried"
+        );
+        assert!(
+            err.starts_with("the ASR endpoint returned a refusal"),
+            "{err}"
+        );
     }
 
     /// A cancelled REST session must not upload and must not type. The guard

@@ -828,14 +828,29 @@ mod tests {
         /// than failing immediately. That is the difference from a provider that
         /// dropped the connection, whose dead socket answers `Err` at once and
         /// costs nothing.
-        pub fn serve_stalled() -> (u16, std::thread::JoinHandle<()>) {
-            serve(move |stream| {
+        ///
+        /// Alongside the join handle it returns the release channel. The peer
+        /// has to keep the socket open while the session is stalled, but an
+        /// unconditional `sleep` banks its whole length on every run: tests
+        /// share the thread pool, and the live-provider tests either side of
+        /// this one assert against real post-stop waits, so a long fixed window
+        /// is a flake the fixture causes rather than a property it measures. A
+        /// deadline is kept so a session that never returns cannot leave this
+        /// peer holding a socket forever, and the test releases it inside that.
+        pub fn serve_stalled() -> (
+            u16,
+            std::thread::JoinHandle<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (port, server) = serve(move |stream| {
                 let mut sink = [0u8; 64];
                 // Read once so the handshake lands, then never read again while
                 // holding the socket open.
                 let _ = stream.read(&mut sink);
-                std::thread::sleep(Duration::from_secs(20));
-            })
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            });
+            (port, server, release_tx)
         }
 
         /// A session whose audio producer keeps running past `stop`, so the
@@ -898,8 +913,6 @@ mod tests {
         );
     }
 
-    /// A peer that stopped reading must not cost the drain one write timeout
-    /// per queued packet.
     /// A stalled peer must not cost the drain one write timeout per queued packet.
     ///
     /// The drain's job is to ship the queued tail so the provider can finalise
@@ -918,13 +931,26 @@ mod tests {
     /// hook is what distinguishes the two.
     #[test]
     fn the_drain_stops_at_the_first_failed_send() {
-        let (port, server) = live_provider::serve_stalled();
+        let (port, server, release) = live_provider::serve_stalled();
         let cfg = live_provider::cfg_for(port);
+
+        // While the peer cannot read, the live loop's send parks and the
+        // session cannot reach the drain until that peer goes away, so the
+        // release cannot wait for `run_stream` to return - it has to arrive
+        // while the session is stalled. Two seconds is past the point where the
+        // kernel window is full (the first ~60 sends land in under 40 ms) and
+        // past the helper's 1.5 s stop, so the drain still finds a real backlog
+        // to work through, and the suite does not bank the fixture's deadline.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2000));
+            let _ = release.send(());
+        });
 
         // Far more packets than the kernel window can take, still arriving when
         // the session ends, so the drain has a real backlog to work through.
         let _ = live_provider::drive_with_a_backlog(&cfg, 4000);
-        let _ = server.join();
+        let _ = releaser.join();
+        server.join().unwrap();
 
         assert!(
             crate::test_hooks::drain_broke_early(),
