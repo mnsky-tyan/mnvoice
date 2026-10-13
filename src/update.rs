@@ -1223,10 +1223,11 @@ mod tests {
         </feed>"#;
         assert_eq!(feed_tags(feed).len(), 2);
         // The tags are other platforms' releases, so there is nothing here for
-        // this install to take on any platform. The module is Windows-only
-        // today, but the assertion is written to hold everywhere rather than
-        // hidden behind a `cfg!` whose body still compiles - and would still
-        // run its asserts - on a platform that cannot reach it.
+        // this install to take on any platform. The assertion is unconditional:
+        // this module is Windows-only at its single point of definition,
+        // `main.rs`'s `#[cfg(windows)] mod update`, so a `cfg!` wrapper here
+        // could only ever evaluate to true and would just be a second spelling
+        // of a rule that file already owns.
         assert!(newest_tag_for_this_platform(feed).is_none());
         assert!(parse_version_from_feed(feed).is_none());
     }
@@ -1238,7 +1239,6 @@ mod tests {
         // expected tag names Windows explicitly because the rule being pinned
         // is Windows' - a bare tag means "the one release that predates the
         // per-platform split", which is this install's.
-        #![cfg(windows)]
         let feed = r#"<feed>
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-linux"/></entry>
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-win"/></entry>

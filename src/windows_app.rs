@@ -621,7 +621,7 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     // and the window setup tests the `hk_vk == 0` sentinel - three spellings of
     // one rule, where this third one silently degraded to "mnvoice - idle. none
     // to dictate." if the parser's normalisation ever changed.
-    if hotkey.is_empty() || hotkey_is_disabled(hotkey) {
+    if hotkey_is_disabled(hotkey) {
         return "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string();
     }
     match (hotkey, hotkey_ok) {
@@ -1041,8 +1041,10 @@ fn toggle(app: &mut App) {
         // rather than removed and the hotkey is registered regardless, the press
         // was swallowed with no log line, no tip and no state change - the orb
         // sat there transcribing and the user could not tell whether the press
-        // had registered. The words are already committed by the time this
-        // state is reached, so cancelling only stops the tail from typing.
+        // had registered. The press cancels for both protocols: a Streaming
+        // cancel stops the queued tail from being shipped, while a REST cancel
+        // discards the whole captured dictation - `dictate_rest`'s entry guard
+        // and its post-round-trip check drop it.
         State::Transcribing => cancel(app),
     }
 }
@@ -1192,13 +1194,14 @@ fn worker(
 /// One item carries every direction: with HOTKEY=none this is the only way to
 /// start a dictation, and it must never be a grayed-out stop item while idle.
 /// The label and enablement follow the state so the single action stays
-/// honest. The Transcribing arm of `toggle` cancels a session, and it cancels a
-/// Streaming one: a REST session is not cancelled there because `dictate_rest`
-/// has finished uploading by the time this state is reached and a cancel
-/// discards a fully-uploaded, untyped dictation. Naming that Streaming-only
-/// cancel in this item is a deferred product decision, so for now the item
-/// shows a disabled status label rather than an enabled "Dictate" that would
-/// silently do nothing. Pure so the mapping is testable without a live window.
+/// honest. The Transcribing arm of `toggle` cancels the session for both
+/// protocols: a Streaming cancel stops the queued tail from being shipped, and
+/// a REST cancel discards the whole captured dictation, which `dictate_rest`'s
+/// entry guard and post-round-trip check drop. Naming that cancel in this item
+/// is a deferred product decision, so for now the item shows a disabled status
+/// label rather than an enabled "Dictate" that would silently do nothing - and
+/// a REST press would discard work the user cannot get back. Pure so the
+/// mapping is testable without a live window.
 fn dictate_item(state: State) -> (&'static str, bool) {
     match state {
         State::Idle => ("Dictate", true),
@@ -2058,10 +2061,11 @@ mod tests {
     fn the_tray_dictate_item_matches_the_session_state() {
         // The single tray item must be honest about the one action it offers:
         // idle starts a dictation, recording stops it, and while a session is
-        // finishing the click action is the Streaming-only cancel in `toggle`'
-        // Transcribing arm, which is not what a REST session does, so the item
-        // is shown disabled rather than as an enabled "Dictate" that silently
-        // does nothing for the protocol in use.
+        // finishing the Transcribing hotkey press cancels for both protocols,
+        // but a REST cancel discards the whole captured dictation (rest's entry
+        // guard and post-round-trip check drop it) - work the user cannot get
+        // back - so the item is shown disabled rather than as an enabled
+        // "Dictate" that would silently do nothing.
         assert_eq!(dictate_item(State::Idle), ("Dictate", true));
         assert_eq!(dictate_item(State::Recording), ("Stop && transcribe", true));
         assert_eq!(

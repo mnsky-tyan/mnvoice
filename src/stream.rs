@@ -678,13 +678,6 @@ mod tests {
             (port, handle, head_slot)
         }
 
-        /// A provider that completes the handshake and then never reads again.
-        ///
-        /// The kernel socket buffers absorb the first stretch of audio, so a
-        /// few frames go out; once those fill, every further send blocks. This
-        /// is the shape of a provider that stalls without closing, and it is
-        /// the only way to exercise the post-session drain against a peer that
-        /// genuinely cannot take the queued tail.
         /// `Sec-WebSocket-Accept`: base64(sha1(key + GUID)). The crate ships a
         /// SHA-1 only inside the update module's checksum helper, so the
         /// handshake digest is spelled here from the RFC 6455 magic value.
