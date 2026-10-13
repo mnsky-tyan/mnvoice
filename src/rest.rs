@@ -129,14 +129,37 @@ fn preview(body: &str) -> String {
 /// words the user dictated, and a dictated bug report or commit body happily
 /// contains `"error"`. Quoted-key shapes found anywhere in a bare transcript
 /// would throw away a dictation that was actually heard.
+///
+/// The `"message"` value may be separated from its key and colon by ASCII
+/// whitespace, because providers pretty-print their JSON (`{"message": "..."}`
+/// is as common as the compact spelling).
 fn looks_like_a_refusal(body: &str) -> bool {
     let start = body.trim_start();
     let lower = start.to_ascii_lowercase();
-    lower.starts_with("<!doctype html")
+    if lower.starts_with("<!doctype html")
         || lower.starts_with("<html")
         || lower.starts_with("<?xml")
-        || (start.starts_with('{')
-            && (start.contains("\"error\"") || start.contains("\"message\":\"")))
+    {
+        return true;
+    }
+    if !start.starts_with('{') {
+        return false;
+    }
+    if start.contains("\"error\"") {
+        return true;
+    }
+    const MESSAGE_KEY: &str = "\"message\"";
+    let Some(key_pos) = start.find(MESSAGE_KEY) else {
+        return false;
+    };
+    start[key_pos + MESSAGE_KEY.len()..]
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .strip_prefix(':')
+        .is_some_and(|after_colon| {
+            after_colon
+                .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                .starts_with('"')
+        })
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -532,6 +555,41 @@ mod tests {
         assert_eq!(
             fallback_transcript("\u{feff}{\"text\":\"hello\"}"),
             Ok("hello".to_string())
+        );
+    }
+
+    /// The `"message"` key is the other error shape a provider returns, and
+    /// providers pretty-print: the exact byte run `"message":"` missed
+    /// `{"message": "..."}` and typed the error sentence into the focused
+    /// window. The quoted-value requirement is what keeps the clause narrow -
+    /// a bare `"message"` mention or a null value is not a refusal.
+    #[test]
+    fn a_message_key_with_a_quoted_value_is_a_refusal() {
+        for body in [
+            r#"{"message": "insufficient quota"}"#,
+            r#"{"message":"insufficient quota"}"#,
+            r#"{"message" : "insufficient quota"}"#,
+            "{\"message\":\t\"insufficient quota\"}",
+        ] {
+            let out = fallback_transcript(body);
+            let err = out.expect_err("a message error must not be typed");
+            assert!(
+                err.starts_with("the ASR endpoint returned a refusal"),
+                "{err}"
+            );
+        }
+
+        let body = r#"{"message": null}"#;
+        assert_eq!(
+            fallback_transcript(body),
+            Ok(body.to_string()),
+            "a null message is not a refusal"
+        );
+
+        assert_eq!(
+            fallback_transcript(r#"{"text": "hello"}"#),
+            Ok("hello".to_string()),
+            "a JSON transcript still parses"
         );
     }
 
