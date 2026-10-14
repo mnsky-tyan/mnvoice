@@ -165,3 +165,32 @@ and direct keyboard event injection.
      exe. To smoke-test a build, start it from a directory with no env file and
      no other instance expected, or test the behaviour through `cargo test` -
      never through the flag that exists to kill things.
+   - **A WebSocket message may arrive in fragments; the Windows backend must
+     reassemble them.** RFC 6455 lets a sender split one message across frames
+     (first frame with FIN clear and the message opcode, then continuations
+     with opcode 0), and the consumer of the transport `read` parses every
+     buffer as one complete JSON document. tungstenite reassembles on Unix;
+     WinHTTP surfaces fragments via `peBufferType` and the loop must keep
+     reading until the final fragment, mapping the close type separately.
+     Verified with a live loopback peer test that discriminates (it fails with
+     the pre-fix read on Windows, passes with the fix).
+   - **A tick that consumed nothing must still charge the silence windows.**
+     The Unix engine's empty-mono path and the Windows engine's packet==0 path
+     both count nothing toward the no-speech and after-voice limits, so a
+     stalled device ran until the longer window expired. Both now call
+     `advance_stalled(elapsed_ms, vad_silence_ms)`, which charges both windows
+     on a tick that returned no audio.
+   - **`AUDCLNT_BUFFERFLAGS_SILENT` packets hold stale buffer contents, not
+     silence.** The flag means the driver did not write the buffer; reading it
+     feeds a glitch into the transcript. Substituting zeros (a shared const
+     slice, no per-packet allocation) makes the behaviour independent of the
+     driver.
+   - **The tray menu must not spawn processes.** `TrackPopupMenu` runs on the UI
+     thread; spawning `schtasks`/`reg.exe` inside it blocks the menu. The
+     autostart state is now cached (`AUTOSTART_CACHED`) and refreshed on the
+     worker threads, and the menu only reads the cache.
+   - **tungstenite's `handshake` feature is not a TLS feature.** It is the HTTP
+     upgrade machinery, needed on both Unix and Windows. It is now a
+     `cfg(windows)` dev-dependency so the Windows test build can compute
+     `Sec-WebSocket-Accept` with `derive_accept_key` instead of ~95 lines of
+     hand-rolled SHA-1/base64. The release binary is unchanged (dev-only).
