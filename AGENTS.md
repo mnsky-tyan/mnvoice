@@ -111,3 +111,46 @@ and direct keyboard event injection.
    - **`sync --recover` needs a clean worktree.** Uncommitted local changes
      duplicated the pipeline head and blocked recovery with
      `safety: blocked_recover_dirty`. `git stash` first, recover, then pop.
+
+   - **Two spellings of one derived constant will disagree exactly where the
+     derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
+     at the sizing site and `nBlockAlign > 0 ? nBlockAlign : channels *
+     sample_bytes` inside `convert_mix`; they differed only at
+     `nBlockAlign == 0`, where the sizing site called 1 byte a frame and the
+     decoder called it 8 for a stereo float32 format. A packet sized the old
+     way failed the length check outright, or decoded one frame for every
+     eight the device had captured. Both sites now call one
+     `frame_bytes(format)` helper, and the helper takes its widths from the
+     format rather than from arguments, so no caller can hand it a pair that
+     contradicts the format it is sizing or decoding. The rule: when a value
+     is derived, derive it in one function and pass the function's result, not
+     the inputs, to the places that need it.
+   - **A comment that names a defect class invites the reviewer to check that
+     class, so it must be true at that line.** Repeated rounds of this pass
+     were spent on prose claiming protection the code does not establish: a
+     guard "catching" a mid-session format change (both operands come from the
+     startup copy of the format, so it cannot), a "tail" that is "real, not
+     theoretical" (the carry was provably empty by induction), and "neither
+     clamp" one sentence after stating the channel count is not clamped. State
+     what the code establishes and name what it does not, including that a
+     separate change would be needed to cover the rest.
+   - **Verify a reviewer's claim about the history before acting on it, and
+     keep the falsification on record.** A finding re-filed three times as
+     `intent-conflict-windows-carry` insisted the intent REQUIRED carrying a
+     partial trailing frame on Windows; the intent's wording predated the same
+     reviewer's own proof that WASAPI's `GetBuffer` reports a whole number of
+     frames, which made the carry unreachable. Disposition: deliberate, with
+     the reason recorded in the code at the site. A fix built on a premise the
+     code contradicts is reverted, and the revert is recorded, not dropped.
+   - **When WSL interop to Windows dies, every `/mnt/c/...` launch fails with
+     `UtilAcceptVsock:271: accept4 failed 110` and the exit code can still be
+     0.** That last part is the trap: a wrapper sees success and an empty
+     string. `cargo.exe`, `cmd.exe` and `tasklist.exe` all went down together
+     while `powershell.exe` intermittently worked, which is what made it look
+     like a per-tool bug. It is a machine-level outage, so a gate's test step
+     cannot route around it - the run fails at `test` with the branch intact.
+     Diagnose with a trivial `cmd.exe /c echo` twice (one success does not
+     mean recovery), treat "ERROR line plus no stdout" as failure, and hold
+     Windows-bound work rather than letting an agent thrash. Recovery is the
+     user's Windows-side call: restarting WSL kills every WSL process,
+     including the agent session and herdr's panes.
