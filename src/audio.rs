@@ -205,7 +205,14 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
 
     let mut silence = SilenceWindows::new();
-    let block_align = engine.format.nBlockAlign.max(1) as usize;
+    // The frame width comes from `frame_bytes`, the same definition the decoder
+    // below uses, so the buffer sizing and the decode cannot disagree.
+    let channels = engine.format.nChannels as usize;
+    // `convert_mix` refuses a zero sample width before it decodes, so clamping
+    // here only keeps the fallback width from being zero - it cannot make a
+    // mismatched stride read silently.
+    let sample_bytes = (engine.format.wBitsPerSample as usize / 8).max(1);
+    let block_align = frame_bytes(&engine.format, channels, sample_bytes);
     let vad_silence_ms = req.vad_silence_ms;
     let vad_rms_threshold = req.vad_rms_threshold;
 
@@ -228,18 +235,18 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             .map_err(|e| format!("capture buffer ({e})"))?;
 
         if frames > 0 && !ptr.is_null() {
-            // No tail to carry here, unlike the Unix engine. `GetBuffer`
-            // reports a whole number of frames and `block_align` is the frame's
-            // byte width, so this slice always ends on a frame boundary - which
-            // is also why `convert_mix`'s length guard cannot fire on this
-            // path. A carry was added and then removed: `GetBuffer` only ever
-            // hands back whole frames, so it could never become non-empty and
-            // only added a heap copy and a full memcpy to the 2 ms capture loop
-            // for a branch that never engaged. The guard's real reach is the
-            // format-derived checks inside `convert_mix`, which carrying bytes
-            // does not address; a live mid-session format change would need the
-            // decode format taken from the packet rather than the startup copy,
-            // which is a separate change.
+            // No tail to carry here, unlike the Unix engine. The length is
+            // `frames * block_align` and `block_align` is computed by the same
+            // `frame_bytes` the decoder uses, so a whole number of frames is
+            // what `convert_mix` is handed; `GetBuffer` reports a frame count,
+            // so a partial frame cannot arrive on this path. A carry was added
+            // and then removed: by construction it could never become non-empty,
+            // so it only added a heap copy and a full memcpy to the 2 ms capture
+            // loop for a branch that never engaged. The length guard stays for
+            // what it actually catches - a format whose declared block align
+            // contradicts its own fields - and for a live mid-session format
+            // change, which would need the decode format taken from the packet
+            // rather than the startup copy.
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result.
@@ -302,6 +309,23 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     Ok(())
 }
 
+/// The width of one interleaved frame in bytes, computed the one way.
+///
+/// `nBlockAlign` is what the format declares, and a zero value is a broken
+/// declaration: the fallback is the width the format's own fields imply
+/// (`channels * sample_bytes`), so a caller that sizes its buffer from this
+/// function and a consumer that decodes with it agree by construction. They
+/// used to spell the rule twice, and disagreed exactly at `nBlockAlign == 0`,
+/// where one said 1 byte and the other `channels * sample_bytes`.
+fn frame_bytes(format: &WAVEFORMATEX, channels: usize, sample_bytes: usize) -> usize {
+    let declared = format.nBlockAlign as usize;
+    if declared > 0 {
+        declared
+    } else {
+        channels * sample_bytes
+    }
+}
+
 fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Vec<i16>, String> {
     let channels = format.nChannels as usize;
     let rate = format.nSamplesPerSec as usize;
@@ -330,11 +354,7 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
         ));
     }
 
-    let frame = if format.nBlockAlign > 0 {
-        format.nBlockAlign as usize
-    } else {
-        channels * sample_bytes
-    };
+    let frame = frame_bytes(format, channels, sample_bytes);
     if frame < channels * sample_bytes || !raw.len().is_multiple_of(frame) {
         return Err("unexpected capture buffer size".into());
     }
@@ -499,6 +519,50 @@ mod tests {
             convert(12, 120).is_ok(),
             "a padded frame stride must still convert"
         );
+    }
+
+    /// The frame stride has ONE definition. The capture loop sizes its buffer
+    /// from `frame_bytes` and the decoder reads with it, so the two cannot
+    /// disagree: they used to spell the rule twice (`nBlockAlign.max(1)` against
+    /// `nBlockAlign > 0 ? nBlockAlign : channels * sample_bytes`) and differed
+    /// exactly where a broken declaration lands, where the sizing side said 1
+    /// byte and the decoding side said a whole frame, so the guard the capture
+    /// comment claimed "cannot fire on this path" fired, or silently threw away
+    /// most of the packet.
+    #[test]
+    fn the_frame_stride_is_one_definition_shared_by_sizing_and_decode() {
+        let fmt = |n_block_align: u16| WAVEFORMATEX {
+            nChannels: 2,
+            nSamplesPerSec: SAMPLE_RATE,
+            wBitsPerSample: 32,
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nBlockAlign: n_block_align,
+            ..Default::default()
+        };
+
+        // A zero block align is a broken declaration: the width the format's
+        // own fields imply is what both sites must use, never 1 byte.
+        assert_eq!(
+            frame_bytes(&fmt(0), 2, 4),
+            8,
+            "a zero nBlockAlign must fall back to channels * sample_bytes"
+        );
+        // A declared width is honoured.
+        assert_eq!(frame_bytes(&fmt(8), 2, 4), 8, "a declared stride wins");
+        assert_eq!(frame_bytes(&fmt(12), 2, 4), 12, "padding is kept");
+
+        // What the capture loop hands over is `frames * frame_bytes`, so a
+        // buffer built that way for a zero-block-align format must be accepted
+        // rather than reported as a bad length.
+        let f = fmt(0);
+        let stride = frame_bytes(&f, 2, 4);
+        let raw = vec![0u8; 2 * stride];
+        let converted = convert_mix(&raw, &f, SampleKind::Float);
+        assert!(
+            converted.is_ok(),
+            "a buffer sized by frame_bytes must convert, got {converted:?}"
+        );
+        assert_eq!(converted.unwrap().len(), 2, "both frames decoded");
     }
 
     /// `sample_kind` reads the sub-format GUID for WAVE_FORMAT_EXTENSIBLE, so a
