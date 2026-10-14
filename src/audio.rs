@@ -323,10 +323,15 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 ///
 /// Both widths are read from `format` rather than passed in, so no caller can
 /// hand the helper a pair that contradicts the format it is sizing or decoding.
-/// A zero `wBitsPerSample` would make the fallback width zero, and a zero
-/// stride makes every buffer a multiple of it, so the byte width is at least 1:
-/// `convert_mix` refuses a zero sample width before it decodes, and the clamp
-/// cannot turn a mismatched stride into a silent read.
+///
+/// A zero `wBitsPerSample` would make the fallback width zero, so the byte
+/// width is at least 1 - but the channel count is not clamped, and a format
+/// declaring zero channels yields a zero stride. That is benign and loud
+/// rather than silent: the slice is read empty, `convert_mix` refuses
+/// `channels == 0` before decoding, and the session aborts with the
+/// unreadable-format error. The clamp exists so the one input this function
+/// actually defends against - a missing block-align declaration on a real
+/// device - cannot become a zero stride that silently reads nothing.
 fn frame_bytes(format: &WAVEFORMATEX) -> usize {
     let declared = format.nBlockAlign as usize;
     if declared > 0 {
@@ -532,16 +537,19 @@ mod tests {
         );
     }
 
-    /// The frame stride has ONE definition. The capture loop sizes its buffer
-    /// from `frame_bytes` and the decoder reads with it, so the two cannot
-    /// disagree: they used to spell the rule twice (`nBlockAlign.max(1)` against
+    /// What `frame_bytes` returns, and that a buffer sized by it decodes whole.
+    ///
+    /// The sizing site lives in `run_session`, which is unsafe and device-bound,
+    /// so nothing here can observe whether that loop still calls this helper -
+    /// what this pins is the helper's own values and the decode that consumes
+    /// them. They used to be spelled twice (`nBlockAlign.max(1)` against
     /// `nBlockAlign > 0 ? nBlockAlign : channels * sample_bytes`) and differed
-    /// exactly where a broken declaration lands, where the sizing side said 1
-    /// byte and the decoding side said a whole frame, so the guard the capture
-    /// comment claimed "cannot fire on this path" fired, or silently threw away
-    /// most of the packet.
+    /// exactly where a broken declaration lands, where one side said 1 byte per
+    /// frame and the other 8 for this test's stereo float32 format: a packet
+    /// sized the old way either failed the length check outright or decoded one
+    /// frame for every eight the device had captured.
     #[test]
-    fn the_frame_stride_is_one_definition_shared_by_sizing_and_decode() {
+    fn a_buffer_sized_by_frame_bytes_converts_for_a_zero_block_align_format() {
         let fmt = |n_block_align: u16| WAVEFORMATEX {
             nChannels: 2,
             nSamplesPerSec: SAMPLE_RATE,
@@ -552,7 +560,7 @@ mod tests {
         };
 
         // A zero block align is a broken declaration: the width the format's
-        // own fields imply is what both sites must use, never 1 byte.
+        // own fields imply is what this function must return, never 1 byte.
         assert_eq!(
             frame_bytes(&fmt(0)),
             8,
@@ -562,9 +570,9 @@ mod tests {
         assert_eq!(frame_bytes(&fmt(8)), 8, "a declared stride wins");
         assert_eq!(frame_bytes(&fmt(12)), 12, "padding is kept");
 
-        // What the capture loop hands over is `frames * frame_bytes`, so a
-        // buffer built that way for a zero-block-align format must be accepted
-        // rather than reported as a bad length.
+        // A buffer built the way the capture loop builds one - `frames *
+        // frame_bytes` - must be accepted for a zero-block-align format rather
+        // than reported as a bad length.
         let f = fmt(0);
         let stride = frame_bytes(&f);
         let raw = vec![0u8; 2 * stride];
