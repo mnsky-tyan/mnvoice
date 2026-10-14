@@ -623,6 +623,21 @@ mod tests {
             out
         }
 
+        /// One frame of a fragmented message: the FIN bit is clear on every
+        /// piece but the last.
+        ///
+        /// RFC 6455 lets a sender split one message across frames, and a peer
+        /// that does is legal. The consumer of `read` parses each returned
+        /// buffer as one complete JSON document, so a backend that surfaced a
+        /// fragment as a whole message would drop the words in it.
+        pub fn fragment(opcode: u8, payload: &[u8], fin: bool) -> Vec<u8> {
+            let mut out = frame(opcode, payload);
+            if !fin {
+                out[0] &= 0x7f;
+            }
+            out
+        }
+
         /// Finish the HTTP upgrade by hand, then run `after_handshake` with a
         /// connected peer. Returns the port the client should dial.
         pub fn serve(
@@ -951,6 +966,45 @@ mod tests {
         assert!(
             text.contains("[connection lost:"),
             "a mid-dictation socket death on the send side must be marked: {text}"
+        );
+    }
+
+    /// A provider that fragments its messages must still deliver whole
+    /// messages to the transcript parser.
+    ///
+    /// RFC 6455 allows one message to arrive as several frames, and the
+    /// consumer of `read` parses every buffer it receives as one complete JSON
+    /// document. The Unix backend reassembles through tungstenite; the Windows
+    /// backend had to do it itself, because `WinHttpWebSocketReceive` reports a
+    /// fragment type and the code returned the fragment as if the message were
+    /// whole - so the JSON failed to parse and the words were dropped, on
+    /// Windows only. This pins the contract both backends must meet.
+    #[test]
+    fn a_fragmented_message_is_reassembled_before_it_is_parsed() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // One JSON result frame split across two frames, with the FIN bit
+            // clear on the first. The split lands mid-token, which is what a
+            // real fragmenting sender does.
+            let json = r#"{"type":"Results","channel":{"alternatives":[{"transcript":"fragmented words"}]},"is_final":true,"speech_final":true}"#;
+            let (a, b) = json.split_at(json.len() / 2);
+            // RFC 6455: the first frame carries the message opcode (text) with
+            // FIN clear, and every following frame is a continuation (opcode 0).
+            let _ = stream.write_all(&live_provider::fragment(0x1, a.as_bytes(), false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = stream.write_all(&live_provider::fragment(0x0, b.as_bytes(), true));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 20);
+        let _ = server.join();
+
+        let text = out.expect("a fragmented message is not an error");
+        assert!(
+            text.contains("fragmented words"),
+            "a fragmented result must be reassembled and typed, got: {text:?}"
         );
     }
 
