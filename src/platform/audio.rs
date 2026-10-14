@@ -203,12 +203,20 @@ pub fn rms_of(samples: &[i16]) -> f64 {
     (sum_sq / samples.len() as f64).sqrt()
 }
 
-/// A persistent capture engine, armed once at startup.
+/// The capture-engine seam.
 ///
-/// On Windows nothing names this trait - the app holds its concrete
-/// `AudioEngine` and calls its inherent method. That asymmetry is deliberate:
-/// the trait is the port's specification for the Unix engines, and the portable
-/// CLI is what actually calls it through a trait object.
+/// On Windows nothing names this trait: the app holds its concrete
+/// `AudioEngine` and calls its inherent method. The Unix engines implement it,
+/// and the CLI is the one caller - through the concrete `CpalAudio` rather than
+/// a trait object, so the trait is a specification the Unix side satisfies
+/// rather than a value that is passed around as `dyn Audio`.
+///
+/// "Persistent" is the Windows engine's shape, not a requirement of this
+/// trait: WASAPI is initialized once at startup and armed per session, which is
+/// what keeps the first audio ~15 ms away. `CpalAudio` opens the device per
+/// session instead, because cpal offers no equivalent of "open now, configure
+/// later" (see unix_audio.rs). Both satisfy the same contract: the returned
+/// receiver yields exactly one result when the session ends.
 #[allow(dead_code)]
 pub trait Audio: Send {
     /// Begin a capture session.

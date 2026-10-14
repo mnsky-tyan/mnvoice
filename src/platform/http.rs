@@ -42,6 +42,29 @@ pub const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
 /// the effective one for both, which is why they are named apart.
 pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The longest body preview a diagnostic message may quote, in characters.
+///
+/// One owner for a bound that was spelled three times (here, in
+/// `rest::preview`, and in the tray's transcription log line) with two
+/// different truncation styles. Changing it in one place used to desynchronize
+/// the messages a user reads in `%TEMP%\mnvoice.log`.
+pub const PREVIEW_CHARS: usize = 200;
+
+/// A bounded, char-safe prefix of a body, for the messages that quote one.
+///
+/// The only cap on what comes back is the transport's
+/// ([`MAX_TRANSCRIPT_BYTES`], 8 MiB), and this string is appended verbatim to
+/// the log by the tray and printed by the CLI on a failed dictation, so a
+/// whole proxy page must not ride along with a one-line diagnosis. The
+/// ellipsis marks that something was cut; the count is in `char`s rather than
+/// bytes so a multi-byte body cannot be sliced mid-character.
+pub fn preview(body: &str) -> String {
+    match body.char_indices().nth(PREVIEW_CHARS) {
+        Some((i, _)) => format!("{}...", &body[..i]),
+        None => body.to_string(),
+    }
+}
+
 /// Response to a completed request. The status is carried rather than turned
 /// into an error here, because the callers disagree about which codes are
 /// interesting: the update path wants to say "HTTP 404" in its message, while
@@ -56,10 +79,7 @@ impl Response {
     /// bounded preview of the body, so a provider's explanation survives
     /// without a megabyte of HTML in the log.
     pub fn error_for_status(&self, what: &str) -> String {
-        let preview: String = String::from_utf8_lossy(&self.body)
-            .chars()
-            .take(200)
-            .collect();
+        let preview = preview(&String::from_utf8_lossy(&self.body));
         format!("{what} returned HTTP {}: {preview}", self.status)
     }
 }
