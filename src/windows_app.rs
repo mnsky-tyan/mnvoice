@@ -1154,6 +1154,18 @@ fn worker(
             // inside the match above. Every shape other than a clean `Ok(())`
             // is a capture failure, and reporting it as NO_SPEECH would tell a
             // user whose audio service stopped that they said nothing.
+            //
+            // Stop capture first. `run_stream` returning means the session is
+            // over, but capture does not know that: on the commonest failure
+            // (no network, or a bad API key, so the socket never opens) it is
+            // still running, and this `recv` waits for it. Dropping the audio
+            // receiver inside `run_stream` usually ends it within a chunk, but
+            // a device that is delivering nothing has no send to fail, so
+            // without this the report - and the error it carries - would wait
+            // for the device or for max_seconds. Setting it is free: the
+            // session is finished either way, and a worker already stopping
+            // sees no change.
+            stop.store(true, Ordering::SeqCst);
             if let Some(e) = capture_fault(capture_done.as_ref()) {
                 result = (false, e);
             }
