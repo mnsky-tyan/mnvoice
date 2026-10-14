@@ -325,13 +325,16 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 /// hand the helper a pair that contradicts the format it is sizing or decoding.
 ///
 /// A zero `wBitsPerSample` would make the fallback width zero, so the byte
-/// width is at least 1 - but the channel count is not clamped, and a format
-/// declaring zero channels yields a zero stride. That is benign and loud
-/// rather than silent: the slice is read empty, `convert_mix` refuses
-/// `channels == 0` before decoding, and the session aborts with the
-/// unreadable-format error. The clamp exists so the one input this function
-/// actually defends against - a missing block-align declaration on a real
-/// device - cannot become a zero stride that silently reads nothing.
+/// width is at least 1: with a zero stride the sizing site hands `convert_mix`
+/// an empty slice, and decoding it would divide by the same zero stride. The
+/// clamp keeps the stride non-zero so the session ends in `convert_mix`'s
+/// "invalid mix format" refusal instead - still a loud abort, which is the
+/// point. The channel count is not clamped, and a format declaring zero
+/// channels does yield a zero stride: that slice is read empty and
+/// `convert_mix` refuses `channels == 0` before any decode, so it is loud
+/// rather than silent. Neither clamp makes an unreadable format readable;
+/// both keep an unreadable format from reading out of bounds or dividing by
+/// zero before the refusal can happen.
 fn frame_bytes(format: &WAVEFORMATEX) -> usize {
     let declared = format.nBlockAlign as usize;
     if declared > 0 {
