@@ -154,3 +154,14 @@ and direct keyboard event injection.
      Windows-bound work rather than letting an agent thrash. Recovery is the
      user's Windows-side call: restarting WSL kills every WSL process,
      including the agent session and herdr's panes.
+   - **NEVER run a freshly built `mnvoice.exe` with `--restart` while the live
+     instance is running.** The flag's whole job is to kill other mnvoice
+     processes and free the hotkey, so it terminates the user's running app -
+     and because the built binary then becomes the one that launches, the live
+     session is left running an unreleased build from the target dir instead of
+     `C:\Users\tyanw\bin\mnvoice.exe`. Verified 2026-10-14: a probe of a temp
+     release build killed the live instance (PID 17272) and replaced it with the
+     temp binary; recovery was stopping that PID and relaunching the installed
+     exe. To smoke-test a build, start it from a directory with no env file and
+     no other instance expected, or test the behaviour through `cargo test` -
+     never through the flag that exists to kill things.
