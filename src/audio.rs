@@ -242,11 +242,17 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             // so a partial frame cannot arrive on this path. A carry was added
             // and then removed: by construction it could never become non-empty,
             // so it only added a heap copy and a full memcpy to the 2 ms capture
-            // loop for a branch that never engaged. The length guard stays for
-            // what it actually catches - a format whose declared block align
-            // contradicts its own fields - and for a live mid-session format
-            // change, which would need the decode format taken from the packet
-            // rather than the startup copy.
+            // loop for a branch that never engaged. The length guard's reach
+            // is the declared stride itself: a device that declares an
+            // nBlockAlign smaller than its own fields imply is refused there,
+            // which is a claim about one WAVEFORMATEX rather than about the
+            // stream. A format that changes mid-session is not something this
+            // guard can catch - both operands derive from the startup copy, so
+            // a change would have to be noticed by re-reading the packet's
+            // format instead, which is a separate change. That is also why the
+            // guard has no cost on this path: sizing the slice and decoding it
+            // both go through the same `frame_bytes`, so the multiple of the
+            // stride holds by construction.
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result.
