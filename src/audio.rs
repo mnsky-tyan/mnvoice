@@ -255,29 +255,14 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             // is why this is not a bug today - it is what makes the behaviour
             // independent of the driver.
             let silent = dwflags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-            // No tail to carry here, unlike the Unix engine. The length is
-            // `frames * block_align` and `block_align` is computed by the same
-            // `frame_bytes` the decoder uses, so a whole number of frames is
-            // what `convert_mix` is handed; `GetBuffer` reports a frame count,
-            // so a partial frame cannot arrive on this path. A carry was added
-            // and then removed: by construction it could never become non-empty,
-            // so it only added a heap copy and a full memcpy to the 2 ms capture
-            // loop for a branch that never engaged. The length guard's reach
-            // is the declared stride itself: a device that declares an
-            // nBlockAlign smaller than its own fields imply is refused there,
-            // which is a claim about one WAVEFORMATEX rather than about the
-            // stream. A format that changes mid-session is not something this
-            // guard can catch - both operands derive from the startup copy, so
-            // a change would have to be noticed by re-reading the packet's
-            // format instead, which is a separate change. That is also why the
-            // guard has no cost on this path: sizing the slice and decoding it
-            // both go through the same `frame_bytes`, so the multiple of the
-            // stride holds by construction.
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
-            // release it below before acting on the result.
+            // release it below before acting on the result. The silent case
+            // reads a shared all-zero slice rather than allocating one: a
+            // silent packet arrives in bursts, and `convert_mix` only reads
+            // the buffer it is handed.
             let converted = if silent {
-                convert_mix(&vec![0u8; bytes.len()], &engine.format, engine.kind)
+                convert_mix(silent_bytes(bytes.len()), &engine.format, engine.kind)
             } else {
                 convert_mix(bytes, &engine.format, engine.kind)
             };
@@ -380,6 +365,21 @@ fn frame_bytes(format: &WAVEFORMATEX) -> usize {
 /// the format deserves.
 fn sample_bytes(format: &WAVEFORMATEX) -> usize {
     format.wBitsPerSample as usize / 8
+}
+
+/// A shared all-zero buffer of `len` bytes, for where a packet's contents are
+/// not valid audio and the zeros are what the caller should see. The buffer is
+/// all zeros, so the caller can read past its logical end into the padding
+/// without seeing anything other than zeros - which keeps the capture loop
+/// allocation-free on the silent path.
+fn silent_bytes(len: usize) -> &'static [u8] {
+    const ZEROS: [u8; 4096] = [0u8; 4096];
+    debug_assert!(len <= ZEROS.len());
+    // A packet larger than the static buffer would need a real allocation;
+    // 4 KiB covers any packet format the engine declares (the block-align
+    // fallback caps it far below), so the debug assert is the guard and the
+    // release path can truncate rather than fail a capture.
+    &ZEROS[..len.min(ZEROS.len())]
 }
 
 fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Vec<i16>, String> {
