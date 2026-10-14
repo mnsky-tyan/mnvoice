@@ -207,12 +207,7 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     let mut silence = SilenceWindows::new();
     // The frame width comes from `frame_bytes`, the same definition the decoder
     // below uses, so the buffer sizing and the decode cannot disagree.
-    let channels = engine.format.nChannels as usize;
-    // `convert_mix` refuses a zero sample width before it decodes, so clamping
-    // here only keeps the fallback width from being zero - it cannot make a
-    // mismatched stride read silently.
-    let sample_bytes = (engine.format.wBitsPerSample as usize / 8).max(1);
-    let block_align = frame_bytes(&engine.format, channels, sample_bytes);
+    let block_align = frame_bytes(&engine.format);
     let vad_silence_ms = req.vad_silence_ms;
     let vad_rms_threshold = req.vad_rms_threshold;
 
@@ -263,10 +258,12 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
                 .map_err(|e| format!("capture release ({e})"))?;
             match converted {
                 Ok(s) => sample_buf.extend_from_slice(&s),
-                // A capture format the mixer cannot translate (the device
-                // switched or a stream reset landed mid-dictation) would
-                // otherwise capture nothing, silently, until the session ends
-                // with "No speech detected". Stop and report instead.
+                // The format `convert_mix` checks is the startup copy, fixed
+                // for the session, so an unreadable format means this device
+                // was never readable - not that it changed under us. The abort
+                // is the point: without it an unreadable format captures
+                // nothing at all, silently, until the session ends reporting
+                // "No speech detected".
                 Err(e) => {
                     let _ = engine.client.Stop();
                     let _ = engine.client.Reset();
@@ -323,13 +320,21 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 /// function and a consumer that decodes with it agree by construction. They
 /// used to spell the rule twice, and disagreed exactly at `nBlockAlign == 0`,
 /// where one said 1 byte and the other `channels * sample_bytes`.
-fn frame_bytes(format: &WAVEFORMATEX, channels: usize, sample_bytes: usize) -> usize {
+///
+/// Both widths are read from `format` rather than passed in, so no caller can
+/// hand the helper a pair that contradicts the format it is sizing or decoding.
+/// A zero `wBitsPerSample` would make the fallback width zero, and a zero
+/// stride makes every buffer a multiple of it, so the byte width is at least 1:
+/// `convert_mix` refuses a zero sample width before it decodes, and the clamp
+/// cannot turn a mismatched stride into a silent read.
+fn frame_bytes(format: &WAVEFORMATEX) -> usize {
     let declared = format.nBlockAlign as usize;
     if declared > 0 {
-        declared
-    } else {
-        channels * sample_bytes
+        return declared;
     }
+    let channels = format.nChannels as usize;
+    let sample_bytes = (format.wBitsPerSample as usize / 8).max(1);
+    channels * sample_bytes
 }
 
 fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Vec<i16>, String> {
@@ -360,7 +365,7 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
         ));
     }
 
-    let frame = frame_bytes(format, channels, sample_bytes);
+    let frame = frame_bytes(format);
     if frame < channels * sample_bytes || !raw.len().is_multiple_of(frame) {
         return Err("unexpected capture buffer size".into());
     }
@@ -549,19 +554,19 @@ mod tests {
         // A zero block align is a broken declaration: the width the format's
         // own fields imply is what both sites must use, never 1 byte.
         assert_eq!(
-            frame_bytes(&fmt(0), 2, 4),
+            frame_bytes(&fmt(0)),
             8,
             "a zero nBlockAlign must fall back to channels * sample_bytes"
         );
         // A declared width is honoured.
-        assert_eq!(frame_bytes(&fmt(8), 2, 4), 8, "a declared stride wins");
-        assert_eq!(frame_bytes(&fmt(12), 2, 4), 12, "padding is kept");
+        assert_eq!(frame_bytes(&fmt(8)), 8, "a declared stride wins");
+        assert_eq!(frame_bytes(&fmt(12)), 12, "padding is kept");
 
         // What the capture loop hands over is `frames * frame_bytes`, so a
         // buffer built that way for a zero-block-align format must be accepted
         // rather than reported as a bad length.
         let f = fmt(0);
-        let stride = frame_bytes(&f, 2, 4);
+        let stride = frame_bytes(&f);
         let raw = vec![0u8; 2 * stride];
         let converted = convert_mix(&raw, &f, SampleKind::Float);
         assert!(
