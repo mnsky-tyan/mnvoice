@@ -410,6 +410,15 @@ impl WebSocket for UnixSocket {
         // A close frame asks the server to shut down; the reply arrives on
         // whichever thread reads next. We do not wait for it - the caller
         // means "stop now".
+        //
+        // Poisoning is recovered here rather than failed on, unlike the send
+        // and read paths above which return an error: those can refuse a
+        // message the caller still owns, but `close` is the call that releases
+        // a reader parked in `read` and terminates the socket. Failing it
+        // because an earlier panic poisoned the lock would leave both the
+        // connection and the parked thread alive, which is the opposite of
+        // what every caller of this method needs. `stream.rs` uses the same
+        // recovery for the state it must always be able to publish.
         {
             let mut ws = self.socket.lock().unwrap_or_else(|e| e.into_inner());
             let _ = ws.send(Message::Close(None));
