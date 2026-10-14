@@ -19,6 +19,7 @@ use crate::platform::http::{
 };
 use crate::rest::parse_base_url;
 use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::ERROR_MORE_DATA;
 use windows::Win32::Networking::WinHttp::*;
 
 // The windows crate does not export these two, and every WinHTTP client needs
@@ -538,6 +539,36 @@ impl WebSocket for WinHttpSocket {
         }
     }
 
+    /// Close the connection.
+    ///
+    /// Diverges from the trait's `close` in the one way WinHTTP cannot avoid,
+    /// and the divergence is recorded here because the trait's own text points
+    /// at the implementation that cannot honour it (http.rs, "a backend that
+    /// cannot block this way must say so in its implementation").
+    ///
+    /// `WinHttpWebSocketClose` is a negotiated close: it sends a close frame
+    /// and waits for the peer's, bounded only by
+    /// `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT` - which `set_close_timeout`
+    /// requests and cannot prove is honoured. Two consequences the trait's
+    /// promise does not have on Unix:
+    ///
+    /// 1. This can wait on the peer. The Unix backend shuts the socket down
+    ///    outright (`shutdown(Both)`), which is what makes its `close`
+    ///    immediate and what releases a reader parked in its `read`.
+    /// 2. It does not release a parked `WinHttpWebSocketReceive`, so the
+    ///    reader thread's `join` in `stream.rs` can outlive this call until the
+    ///    peer sends something or the transport fails. `WinHttpWebSocketShutdown`
+    ///    is not the escape hatch: it closes the SEND channel and explicitly
+    ///    leaves the receive channel open. WinHTTP has no socket abort that
+    ///    would end a pending receive, so there is nothing to route around this
+    ///    with.
+    ///
+    /// The consequence is bounded, not silent: the session has already been
+    /// reported to the user, and the reader exits as soon as the peer speaks
+    /// or the transport notices the teardown. Closing it properly needs a
+    /// design decision (poll in `read`, close the session handle from here and
+    /// accept the receive's error, or drop the promise from the trait), which
+    /// is why this documents the gap rather than pretending to close it.
     fn close(&self) {
         unsafe {
             let _ = WinHttpWebSocketClose(
@@ -549,7 +580,7 @@ impl WebSocket for WinHttpSocket {
         }
     }
 
-    /// Read one frame.
+    /// Read one whole message.
     ///
     /// WinHTTP has no "read with timeout" call and the socket is opened with
     /// no receive timeout, so the receive blocks until a frame arrives, the
@@ -557,36 +588,57 @@ impl WebSocket for WinHttpSocket {
     /// documents. The two ends are kept apart, because the streaming loop
     /// reports a lost connection only when the read says so: a nonzero result
     /// is a transport failure and becomes an `Err`, while a close frame
-    /// arrives as a zero-length read with a success result and becomes
-    /// `Ok(None)`. Collapsing the two would make a provider disconnect
-    /// indistinguishable from an orderly end, which is exactly the confusion
-    /// the trait's `Result` exists to prevent.
+    /// arrives as `WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE` and becomes `Ok(None)`.
+    /// Collapsing the two would make a provider disconnect indistinguishable
+    /// from an orderly end, which is exactly the confusion the trait's
+    /// `Result` exists to prevent.
+    ///
+    /// `peBufferType` is the API's own report of what came back, and this
+    /// reads it: the trait's consumer treats every `read` as one complete JSON
+    /// message (`stream.rs` parses the whole frame), so a fragment returned as
+    /// if it were whole would fail that parse and silently drop words - the
+    /// Unix backend reassembles through tungstenite and would not. Three
+    /// shapes therefore need telling apart, and the byte count alone cannot do
+    /// it: a fragment type accumulates until the message ends, `ERROR_MORE_DATA`
+    /// (a message longer than the 64 KiB buffer) continues into the next call
+    /// rather than failing the session, and the close type ends the stream
+    /// even though a legal empty message is also a zero-length read.
     fn read(&self) -> Result<Option<Vec<u8>>, String> {
         // Once a WinHTTP request is upgraded to a socket, its receive timeout
         // is fixed at what the session was configured with, and the pre-seam
         // behaviour this preserves is a blocking read ended by a frame or a
         // close. The streaming loop re-checks its flags before every call.
         unsafe {
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut read = 0u32;
-            let mut buf_type = WINHTTP_WEB_SOCKET_BUFFER_TYPE::default();
-            let result = WinHttpWebSocketReceive(
-                self.ws,
-                buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                buffer.len() as u32,
-                &mut read,
-                &mut buf_type,
-            );
-            if result != 0 {
-                return Err(format!("websocket read failed (error {result})"));
+            let mut message: Vec<u8> = Vec::new();
+            loop {
+                let mut buffer = vec![0u8; 64 * 1024];
+                let mut read = 0u32;
+                let mut buf_type = WINHTTP_WEB_SOCKET_BUFFER_TYPE::default();
+                let result = WinHttpWebSocketReceive(
+                    self.ws,
+                    buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                    buffer.len() as u32,
+                    &mut read,
+                    &mut buf_type,
+                );
+                let more_data = result == ERROR_MORE_DATA.0;
+                if result != 0 && !more_data {
+                    return Err(format!("websocket read failed (error {result})"));
+                }
+                if buf_type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE {
+                    return Ok(None);
+                }
+                let is_fragment = buf_type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE
+                    || buf_type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE;
+                if read > 0 {
+                    message.extend_from_slice(&buffer[..read as usize]);
+                }
+                // `more_data` and a fragment type both mean this message is
+                // not finished; anything else is a whole message.
+                if !more_data && !is_fragment {
+                    return Ok(Some(message));
+                }
             }
-            // A zero-length read is the close frame, which is the end of the
-            // stream, not an empty poll.
-            if read == 0 {
-                return Ok(None);
-            }
-            buffer.truncate(read as usize);
-            Ok(Some(buffer))
         }
     }
 }

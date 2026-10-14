@@ -88,7 +88,7 @@ pub trait WebSocket: Send + Sync {
     /// Send a close frame and shut down without waiting for the peer.
     fn close(&self);
 
-    /// Read the next frame, returning `None` on a clean close.
+    /// Read the next message, returning `None` on a clean close.
     ///
     /// A blocking read: it returns when a frame arrives, when the peer closes,
     /// or on a transport error - never merely because the provider was quiet,
@@ -100,6 +100,17 @@ pub trait WebSocket: Send + Sync {
     /// the Windows socket carries no receive timeout at all, so neither
     /// returns to the caller on a timeout; a backend that cannot block this
     /// way must say so in its implementation.
+    ///
+    /// One whole message per call, with the connection's own control frames
+    /// handled by the backend and never returned as payload: the consumer
+    /// parses every frame it receives as one complete JSON document, so a
+    /// fragment or a keep-alive delivered as data would be dropped as
+    /// unparseable. Both backends satisfy this differently and honestly -
+    /// tungstenite reassembles fragments and surfaces ping/pong, which
+    /// `unix_http` swallows while letting tungstenite answer the ping; WinHTTP
+    /// reassembles nothing, so `windows_impl` accumulates fragment buffer
+    /// types itself, and it never sees a ping or pong at all because WinHTTP
+    /// answers those below the API.
     fn read(&self) -> Result<Option<Vec<u8>>, String>;
 }
 

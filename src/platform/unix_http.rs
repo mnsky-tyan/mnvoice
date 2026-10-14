@@ -433,11 +433,16 @@ impl WebSocket for UnixSocket {
                 Ok(Message::Text(text)) => return Ok(Some(text.as_str().as_bytes().to_vec())),
                 Ok(Message::Close(_)) => return Ok(None),
                 // Protocol-level pings must be answered for the server to keep
-                // the connection; the pong goes out on the next write, and
-                // neither frame carries transcript payload.
-                Ok(Message::Ping(_)) => {
-                    let _ = ws.send(Message::Pong(Vec::new().into()));
-                }
+                // the connection. tungstenite queues that pong itself when it
+                // reads the ping and writes it on the next read, write or
+                // flush (protocol/mod.rs, "upon receiving ping messages
+                // tungstenite queues pong replies automatically"), and a
+                // manual `Message::Pong` REPLACES the queued one - which is
+                // why this arm does nothing rather than sending one: the
+                // reply already goes out on the next call, and sending here
+                // would only add a write under the socket lock and lose the
+                // payload the automatic reply echoes back.
+                Ok(Message::Ping(_)) => {}
                 Ok(Message::Pong(_)) => {}
                 // The enum is non-exhaustive across versions (raw frames,
                 // future additions); anything that is not payload or a ping
