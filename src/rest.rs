@@ -4,7 +4,7 @@
 // proxy settings on Windows, ureq with rustls (bundled roots) or native-tls elsewhere.
 
 use crate::config::{auth_value, Config};
-use crate::platform::http::Transport;
+use crate::platform::http::{preview, Transport};
 
 const BOUNDARY: &str = "mnvoiceboundary9f2a";
 
@@ -98,22 +98,6 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
         ));
     }
     Ok(trimmed.to_string())
-}
-
-/// A bounded, char-safe prefix of a body, for the messages that quote one.
-///
-/// The only cap on what comes back is the transport's (`MAX_TRANSCRIPT_BYTES`,
-/// 8 MiB), and this string is appended verbatim to `%TEMP%\mnvoice.log` by the
-/// tray and printed by the CLI on a failed dictation, so a whole proxy page
-/// must not ride along with a one-line diagnosis. The sibling that turns a
-/// non-200 into an error (`Response::error_for_status`) bounds its preview the
-/// same way.
-fn preview(body: &str) -> String {
-    const LIMIT: usize = 200;
-    match body.char_indices().nth(LIMIT) {
-        Some((i, _)) => format!("{}...", &body[..i]),
-        None => body.to_string(),
-    }
 }
 
 /// Whether a 200 body is a provider's error payload rather than a transcript.

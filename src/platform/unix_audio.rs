@@ -35,6 +35,13 @@ use std::time::{Duration, Instant};
 
 pub struct CpalAudio;
 
+/// The ticker's period, and the time a tick that consumed no audio covers.
+///
+/// One definition: the sleep below and the stalled-tick accounting must agree,
+/// or a device delivering nothing would be charged a different duration than
+/// the loop actually waited.
+const TICK_MS: u64 = 20;
+
 impl CpalAudio {
     pub fn new() -> Result<Self, String> {
         Ok(Self)
@@ -158,7 +165,7 @@ fn run_session(
     // exactly when the user needs to hear that the device, not they, ended
     // the recording.
     loop {
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(TICK_MS));
 
         // A device that failed mid-session stops delivering frames; report it
         // as the error it is rather than as a silent, successful timeout.
@@ -176,6 +183,16 @@ fn run_session(
         // Windows engine hands it.
         let mono = take_frames(&buffer, channels);
 
+        // A device that stays open and delivers nothing must still end on the
+        // silence windows rather than on `max_seconds`: `advance` below counts
+        // the audio a chunk carries, and an empty chunk carries none. This
+        // tick's own 20 ms is the only evidence that time passed, so charge it
+        // (see SilenceWindows::advance_stalled). A tick that did consume audio
+        // keeps the audio-time accounting below and is never charged twice.
+        if mono.is_empty() && silence.advance_stalled(TICK_MS, vad_silence_ms) {
+            break;
+        }
+
         let chunk = resample_linear(&mono, resample_step);
 
         // The silence detector reads the same window that goes downstream,
@@ -192,7 +209,11 @@ fn run_session(
         {
             break;
         }
-        if silence.advance(chunk_len, rms, vad_rms_threshold, vad_silence_ms) {
+        // A tick that consumed audio keeps the audio-time accounting; the
+        // stalled path above already charged the empty ones.
+        let ended_on_audio =
+            !mono.is_empty() && silence.advance(chunk_len, rms, vad_rms_threshold, vad_silence_ms);
+        if ended_on_audio {
             break;
         }
     }

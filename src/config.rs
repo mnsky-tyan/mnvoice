@@ -458,12 +458,17 @@ impl RawFields {
     /// over its aliases whatever order the lines appear in, and an alias fills
     /// only a field nothing has set yet (a Deepgram-specific default
     /// overridable by a plain `API_KEY=`); every other field takes the last
-    /// line that names it. The one exception is `KEYWORDS`, which ACCUMULATES
-    /// across every line that names it and is never cleared - a `KEYWORDS=`
-    /// line in the file and a `KEYWORDS` variable in the environment are both
-    /// meant to contribute, and a test locks that. The environment pass runs
-    /// after the file, so it overrides anything the file set and is not
-    /// subject to the guards.
+    /// line that names it, so an ALIAS CAN OVERWRITE A CANONICAL KEY for those
+    /// (`ORB_COLOR=#111111` followed by `COLOR=#222222` ends as `#222222`, and
+    /// the same holds for `HOTKEY`/`KEYBIND` and the other unguarded fields).
+    /// That is deliberate - a config line is a request, and the later one is
+    /// the more recent intent - but it is the opposite of the guarded fields,
+    /// so the spelling the user wants must come last for these. The one
+    /// exception is `KEYWORDS`, which ACCUMULATES across every line that names
+    /// it and is never cleared - a `KEYWORDS=` line in the file and a
+    /// `KEYWORDS` variable in the environment are both meant to contribute,
+    /// and a test locks that. The environment pass runs after the file, so it
+    /// overrides anything the file set and is not subject to the guards.
     fn set(&mut self, field: Field, k: &str, v: &str, from_file: bool) {
         let canonical_overrides = from_file && k == field.canonical();
         match field {

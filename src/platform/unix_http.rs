@@ -410,6 +410,15 @@ impl WebSocket for UnixSocket {
         // A close frame asks the server to shut down; the reply arrives on
         // whichever thread reads next. We do not wait for it - the caller
         // means "stop now".
+        //
+        // Poisoning is recovered here rather than failed on, unlike the send
+        // and read paths above which return an error: those can refuse a
+        // message the caller still owns, but `close` is the call that releases
+        // a reader parked in `read` and terminates the socket. Failing it
+        // because an earlier panic poisoned the lock would leave both the
+        // connection and the parked thread alive, which is the opposite of
+        // what every caller of this method needs. `stream.rs` uses the same
+        // recovery for the state it must always be able to publish.
         {
             let mut ws = self.socket.lock().unwrap_or_else(|e| e.into_inner());
             let _ = ws.send(Message::Close(None));
@@ -433,11 +442,16 @@ impl WebSocket for UnixSocket {
                 Ok(Message::Text(text)) => return Ok(Some(text.as_str().as_bytes().to_vec())),
                 Ok(Message::Close(_)) => return Ok(None),
                 // Protocol-level pings must be answered for the server to keep
-                // the connection; the pong goes out on the next write, and
-                // neither frame carries transcript payload.
-                Ok(Message::Ping(_)) => {
-                    let _ = ws.send(Message::Pong(Vec::new().into()));
-                }
+                // the connection. tungstenite queues that pong itself when it
+                // reads the ping and writes it on the next read, write or
+                // flush (protocol/mod.rs, "upon receiving ping messages
+                // tungstenite queues pong replies automatically"), and a
+                // manual `Message::Pong` REPLACES the queued one - which is
+                // why this arm does nothing rather than sending one: the
+                // reply already goes out on the next call, and sending here
+                // would only add a write under the socket lock and lose the
+                // payload the automatic reply echoes back.
+                Ok(Message::Ping(_)) => {}
                 Ok(Message::Pong(_)) => {}
                 // The enum is non-exhaustive across versions (raw frames,
                 // future additions); anything that is not payload or a ping

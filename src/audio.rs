@@ -211,13 +211,30 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     let vad_silence_ms = req.vad_silence_ms;
     let vad_rms_threshold = req.vad_rms_threshold;
 
+    // The tick length the stalled path charges to the silence windows. This
+    // loop asks for the next packet every 2 ms, so that is what a tick that
+    // consumed nothing covered. A literal rather than a measured delta: the
+    // sleep is what bounds the loop, and measuring would add a clock read per
+    // tick to charge a path that only runs when the device has gone quiet
+    // without erroring.
+    const POLL_MS: u64 = 2;
+
     while !req.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let packet = engine
             .capture_client
             .GetNextPacketSize()
             .map_err(|e| format!("capture read ({e})"))?;
         if packet == 0 {
-            thread::sleep(Duration::from_millis(2));
+            // Nothing to consume, so `advance`'s audio-time accounting cannot
+            // move a window. A device that stays open and hands over no
+            // packets is the accidental-open-mic case NO_SPEECH_LIMIT_MS
+            // exists for, so charge the tick's own duration instead of letting
+            // the session run to `max_seconds`.
+            if silence.advance_stalled(POLL_MS, vad_silence_ms) {
+                req.stop.store(true, Ordering::SeqCst);
+                break;
+            }
+            thread::sleep(Duration::from_millis(POLL_MS));
             continue;
         }
 
@@ -230,28 +247,25 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             .map_err(|e| format!("capture buffer ({e})"))?;
 
         if frames > 0 && !ptr.is_null() {
-            // No tail to carry here, unlike the Unix engine. The length is
-            // `frames * block_align` and `block_align` is computed by the same
-            // `frame_bytes` the decoder uses, so a whole number of frames is
-            // what `convert_mix` is handed; `GetBuffer` reports a frame count,
-            // so a partial frame cannot arrive on this path. A carry was added
-            // and then removed: by construction it could never become non-empty,
-            // so it only added a heap copy and a full memcpy to the 2 ms capture
-            // loop for a branch that never engaged. The length guard's reach
-            // is the declared stride itself: a device that declares an
-            // nBlockAlign smaller than its own fields imply is refused there,
-            // which is a claim about one WAVEFORMATEX rather than about the
-            // stream. A format that changes mid-session is not something this
-            // guard can catch - both operands derive from the startup copy, so
-            // a change would have to be noticed by re-reading the packet's
-            // format instead, which is a separate change. That is also why the
-            // guard has no cost on this path: sizing the slice and decoding it
-            // both go through the same `frame_bytes`, so the multiple of the
-            // stride holds by construction.
+            // A silent packet's contents are not valid audio; the flag says the
+            // buffer holds whatever was there before, not silence. Reading it
+            // anyway would feed a stale buffer into the transcript as an
+            // audible glitch, so this substitutes the zeros the flag promises.
+            // Most shared-mode drivers zero-fill these packets already, which
+            // is why this is not a bug today - it is what makes the behaviour
+            // independent of the driver.
+            let silent = dwflags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
-            // release it below before acting on the result.
-            let converted = convert_mix(bytes, &engine.format, engine.kind);
+            // release it below before acting on the result. The silent case
+            // reads a shared all-zero slice rather than allocating one: a
+            // silent packet arrives in bursts, and `convert_mix` only reads
+            // the buffer it is handed.
+            let converted = if silent {
+                convert_mix(silent_bytes(bytes.len()), &engine.format, engine.kind)
+            } else {
+                convert_mix(bytes, &engine.format, engine.kind)
+            };
             engine
                 .capture_client
                 .ReleaseBuffer(frames)
@@ -324,27 +338,48 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 /// Both widths are read from `format` rather than passed in, so no caller can
 /// hand the helper a pair that contradicts the format it is sizing or decoding.
 ///
-/// A zero `wBitsPerSample` would make the fallback width zero, so the byte
-/// width is at least 1: with a zero stride the sizing site hands `convert_mix`
-/// an empty slice, and decoding it would divide by the same zero stride. The
-/// clamp keeps the stride non-zero so the session ends in `convert_mix`'s
-/// "invalid mix format" refusal instead - still a loud abort, which is the
-/// point. The channel count is not clamped, and a format declaring zero
-/// channels does yield a zero stride: that slice is read empty and
-/// `convert_mix` refuses `channels == 0` before any decode, so it is loud
-/// rather than silent. The clamp does not make an unreadable format readable.
-/// It only decides which refusal catches one: with a zero byte width the stride
-/// stays non-zero and `convert_mix` refuses "invalid mix format"; the
-/// zero-channel format is caught by its `channels == 0` refusal before any
-/// decode. Both end the session loudly, and neither reads out of bounds first.
+/// A zero `wBitsPerSample` is a broken declaration too: the fallback width is
+/// zero, so this returns a zero stride, and `convert_mix` refuses the format
+/// as invalid before it divides by that zero. A format declaring zero channels
+/// is caught by the same refusal. Nothing is made readable here; an unreadable
+/// format ends the session loudly rather than being decoded.
 fn frame_bytes(format: &WAVEFORMATEX) -> usize {
     let declared = format.nBlockAlign as usize;
     if declared > 0 {
         return declared;
     }
     let channels = format.nChannels as usize;
-    let sample_bytes = (format.wBitsPerSample as usize / 8).max(1);
+    let sample_bytes = sample_bytes(format);
     channels * sample_bytes
+}
+
+/// The byte width of one sample of one channel, derived from the format.
+///
+/// One definition, because this was spelled twice with different clamps:
+/// `(wBitsPerSample / 8).max(1)` at the stride fallback and `bits / 8` in
+/// `convert_mix`. They disagreed exactly at `wBitsPerSample == 0`, the same
+/// shape as the `nBlockAlign` split the stride helper exists to close. No
+/// clamp is needed: a zero width makes the stride zero, which the sizing site
+/// turns into an empty slice, and `convert_mix` refuses the format as invalid
+/// before any division by that zero - a loud refusal either way, and the one
+/// the format deserves.
+fn sample_bytes(format: &WAVEFORMATEX) -> usize {
+    format.wBitsPerSample as usize / 8
+}
+
+/// A shared all-zero buffer of `len` bytes, for where a packet's contents are
+/// not valid audio and the zeros are what the caller should see. The buffer is
+/// all zeros, so the caller can read past its logical end into the padding
+/// without seeing anything other than zeros - which keeps the capture loop
+/// allocation-free on the silent path.
+fn silent_bytes(len: usize) -> &'static [u8] {
+    const ZEROS: [u8; 4096] = [0u8; 4096];
+    debug_assert!(len <= ZEROS.len());
+    // A packet larger than the static buffer would need a real allocation;
+    // 4 KiB covers any packet format the engine declares (the block-align
+    // fallback caps it far below), so the debug assert is the guard and the
+    // release path can truncate rather than fail a capture.
+    &ZEROS[..len.min(ZEROS.len())]
 }
 
 fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Vec<i16>, String> {
@@ -352,7 +387,7 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
     let rate = format.nSamplesPerSec as usize;
     let bits = format.wBitsPerSample as usize;
     let is_float = kind == SampleKind::Float;
-    let sample_bytes = bits / 8;
+    let sample_bytes = sample_bytes(format);
     if sample_bytes == 0 || channels == 0 {
         return Err("invalid mix format".into());
     }

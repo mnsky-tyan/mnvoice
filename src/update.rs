@@ -861,9 +861,17 @@ fn mark_checked_at(stamp: &Path) {
     let _ = fs::write(stamp, now.to_string());
 }
 
-/// Background self-update check. Called once from a temporary thread started
-/// at launch, so it can never delay startup. Only installs when idle - see
-/// the caller in main.rs.
+/// Background self-update check. Called once from a temporary thread started at
+/// launch, so it can never delay startup. Only installs when idle - see
+/// `windows_app::check_for_updates_async`, which is the one place the install
+/// gate lives; the tray's manual item calls that directly.
+///
+/// The stamp is written here, before the check runs, because the throttle is
+/// about traffic towards github.com rather than about the result: a check that
+/// fails must not be retried on every subsequent start. The manual path does
+/// not touch the stamp, so a manual "up to date" leaves the daily window
+/// intact and the background check can still fire later the same day - at most
+/// one extra request, because `UPDATE_IN_FLIGHT` serializes the two.
 fn background_check_auto() {
     if !should_check_today() {
         return;

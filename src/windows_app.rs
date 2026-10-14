@@ -14,7 +14,7 @@ use crate::update;
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId, CREATE_NO_WINDOW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
 };
@@ -224,7 +224,7 @@ fn kill_running_instances() {
     let self_pid = unsafe { GetCurrentProcessId() };
     let reported = std::process::Command::new("C:\\Windows\\System32\\taskkill.exe")
         .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
-        .creation_flags(0x0800_0000)
+        .creation_flags(CREATE_NO_WINDOW.0)
         .status()
         .map(|s| s.code());
     // Report what the scheduler actually said. `let _ = ...status()` dropped
@@ -330,7 +330,12 @@ pub fn main() {
         // One-time move off the Run key onto a logon task. On its own
         // thread: it only decides whether the NEXT logon starts the app,
         // so the window, the hotkey and the tray never wait on its spawns.
-        thread::spawn(migrate_autostart);
+        thread::spawn(|| {
+            migrate_autostart();
+            // The menu's checkbox reads the cache rather than probing inside
+            // the modal loop, so the first open has an answer ready.
+            refresh_autostart_cache();
+        });
 
         // A load() failure is exactly the state the idle tip has to report,
         // and it is the reason dictation cannot start at all.
@@ -410,6 +415,17 @@ fn claim_single_instance() -> InstanceClaim {
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log("second instance blocked, exiting");
         return InstanceClaim::AlreadyTaken;
+    }
+    // A failed CreateMutexW leaves no guard at all: the process runs without
+    // single-instance protection, so two instances can race for the global
+    // hotkey and the user sees a later "HOTKEY ... UNAVAILABLE" with no cause
+    // above it. Nothing here can conjure a guard, but the log line is what
+    // makes that later failure diagnosable, and every other startup failure in
+    // this file already reports itself.
+    if let Err(e) = &handle {
+        log(&format!(
+            "single-instance mutex unavailable ({e}), running unprotected"
+        ));
     }
     InstanceClaim::Acquired(handle.ok())
 }
@@ -517,6 +533,11 @@ fn create_tray_window(
         ) {
             Ok(h) => Some(h),
             Err(e) => {
+                // The window proc never took ownership, so the box handed to
+                // CreateWindowExW is still ours. It owns an Arc<config::Config>
+                // and an AudioEngine, so leaving it unreclaimed leaks the
+                // standby engine's resources on this path.
+                drop(Box::from_raw(init));
                 log(&format!("CreateWindowExW failed: {e}"));
                 None
             }
@@ -865,8 +886,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if cancelled {
                         log("session cancelled, discarding the rest");
                     } else if ok {
-                        let preview: String = message.chars().take(200).collect();
-                        log(&format!("transcribed: {preview}"));
+                        // One preview definition, shared with the transport's
+                        // error path and the REST refusal message, so the bound
+                        // cannot drift between the places a user reads it.
+                        log(&format!("transcribed: {}", crate::platform::http::preview(&message)));
                     } else {
                         log(&format!("error: {message}"));
                     }
@@ -914,6 +937,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             if let Err(e) = toggle_autostart() {
                                 log(&format!("autostart toggle failed: {e}"));
                             }
+                            // The menu's checkbox reads the cache, so the
+                            // mutation has to republish it or the next open
+                            // would still show the state from before the
+                            // click.
+                            refresh_autostart_cache();
                         });
                     }
                     IDM_RESTART => relaunch_for_restart(),
@@ -1154,6 +1182,18 @@ fn worker(
             // inside the match above. Every shape other than a clean `Ok(())`
             // is a capture failure, and reporting it as NO_SPEECH would tell a
             // user whose audio service stopped that they said nothing.
+            //
+            // Stop capture first. `run_stream` returning means the session is
+            // over, but capture does not know that: on the commonest failure
+            // (no network, or a bad API key, so the socket never opens) it is
+            // still running, and this `recv` waits for it. Dropping the audio
+            // receiver inside `run_stream` usually ends it within a chunk, but
+            // a device that is delivering nothing has no send to fail, so
+            // without this the report - and the error it carries - would wait
+            // for the device or for max_seconds. Setting it is free: the
+            // session is finished either way, and a worker already stopping
+            // sees no change.
+            stop.store(true, Ordering::SeqCst);
             if let Some(e) = capture_fault(capture_done.as_ref()) {
                 result = (false, e);
             }
@@ -1220,9 +1260,24 @@ unsafe fn show_menu(hwnd: HWND) {
         Err(_) => return,
     };
 
-    // Checkbox reflects live system state, so it is evaluated on every open.
-    let startup_flags = if autostart_enabled() { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
-    let _ = AppendMenuW(menu, MF_STRING | startup_flags, IDM_STARTUP, w!("Start with Windows"));
+    // Checkbox reflects live system state. Read from a cache rather than
+    // probing here: `autostart_enabled` spawns schtasks and up to two reg.exe
+    // processes, each an unbounded wait, and this runs inside
+    // TrackPopupMenu's modal loop where nothing else is serviced - the same
+    // freeze the IDM_STARTUP handler was moved off the UI thread to avoid. The
+    // cache is filled at startup and refreshed after any mutation, so the
+    // checkmark still cannot drift from reality in the steady state.
+    let startup_flags = if autostart_cached() {
+        MF_CHECKED
+    } else {
+        MENU_ITEM_FLAGS(0)
+    };
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING | startup_flags,
+        IDM_STARTUP,
+        w!("Start with Windows"),
+    );
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, IDM_UPDATE, w!("Check for updates"));
@@ -1268,13 +1323,13 @@ const AUTOSTART_APPROVED_KEY: &str =
 
 fn reg_cmd() -> std::process::Command {
     let mut c = std::process::Command::new("C:\\Windows\\System32\\reg.exe");
-    c.creation_flags(0x0800_0000);
+    c.creation_flags(CREATE_NO_WINDOW.0);
     c
 }
 
 fn schtasks_cmd() -> std::process::Command {
     let mut c = std::process::Command::new("C:\\Windows\\System32\\schtasks.exe");
-    c.creation_flags(0x0800_0000);
+    c.creation_flags(CREATE_NO_WINDOW.0);
     c
 }
 
@@ -1314,9 +1369,10 @@ fn autostart_starting(state: AutostartState) -> bool {
 /// The Run key is still consulted, so an install that has not been relaunched
 /// since the migration still reports an accurate tray checkmark instead of
 /// offering to enable something that is already on. Every read is a process
-/// spawn on the UI thread, so the staging matters: the logon task settles the
-/// question on its own in the steady state, and the Run value's Task Manager
-/// override is only read while an old Run entry may still be there.
+/// spawn, so callers that run on the UI thread must use `autostart_cached`
+/// instead of this: the logon task settles the question on its own in the
+/// steady state, and the Run value's Task Manager override is only read while
+/// an old Run entry may still be there.
 fn autostart_enabled() -> bool {
     let state = if task_exists() {
         AutostartState::TaskPresent
@@ -1324,6 +1380,32 @@ fn autostart_enabled() -> bool {
         autostart_state(run_key_set(), run_key_disabled)
     };
     autostart_starting(state)
+}
+
+/// What `autostart_enabled` last reported, for the menu's checkbox.
+///
+/// The menu is built inside `TrackPopupMenu`'s modal loop, where a process
+/// spawn freezes everything: `autostart_enabled` runs schtasks and up to two
+/// reg.exe commands with no timeout, which is the same unbounded wait the
+/// IDM_STARTUP handler was moved onto a worker thread to escape. So the probe
+/// runs off the UI thread (at startup and after each mutation) and the menu
+/// reads this. `-1` means "not probed yet", and the checkbox is then drawn
+/// unchecked - the safe direction, because an unchecked box offers to enable
+/// something that is already on, which the toggle handles idempotently, while
+/// a checked box would offer to turn off something that may not be there.
+static AUTOSTART_CACHED: AtomicI8 = AtomicI8::new(-1);
+
+fn autostart_cached() -> bool {
+    AUTOSTART_CACHED.load(Ordering::SeqCst) > 0
+}
+
+/// Re-probe the autostart state and publish it for the menu.
+///
+/// Called on a worker thread at startup and after every mutation, so the
+/// checkbox follows reality without the menu ever paying for the probe.
+fn refresh_autostart_cache() {
+    let enabled = autostart_enabled();
+    AUTOSTART_CACHED.store(i8::from(enabled), Ordering::SeqCst);
 }
 
 /// Classify what the Run value alone says, given a query that may not have been
@@ -1584,48 +1666,62 @@ fn disable_left_it_gone(exited_zero: bool, after: impl FnOnce() -> TaskState) ->
     exited_zero || after() == TaskState::Absent
 }
 
-/// The message for a scheduler command that did not take, classified by a
-/// fresh Run-key read of what the machine still holds.
+/// Which autostart step did not take, so the message can name it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutostartFailure {
+    /// The scheduler command itself (create or delete) did not take.
+    Scheduler,
+    /// The scheduler held the requested state, but the Run-key delete that
+    /// follows it was not confirmed.
+    Retire,
+}
+
+/// The message for an autostart step that did not take, classified by a fresh
+/// Run-key read of what the machine still holds.
+///
+/// One function for both steps, because the shape is identical - a total match
+/// over the same `(enable, Option<bool>)` pair, differing only in wording - and
+/// a fifth answer for that read would otherwise have to be added in two places
+/// or silently become non-total in one of them.
 ///
 /// Total over the read: every arm names what was actually seen, and a query
 /// that cannot be answered says "unconfirmed" instead of asserting a machine
 /// state nothing observed. Claiming either "no Run key" or "the key survived"
 /// would assert something the read cannot support.
-fn schtasks_failure_message(enable: bool, run_key: Option<bool>) -> String {
-    match run_key {
+fn autostart_failure_message(
+    kind: AutostartFailure,
+    enable: bool,
+    run_key: Option<bool>,
+) -> String {
+    use AutostartFailure::{Retire, Scheduler};
+    match (kind, enable, run_key) {
         // Present: the Run key is the autostart that survived, and naming it
         // is accurate.
-        Some(true) if enable => {
+        (Scheduler, true, Some(true)) => {
             "schtasks.exe could not create the logon task, keeping the Run key".into()
         }
-        Some(true) => "schtasks.exe could not remove the logon task, keeping the Run key".into(),
-        // Absent: confirmed by a query that ran.
-        Some(false) if enable => {
+        (Scheduler, false, Some(true)) => {
+            "schtasks.exe could not remove the logon task, keeping the Run key".into()
+        }
+        (Retire, true, Some(true)) => {
+            "the Run key could not be retired, so mnvoice starts twice at logon".into()
+        }
+        (Retire, false, Some(true)) => {
+            "the Run key could not be retired, so mnvoice still starts at logon".into()
+        }
+        // Absent: confirmed by a query that ran. The retire case's caller
+        // settles this before calling, so that arm exists to keep the match
+        // total rather than because a caller can reach it.
+        (Scheduler, true, Some(false)) => {
             "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
                 .into()
         }
-        Some(false) => "the logon task could not be confirmed removed".into(),
+        (Scheduler, false, Some(false)) => "the logon task could not be confirmed removed".into(),
+        (Retire, _, Some(false)) => "the Run key could not be confirmed removed".into(),
         // Unanswerable: reg.exe could not be spawned, so the machine state is
         // unknown. The same distinction `task_state` spells out with its
         // `Unknown` variant.
-        None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
-    }
-}
-
-/// The message for a Run-key delete whose outcome the confirming read did not
-/// confirm. Same totality rule as `schtasks_failure_message`.
-///
-/// The caller settles a confirmed-absent read before calling, so the
-/// `Some(false)` arm exists to keep the match total over the read, not because
-/// a caller can still reach it.
-fn retire_failure_message(enable: bool, run_key: Option<bool>) -> String {
-    match run_key {
-        Some(true) if enable => {
-            "the Run key could not be retired, so mnvoice starts twice at logon".into()
-        }
-        Some(true) => "the Run key could not be retired, so mnvoice still starts at logon".into(),
-        Some(false) => "the Run key could not be confirmed removed".into(),
-        None => "the Run key could not be read, so the autostart state is unconfirmed".into(),
+        (_, _, None) => "the Run key could not be read, so the autostart state is unconfirmed".into(),
     }
 }
 
@@ -1680,7 +1776,11 @@ fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Res
         // enable branch checks before it claims the Run key: naming it
         // unconditionally reported a fallback that may itself have been
         // retired, which is the exact thing this branch exists to avoid.
-        return Err(schtasks_failure_message(enable, run_key_set()));
+        return Err(autostart_failure_message(
+            AutostartFailure::Scheduler,
+            enable,
+            run_key_set(),
+        ));
     }
     if clear_run_key() != Some(true) {
         // The delete's outcome was not confirmed on the first read. A fresh
@@ -1692,7 +1792,11 @@ fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Res
         // the code cannot see.
         let read = run_key_set();
         if read != Some(false) {
-            return Err(retire_failure_message(enable, read));
+            return Err(autostart_failure_message(
+                AutostartFailure::Retire,
+                enable,
+                read,
+            ));
         }
     }
     log(if enable { "autostart enabled" } else { "autostart disabled" });
@@ -2156,54 +2260,55 @@ mod tests {
     /// rather than as an absent or surviving key.
     #[test]
     fn autostart_failure_messages_name_what_was_seen() {
+        use AutostartFailure::{Retire, Scheduler};
         assert_eq!(
-            schtasks_failure_message(true, Some(true)),
+            autostart_failure_message(Scheduler, true, Some(true)),
             "schtasks.exe could not create the logon task, keeping the Run key"
         );
         assert_eq!(
-            schtasks_failure_message(false, Some(true)),
+            autostart_failure_message(Scheduler, false, Some(true)),
             "schtasks.exe could not remove the logon task, keeping the Run key"
         );
         assert_eq!(
-            schtasks_failure_message(true, Some(false)),
+            autostart_failure_message(Scheduler, true, Some(false)),
             "schtasks.exe could not create the logon task, and no Run key is left to fall back on"
         );
         assert_eq!(
-            schtasks_failure_message(false, Some(false)),
+            autostart_failure_message(Scheduler, false, Some(false)),
             "the logon task could not be confirmed removed"
         );
         assert_eq!(
-            schtasks_failure_message(true, None),
+            autostart_failure_message(Scheduler, true, None),
             "the Run key could not be read, so the autostart state is unconfirmed"
         );
         assert_eq!(
-            schtasks_failure_message(false, None),
+            autostart_failure_message(Scheduler, false, None),
             "the Run key could not be read, so the autostart state is unconfirmed"
         );
         assert_eq!(
-            retire_failure_message(true, Some(true)),
+            autostart_failure_message(Retire, true, Some(true)),
             "the Run key could not be retired, so mnvoice starts twice at logon"
         );
         assert_eq!(
-            retire_failure_message(false, Some(true)),
+            autostart_failure_message(Retire, false, Some(true)),
             "the Run key could not be retired, so mnvoice still starts at logon"
         );
         // A confirmed-absent fresh read settles the retire at the caller, so
         // these two pin the arm's totality, not a reachable caller state.
         assert_eq!(
-            retire_failure_message(true, Some(false)),
+            autostart_failure_message(Retire, true, Some(false)),
             "the Run key could not be confirmed removed"
         );
         assert_eq!(
-            retire_failure_message(false, Some(false)),
+            autostart_failure_message(Retire, false, Some(false)),
             "the Run key could not be confirmed removed"
         );
         assert_eq!(
-            retire_failure_message(true, None),
+            autostart_failure_message(Retire, true, None),
             "the Run key could not be read, so the autostart state is unconfirmed"
         );
         assert_eq!(
-            retire_failure_message(false, None),
+            autostart_failure_message(Retire, false, None),
             "the Run key could not be read, so the autostart state is unconfirmed"
         );
     }

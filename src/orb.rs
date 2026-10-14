@@ -9,6 +9,8 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{w, PCWSTR};
 
+use crate::windows_app::log;
+
 const ORB_WIDTH: i32 = 48;
 const ORB_HEIGHT: i32 = 48;
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
@@ -130,7 +132,24 @@ impl Orb {
                 }
             };
 
-            let _ = SelectObject(dc_mem, bitmap);
+            // Checked like every other Win32 call in this function: this is
+            // what makes the DIB section the memory DC's surface, and a
+            // refused selection would leave `dc_mem` on its default 1x1
+            // bitmap - so the orb would composite a blank surface for the life
+            // of the process while render_frame drew into a bitmap nothing
+            // displays, with no diagnostic anywhere.
+            //
+            // `SelectObject` returns `HGDIOBJ`, not a `Result`: the windows
+            // crate does not convert this one. Failure is `HGDI_ERROR`, whose
+            // value is all ones - a valid handle is never that, because GDI
+            // handles are small non-negative integers.
+            let previous = SelectObject(dc_mem, bitmap);
+            if previous.0 as isize == -1 {
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(dc_mem);
+                let _ = DestroyWindow(hwnd);
+                return Err("SelectObject refused the DIB section".into());
+            }
 
             Ok(Self {
                 hwnd,
@@ -260,19 +279,50 @@ impl Drop for Orb {
 
 fn calc_position() -> (i32, i32) {
     let mut work_area = RECT::default();
-    unsafe {
-        let _ = SystemParametersInfoW(
+    let read = unsafe {
+        SystemParametersInfoW(
             SPI_GETWORKAREA,
             0,
             Some(&mut work_area as *mut _ as *mut _),
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
+        )
+    };
+    // A refused geometry read leaves `work_area` all zeros, and the arithmetic
+    // below would then place the orb at (-24, 0) - off the top-left corner and
+    // invisible, which reads as "the indicator is broken" rather than "the
+    // screen size is unknown". Fall back to the primary monitor's metrics and
+    // say which source was used, so a failure is diagnosable instead of
+    // silent.
+    if read.is_err() {
+        let (w, h) = unsafe {
+            (
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            )
+        };
+        if w > 0 && h > 0 {
+            log(&format!(
+                "orb: SPI_GETWORKAREA refused, using primary screen metrics {w}x{h}"
+            ));
+            return (x_for(0, w), y_for(0, h));
+        }
+        log("orb: no screen geometry available, using the top-left corner");
+        return (0, 0);
     }
-    let screen_w = work_area.right - work_area.left;
-    let x = work_area.left + (screen_w - ORB_WIDTH) / 2;
-    // Anchored right at the bottom edge, 2px above taskbar
-    let y = (work_area.bottom - ORB_HEIGHT - 2).max(work_area.top);
-    (x, y)
+    (
+        x_for(work_area.left, work_area.right),
+        y_for(work_area.top, work_area.bottom),
+    )
+}
+
+/// Centres the orb horizontally in `[left, right)`.
+fn x_for(left: i32, right: i32) -> i32 {
+    left + ((right - left) - ORB_WIDTH) / 2
+}
+
+/// Anchors the orb at the bottom of `[top, bottom)`, 2px above the taskbar.
+fn y_for(top: i32, bottom: i32) -> i32 {
+    (bottom - ORB_HEIGHT - 2).max(top)
 }
 
 /// Linear-light accumulator for one pixel: lights are summed here and packed

@@ -29,15 +29,17 @@ pub const I16_SCALE: f32 = 32768.0;
 
 /// A session that has heard no speech at all ends itself after this long, so
 /// an accidental hotkey press does not hold the microphone hostage until
-/// `max_seconds`. Both engines enforce it.
+/// `max_seconds`. Both engines enforce it, including on a capture path that
+/// delivers nothing at all - see [`SilenceWindows::advance_stalled`].
 pub const NO_SPEECH_LIMIT_MS: u64 = 10_000;
 
 /// How much wall-clock audio a buffer of `samples` covers at the shared rate.
 ///
 /// Both engines advance their voice-activity windows by the audio they
 /// consumed, not by loop ticks - a tick that ran long still counts the time it
-/// covered, so a stalled capture thread ends the session on the configured
-/// silence instead of leaving the microphone open.
+/// covered. A tick that consumed no audio at all is the one case this cannot
+/// cover (`audio_ms(0)` is 0), and it is handled by
+/// [`SilenceWindows::advance_stalled`] instead of being silently free.
 pub fn audio_ms(samples: usize) -> u64 {
     samples as u64 * 1000 / SAMPLE_RATE as u64
 }
@@ -127,6 +129,33 @@ impl SilenceWindows {
             silence_expired(self.no_speech_ms, NO_SPEECH_LIMIT_MS as u32)
         }
     }
+
+    /// Advances a tick that consumed no audio at all, by the wall-clock time
+    /// it covered, reporting whether the session should end.
+    ///
+    /// The audio-time accounting in [`advance`](Self::advance) cannot move a
+    /// window on a device that hands over nothing: `audio_ms(0)` is 0, so a
+    /// capture path that stays open, raises no error, and delivers no frames
+    /// would leave the session running until `max_seconds`. That is precisely
+    /// the accidental-open-mic case `NO_SPEECH_LIMIT_MS` exists for, and it is
+    /// the one place where the tick's own duration is the only evidence that
+    /// time passed. The post-voice window uses the same rule for the same
+    /// reason: a device that dies after the user has spoken cannot be left to
+    /// `max_seconds` either, and the configured silence is the honest cutoff
+    /// for it.
+    ///
+    /// A tick that consumed any audio at all must go through `advance`
+    /// instead, or the time would be counted twice - once as audio and once as
+    /// wall clock.
+    pub fn advance_stalled(&mut self, elapsed_ms: u64, vad_silence_ms: u32) -> bool {
+        if self.heard_voice {
+            self.since_voice_ms += elapsed_ms;
+            silence_expired(self.since_voice_ms, vad_silence_ms)
+        } else {
+            self.no_speech_ms += elapsed_ms;
+            silence_expired(self.no_speech_ms, NO_SPEECH_LIMIT_MS as u32)
+        }
+    }
 }
 
 /// Whether a silence window of `since_voice_ms` has reached its limit.
@@ -174,12 +203,20 @@ pub fn rms_of(samples: &[i16]) -> f64 {
     (sum_sq / samples.len() as f64).sqrt()
 }
 
-/// A persistent capture engine, armed once at startup.
+/// The capture-engine seam.
 ///
-/// On Windows nothing names this trait - the app holds its concrete
-/// `AudioEngine` and calls its inherent method. That asymmetry is deliberate:
-/// the trait is the port's specification for the Unix engines, and the portable
-/// CLI is what actually calls it through a trait object.
+/// On Windows nothing names this trait: the app holds its concrete
+/// `AudioEngine` and calls its inherent method. The Unix engines implement it,
+/// and the CLI is the one caller - through the concrete `CpalAudio` rather than
+/// a trait object, so the trait is a specification the Unix side satisfies
+/// rather than a value that is passed around as `dyn Audio`.
+///
+/// "Persistent" is the Windows engine's shape, not a requirement of this
+/// trait: WASAPI is initialized once at startup and armed per session, which is
+/// what keeps the first audio ~15 ms away. `CpalAudio` opens the device per
+/// session instead, because cpal offers no equivalent of "open now, configure
+/// later" (see unix_audio.rs). Both satisfy the same contract: the returned
+/// receiver yields exactly one result when the session ends.
 #[allow(dead_code)]
 pub trait Audio: Send {
     /// Begin a capture session.
@@ -352,6 +389,73 @@ mod tests {
                 audio_ms(samples)
             );
         }
+    }
+
+    /// A device that delivers no audio at all must still end the session on
+    /// the silence windows, not on `max_seconds`: `advance` counts the audio a
+    /// chunk carries, and a stalled tick carries none. The stalled path
+    /// charges the tick's own duration instead, so the same limits arrive on
+    /// wall-clock time.
+    #[test]
+    fn a_stalled_capture_path_still_ends_on_the_silence_windows() {
+        // Nothing said at all: the no-speech limit, 10 s at 20 ms per tick.
+        let mut silence = SilenceWindows::new();
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            if silence.advance_stalled(20, 3_000) {
+                break;
+            }
+            assert!(ticks < 1_000, "the no-speech limit never arrived");
+        }
+        assert_eq!(ticks, 500, "10 000 ms of 20 ms stalled ticks");
+
+        // After voice: the configured silence, 3 s at 20 ms per tick.
+        let mut silence = SilenceWindows::new();
+        assert!(!silence.advance(640, 1.0, 0.01, 3_000), "voice first");
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            if silence.advance_stalled(20, 3_000) {
+                break;
+            }
+            assert!(ticks < 1_000, "the configured silence never arrived");
+        }
+        assert_eq!(ticks, 150, "3000 ms of 20 ms stalled ticks");
+    }
+
+    /// The stalled path and the audio path share one window each, so a session
+    /// that heard voice and then went quiet is ended by the two together at
+    /// the configured silence - not at twice it, and not at neither.
+    #[test]
+    fn the_stalled_and_audio_paths_share_the_same_window() {
+        let mut silence = SilenceWindows::new();
+        assert!(!silence.advance(640, 1.0, 0.01, 3_000), "voice first");
+        // 1.5 s of real silence, then stalled ticks for the remainder.
+        let mut elapsed = 0u64;
+        while elapsed + audio_ms(640) <= 1_500 {
+            elapsed += audio_ms(640);
+            assert!(
+                !silence.advance(640, 0.0, 0.01, 3_000),
+                "ended early at {elapsed} ms of audio"
+            );
+        }
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            if silence.advance_stalled(20, 3_000) {
+                break;
+            }
+            assert!(ticks < 200, "the configured silence never arrived");
+        }
+        // 1500 ms of audio at 40 ms per chunk rounds to 1520, so the stalled
+        // side owes the remainder.
+        let owed = 3_000u64 - elapsed;
+        assert_eq!(
+            ticks,
+            owed.div_ceil(20),
+            "{owed} ms left after {elapsed} ms of audio"
+        );
     }
 
     /// The amplitude comparison is strict (`rms > threshold`), so a chunk
