@@ -142,11 +142,16 @@ fn watch_recording(
         }
         match capture_done.try_recv() {
             Ok(result) => return (result, opened.elapsed()),
-            // Disconnected means the capture thread died WITHOUT reporting:
-            // the sender only lives as long as the thread. Waiting longer can
-            // never help - this used to spin here forever, while the tray
-            // treats the same case as "no error" and moves on. Fail like any
-            // other capture failure instead.
+            // Disconnected means the capture thread dropped its sender
+            // without reporting, and the sender only lives as long as the
+            // thread. Waiting longer can never help - this used to spin here
+            // forever, while the tray treats the same case as "no error" and
+            // moves on. Fail like any other capture failure instead.
+            //
+            // Unreachable in a release build, where `panic = "abort"` makes a
+            // panicking thread take the process down rather than unwind out of
+            // it. A debug build can panic, and the arm costs nothing, so it
+            // stays - but no live case has ever been seen here.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 return (
                     Err("audio capture ended unexpectedly".into()),

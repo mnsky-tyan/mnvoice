@@ -268,6 +268,13 @@ pub fn parse_auto_update(s: &str) -> bool {
 }
 
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
+    // The same BOM that `parse` strips: `load` feeds keywords.txt,
+    // vocabulary.txt and words.txt straight through here, so a file saved by
+    // Windows Notepad would otherwise read its first keyword as
+    // `\u{feff}kubernetes`. That keyword is kept as a distinct word and goes on
+    // the wire as `%EF%BB%BFkubernetes`, boosting nothing and reporting no
+    // error anywhere.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     // A lowercase index beside the vector, so de-duplication does not have to
     // re-scan every word already collected for every new one. The dedup is
     // case-insensitive by contract, so the key is the lowercase form and the
@@ -295,6 +302,15 @@ pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
 }
 
 fn parse<F: FnMut(&str, &str)>(text: &str, mut f: F) {
+    // A UTF-8 BOM has to come off before the first line is parsed, not after:
+    // `lines()` does not treat it as whitespace, so `trim()` leaves it attached
+    // and the first key becomes `\u{feff}API_KEY` instead of `API_KEY`. That key
+    // then misses the field it would have filled and is reported as missing, so
+    // a file edited in Windows Notepad looks corrupted when it is not. The
+    // checksum-file parser in `update.rs` strips it for the same reason: a file
+    // format has to be total with respect to what an editor on this platform
+    // actually writes.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -682,6 +698,20 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
+    /// A BOM is what Windows Notepad and a `>` redirect actually write, so a
+    /// config authored on this platform carries one. `lines()` does not treat it
+    /// as whitespace, so without the strip the first key reads as
+    /// `\u{feff}API_KEY` and is reported missing - which looks like a corrupted
+    /// file rather than an editor artefact.
+    #[test]
+    fn a_bom_does_not_rename_the_first_key() {
+        let mut keys = Vec::new();
+        parse("\u{feff}API_KEY=abc\nMODEL=nova-3\n", |k, v| {
+            keys.push(format!("{k}={v}"));
+        });
+        assert_eq!(keys, vec!["API_KEY=abc", "MODEL=nova-3"]);
+    }
+
     #[test]
     fn test_parse_keywords_text() {
         let mut kw = Vec::new();
@@ -693,6 +723,16 @@ mod tests {
         ";
         parse_keywords_text(input, &mut kw);
         assert_eq!(kw, vec!["mnvoice", "herdr", "Kubernetes", "TypeScript"]);
+    }
+
+    /// The keyword files are edited on this platform with the same editors that
+    /// write a BOM, and the first word is the one they corrupt. Order is part
+    /// of the contract too: the list is sent to the provider as a prompt.
+    #[test]
+    fn a_bom_does_not_rename_the_first_keyword() {
+        let mut kw = Vec::new();
+        parse_keywords_text("\u{feff}alpha\nbeta", &mut kw);
+        assert_eq!(kw, vec!["alpha", "beta"]);
     }
 
     #[test]

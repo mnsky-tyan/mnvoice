@@ -67,6 +67,10 @@ const IDM_OPEN_KEYWORDS: usize = 6;
 const IDM_UPDATE: usize = 7;
 const TIMER_ORB: usize = 101;
 
+/// The tray icon's `uID`. With `TRAY_GUID` this is the icon's identity: every
+/// `Shell_NotifyIconW` call has to name the same pair.
+const TRAY_ICON_ID: u32 = 1;
+
 const CLASS_NAME: PCWSTR = w!("mnvoiceTrayClass");
 const WINDOW_NAME: PCWSTR = w!("mnvoice");
 const MUTEX_NAME: PCWSTR = w!("mnvoice-single-instance");
@@ -177,6 +181,14 @@ struct App {
     /// overwrite the startup UNAVAILABLE warning with a cheerful "F9 to
     /// dictate" for a key that does nothing.
     hotkey_ok: bool,
+    /// Whether the cancel key for the current session could be claimed. The
+    /// counterpart of `hotkey_ok` on the cancel side, and held as a field for
+    /// the same reason: a one-off `set_tray_tip` from the failed registration
+    /// was overwritten by the very next state tip, so the session went on
+    /// advertising a cancel key that was never live. True when the key
+    /// registered, and true when there is no cancel key to register
+    /// (CANCEL_KEY=none is the configured state, not a failed one).
+    cancel_key_ok: bool,
     orb: Option<orb::Orb>,
     audio_engine: audio::AudioEngine,
 }
@@ -337,8 +349,11 @@ pub fn main() {
         } else {
             register_hotkey_with_retry(hwnd, hk_mod, hk_vk, &hk_str)
         };
-        app_ref(hwnd).hotkey_ok = hotkey_ok;
-        add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, app_ref(hwnd).config.is_some()));
+        if let Some(app) = app_ref(hwnd) {
+            app.hotkey_ok = hotkey_ok;
+            let configured = app.config.is_some();
+            add_tray(hwnd, &idle_tip(&hk_str, hotkey_ok, configured));
+        }
 
         // The installing process exits at relaunch, so it cannot report its
         // own success - this process is the success. The swap-aside image it
@@ -454,8 +469,17 @@ fn register_window_class(hinstance: HINSTANCE) -> bool {
             hIcon: app_icon(),
             ..Default::default()
         };
-        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_ALREADY_EXISTS {
-            log("RegisterClassW failed");
+        // A duplicate registration returns ERROR_CLASS_ALREADY_EXISTS, not
+        // ERROR_ALREADY_EXISTS: window classes live in the process atom table,
+        // and "this name is taken" is the atom table's own answer. Checking the
+        // wrong code here meant a second registration of the same name logged a
+        // failure that was not one. A relaunch is a fresh process with its own
+        // atom table, so in practice the class is new each time - the tolerance
+        // is for a future in-process second window.
+        let registered = RegisterClassW(&wc) != 0;
+        let taken = !registered && GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+        if !registered && !taken {
+            log(&format!("RegisterClassW failed ({})", GetLastError().0));
             return false;
         }
     }
@@ -553,8 +577,23 @@ struct AppInit {
     audio_engine: audio::AudioEngine,
 }
 
-fn app_ref(hwnd: HWND) -> &'static mut App {
-    unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App) }
+/// The live `App`, or nothing if the window has none.
+///
+/// Returns `Option` rather than a `&'static mut` into a null pointer. Window
+/// classes live in the process atom table, so a class registered once is
+/// shared by every window of that class in the process, and `WM_CREATE` on a
+/// second one would overwrite the first window's `GWLP_USERDATA` - which a
+/// blind dereference would read as an `App` that belongs to the other window.
+/// `WM_DESTROY` is the one path that clears the slot, so the value is absent
+/// exactly when the window is going away. Nothing today creates a second tray
+/// window, but the unchecked cast is what would make that a silent aliasing bug
+/// instead of a compile error at the call site.
+fn app_ref(hwnd: HWND) -> Option<&'static mut App> {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { &mut *ptr })
 }
 
 unsafe fn add_tray(hwnd: HWND, tip: &str) {
@@ -577,20 +616,54 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     if !has_config {
         return "mnvoice - NO API KEY. Set API_KEY in mnvoice.env (see log).".to_string();
     }
+    // "Disabled" is decided in one place, `hotkey_is_disabled`, rather than
+    // by an exact string match here. The parser normalises to lowercase "none"
+    // and the window setup tests the `hk_vk == 0` sentinel - three spellings of
+    // one rule, where this third one silently degraded to "mnvoice - idle. none
+    // to dictate." if the parser's normalisation ever changed.
+    if hotkey_is_disabled(hotkey) {
+        return "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string();
+    }
     match (hotkey, hotkey_ok) {
-        ("none", _) => "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string(),
         (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
         (hk, false) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
     }
 }
 
+/// Whether `hotkey` is the disabled spelling.
+///
+/// One definition for a rule the parser, the window setup and the tray tip all
+/// need. The parser normalises to lowercase `"none"` when it builds the pair,
+/// so a case-insensitive compare here agrees with it by construction rather
+/// than by the two of them happening to spell it the same way today.
+fn hotkey_is_disabled(hotkey: &str) -> bool {
+    hotkey.eq_ignore_ascii_case("none")
+}
+
 /// The tray tooltip for a given session state. Single-sourced so left-click
 /// polling and state transitions never disagree on tooltip text.
-fn state_tip(state: State, hotkey_str: &str, hotkey_ok: bool, has_config: bool) -> String {
-    match state {
+///
+/// `cancel_warning` is the sentence naming a cancel key that could not be
+/// claimed, and it is carried in every state, the way an unregistered dictate
+/// key is: the condition lasts until a later session claims the key, so a tip
+/// written once at the failed registration would be overwritten by the very
+/// next state change and the session would go on advertising a key that does
+/// nothing.
+fn state_tip(
+    state: State,
+    hotkey_str: &str,
+    hotkey_ok: bool,
+    has_config: bool,
+    cancel_warning: Option<&str>,
+) -> String {
+    let tip = match state {
         State::Idle => idle_tip(hotkey_str, hotkey_ok, has_config),
         State::Recording => "mnvoice - listening (auto-stops on silence)".to_string(),
         State::Transcribing => "mnvoice - transcribing...".to_string(),
+    };
+    match cancel_warning {
+        Some(warning) => format!("{tip} - {warning}"),
+        None => tip,
     }
 }
 
@@ -600,11 +673,27 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
     let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+/// The warning naming a cancel key this app could not claim, or `None` when
+/// there is nothing to warn about: either the key registered, or there is no
+/// cancel key to claim. Owned here because this is the only place the sentence
+/// is composed - `toggle` records the failure and every tip reads it back from
+/// that record, so the warning cannot be written to the tip once and then be
+/// overwritten by the next state change.
+fn cancel_warning(app: &App) -> Option<String> {
+    match (app.cancel_key_ok, app.config.as_ref()) {
+        (false, Some(cfg)) => Some(format!(
+            "{} could not be claimed, so there is no cancel key",
+            cfg.cancel_key_str
+        )),
+        _ => None,
+    }
+}
+
 /// Push the tray tip for the state `app` is in right now.
 ///
 /// `state_tip`'s doc says the *text* is single-sourced "so left-click polling
 /// and state transitions never disagree on tooltip text" - and it is. The
-/// *arguments* were not: this exact four-argument expression was spelled out at
+/// *arguments* were not: this exact expression was spelled out at
 /// five call sites (the tray left-click, the worker teardown, both toggle arms
 /// and cancel), with every input a field of the same `App`, so a field the tip
 /// should reflect had to be threaded through five places. `hotkey_ok` already
@@ -614,6 +703,9 @@ unsafe fn set_tray_tip(hwnd: HWND, tip: &str) {
 /// describes the state the app is in - at the four sites that call `set_state`
 /// first, that is the state they were hardcoding.
 unsafe fn push_tip(hwnd: HWND, app: &App) {
+    // Read from the record `toggle` writes, so no call site has to thread the
+    // cancel-key state through and no transition can erase the warning.
+    let warning = cancel_warning(app);
     set_tray_tip(
         hwnd,
         &state_tip(
@@ -621,6 +713,7 @@ unsafe fn push_tip(hwnd: HWND, app: &App) {
             &app.hotkey_str,
             app.hotkey_ok,
             app.config.is_some(),
+            warning.as_deref(),
         ),
     );
 }
@@ -632,7 +725,11 @@ fn tray_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: 1,
+        // Named like every other id this file hands out. `uID` is half of the
+        // icon's identity alongside `TRAY_GUID`: every `Shell_NotifyIconW`
+        // call has to name the same pair, and a bare literal is the one thing
+        // in that struct with no name to change together.
+        uID: TRAY_ICON_ID,
         uFlags: flags,
         guidItem: TRAY_GUID,
         ..Default::default()
@@ -698,6 +795,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // The registration result arrives after WM_CREATE (the
                     // hwnd did not exist yet); main sets the real value.
                     hotkey_ok: true,
+                    // No session has started, so nothing has failed to claim.
+                    cancel_key_ok: true,
                     orb,
                     audio_engine: init.audio_engine,
                 }));
@@ -706,21 +805,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER => {
                 if wparam.0 == TIMER_ORB {
-                    let app = app_ref(hwnd);
-                    if let Some(orb) = &mut app.orb {
-                        orb.tick();
+                    if let Some(app) = app_ref(hwnd) {
+                        if let Some(orb) = &mut app.orb {
+                            orb.tick();
+                        }
                     }
                 }
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                let app = app_ref(hwnd);
-                match wparam.0 as i32 {
-                    HOTKEY_TOGGLE => toggle(app),
-                    // Esc cancels and hides the orb at once. It must not "finish"
-                    // the phrase, which used to leave the orb sitting on screen.
-                    HOTKEY_ESC => cancel(app),
-                    _ => {}
+                if let Some(app) = app_ref(hwnd) {
+                    match wparam.0 as i32 {
+                        HOTKEY_TOGGLE => toggle(app),
+                        // Esc cancels and hides the orb at once. It must not
+                        // "finish" the phrase, which used to leave the orb
+                        // sitting on screen.
+                        HOTKEY_ESC => cancel(app),
+                        _ => {}
+                    }
                 }
                 LRESULT(0)
             }
@@ -729,13 +831,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     show_menu(hwnd);
                 } else if event == WM_LBUTTONUP {
-                    let app = app_ref(hwnd);
-                    push_tip(hwnd, app);
+                    if let Some(app) = app_ref(hwnd) {
+                        push_tip(hwnd, app);
+                    }
                 }
                 LRESULT(0)
             }
             WM_APP_WORKER => {
-                let app = app_ref(hwnd);
+                let Some(app) = app_ref(hwnd) else {
+                    return LRESULT(0);
+                };
                 let msg_session = wparam.0;
                 if msg_session != app.session_id {
                     // Stale outcome from an earlier session; ignore completely.
@@ -778,13 +883,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // still believing the hotkey is owned, breaking the next start.
                         let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
-                        let app = app_ref(hwnd);
-                        set_state(app, State::Idle);
+                        if let Some(app) = app_ref(hwnd) {
+                            set_state(app, State::Idle);
+                        }
                         PostQuitMessage(0);
                     }
                     IDM_DICTATE => {
-                        let app = app_ref(hwnd);
-                        toggle(app);
+                        if let Some(app) = app_ref(hwnd) {
+                            toggle(app);
+                        }
                     }
                     IDM_STARTUP => {
                         // Toggle the logon task. The Run key is cleared as a side
@@ -804,8 +911,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // domain-locked machine that is a visible freeze from a
                         // single menu click.
                         thread::spawn(|| {
-                            let enable = !autostart_enabled();
-                            if let Err(e) = set_autostart(enable) {
+                            if let Err(e) = toggle_autostart() {
                                 log(&format!("autostart toggle failed: {e}"));
                             }
                         });
@@ -856,7 +962,7 @@ fn toggle(app: &mut App) {
             // The orb appearing used to leave a gap where Esc was dead, which
             // read as "Esc does not work right after the orb shows".
             if cfg.cancel_key.1 != 0 {
-                if let Err(e) = unsafe {
+                match unsafe {
                     RegisterHotKey(
                         app.hwnd,
                         HOTKEY_ESC,
@@ -864,7 +970,20 @@ fn toggle(app: &mut App) {
                         cfg.cancel_key.1,
                     )
                 } {
-                    log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
+                    Ok(()) => app.cancel_key_ok = true,
+                    Err(e) => {
+                        // Another process already owns the combination, which
+                        // is the exact condition `register_hotkey_with_retry`
+                        // exists for on the dictate key. The orb still appears
+                        // below, and without a tip it advertises a cancel key
+                        // that was never live - so record it on the app, the
+                        // same way the dictate key's failure is recorded, and
+                        // let `state_tip` keep saying it for as long as it is
+                        // true. Writing the tip here instead was overwritten
+                        // by the state push a few lines below.
+                        log(&format!("RegisterHotKey({}) failed: {e}", cfg.cancel_key_str));
+                        app.cancel_key_ok = false;
+                    }
                 }
             }
 
@@ -917,7 +1036,16 @@ fn toggle(app: &mut App) {
             unsafe { push_tip(app.hwnd, app) };
             log("recording stopped, transcribing");
         }
-        State::Transcribing => {}
+        // Pressing the dictate key again mid-transcription means "stop".
+        // This arm used to do nothing at all, and because the tray item is greyed
+        // rather than removed and the hotkey is registered regardless, the press
+        // was swallowed with no log line, no tip and no state change - the orb
+        // sat there transcribing and the user could not tell whether the press
+        // had registered. The press cancels for both protocols: a Streaming
+        // cancel stops the queued tail from being shipped, while a REST cancel
+        // discards the whole captured dictation - `dictate_rest`'s entry guard
+        // and its post-round-trip check drop it.
+        State::Transcribing => cancel(app),
     }
 }
 
@@ -963,7 +1091,11 @@ fn capture_fault(done: Option<&std::sync::mpsc::Receiver<Result<(), String>>>) -
         Some(done) => match done.recv() {
             Ok(Err(e)) => Some(e),
             // The worker dropped its sender without sending, which for this
-            // channel means it did not reach its own report.
+            // channel means it did not reach its own report. Unreachable in a
+            // release build - `panic = "abort"` means a panicking worker takes
+            // the process down rather than unwinding out of it - so this is
+            // the defensive shape, not a case anyone has observed. Kept
+            // because a debug build can panic and the arm costs nothing.
             Err(_) => Some("capture failed: the audio worker stopped".to_string()),
             Ok(Ok(())) => None,
         },
@@ -1062,10 +1194,14 @@ fn worker(
 /// One item carries every direction: with HOTKEY=none this is the only way to
 /// start a dictation, and it must never be a grayed-out stop item while idle.
 /// The label and enablement follow the state so the single action stays
-/// honest: Transcribing has no click action at all (toggle's arm is a
-/// deliberate no-op), so it shows a disabled status label rather than an
-/// enabled "Dictate" that would silently do nothing. Pure so the mapping is
-/// testable without a live window.
+/// honest. The Transcribing arm of `toggle` cancels the session for both
+/// protocols: a Streaming cancel stops the queued tail from being shipped, and
+/// a REST cancel discards the whole captured dictation, which `dictate_rest`'s
+/// entry guard and post-round-trip check drop. Naming that cancel in this item
+/// is a deferred product decision, so for now the item shows a disabled status
+/// label rather than an enabled "Dictate" that would silently do nothing - and
+/// a REST press would discard work the user cannot get back. Pure so the
+/// mapping is testable without a live window.
 fn dictate_item(state: State) -> (&'static str, bool) {
     match state {
         State::Idle => ("Dictate", true),
@@ -1075,7 +1211,10 @@ fn dictate_item(state: State) -> (&'static str, bool) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let app = app_ref(hwnd);
+    let Some(app) = app_ref(hwnd) else {
+        // The window is being torn down; nothing left to show a menu for.
+        return;
+    };
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
         Err(_) => return,
@@ -1494,8 +1633,26 @@ fn retire_failure_message(enable: bool, run_key: Option<bool>) -> String {
 /// needed, and the Run key is cleared in both directions - but only once the
 /// scheduler is confirmed to hold the state that was asked for, so a toggle
 /// that did not take can never destroy the autostart the user had.
-fn set_autostart(enable: bool) -> Result<(), String> {
-    let _mutation = autostart_lock();
+///
+/// The read of the current state and the write of the new one are one operation
+/// under the autostart lock. Doing them apart - reading the state in the caller
+/// and handing the result here - let a concurrent toggle, or the startup
+/// migration, change the state between the two, so two clicks in quick
+/// succession could both read the same value and both write the same target.
+/// The lock's own contract is that a mutation holds it across its reads, so the
+/// read belongs inside it.
+///
+/// The guard is passed in rather than acquired here so a caller can hold one
+/// across its own read, which a second acquire inside could not do: the guard is
+/// not reentrant.
+fn toggle_autostart() -> Result<(), String> {
+    let mutation = autostart_lock();
+    let enable = !autostart_enabled();
+    set_autostart_guarded(mutation, enable)
+}
+
+fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Result<(), String> {
+    let _mutation = mutation;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.display().to_string();
     let mut cmd = schtasks_cmd();
@@ -1904,9 +2061,11 @@ mod tests {
     fn the_tray_dictate_item_matches_the_session_state() {
         // The single tray item must be honest about the one action it offers:
         // idle starts a dictation, recording stops it, and while a session is
-        // finishing there is no click action (toggle's Transcribing arm is a
-        // no-op), so it is shown disabled rather than as an enabled "Dictate"
-        // that silently does nothing.
+        // finishing the Transcribing hotkey press cancels for both protocols,
+        // but a REST cancel discards the whole captured dictation (rest's entry
+        // guard and post-round-trip check drop it) - work the user cannot get
+        // back - so the item is shown disabled rather than as an enabled
+        // "Dictate" that would silently do nothing.
         assert_eq!(dictate_item(State::Idle), ("Dictate", true));
         assert_eq!(dictate_item(State::Recording), ("Stop && transcribe", true));
         assert_eq!(
@@ -1992,8 +2151,8 @@ mod tests {
         )));
     }
 
-    /// Every message `set_autostart` can return names what the Run-key read
-    /// actually saw, and an unanswerable read is reported as unconfirmed
+    /// Every message `set_autostart_guarded` can return names what the Run-key
+    /// read actually saw, and an unanswerable read is reported as unconfirmed
     /// rather than as an absent or surviving key.
     #[test]
     fn autostart_failure_messages_name_what_was_seen() {
@@ -2130,16 +2289,38 @@ mod tests {
     #[test]
     fn the_tray_state_tip_reflects_session_state() {
         assert_eq!(
-            state_tip(State::Idle, "Alt+Space", true, true),
+            state_tip(State::Idle, "Alt+Space", true, true, None),
             "mnvoice - idle. Alt+Space to dictate."
         );
         assert_eq!(
-            state_tip(State::Recording, "Alt+Space", true, true),
+            state_tip(State::Recording, "Alt+Space", true, true, None),
             "mnvoice - listening (auto-stops on silence)"
         );
         assert_eq!(
-            state_tip(State::Transcribing, "Alt+Space", true, true),
+            state_tip(State::Transcribing, "Alt+Space", true, true, None),
             "mnvoice - transcribing..."
+        );
+    }
+
+    /// The cancel-key warning has to survive the tip that follows it. A state
+    /// push happens on every transition, so a warning written once at the
+    /// failed registration is gone within microseconds and the rest of the
+    /// session advertises a key that does nothing.
+    #[test]
+    fn a_cancel_key_that_was_never_claimed_keeps_saying_so() {
+        let warning = "Escape could not be claimed, so there is no cancel key";
+        for state in [State::Idle, State::Recording, State::Transcribing] {
+            let tip = state_tip(state, "Alt+Space", true, true, Some(warning));
+            assert!(
+                tip.contains(warning),
+                "the warning must be present in {}: {tip:?}",
+                state_name(state)
+            );
+        }
+        // And it drops out the moment the key is claimed again.
+        assert_eq!(
+            state_tip(State::Recording, "Alt+Space", true, true, None),
+            "mnvoice - listening (auto-stops on silence)"
         );
     }
 

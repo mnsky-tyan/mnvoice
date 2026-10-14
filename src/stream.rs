@@ -80,7 +80,16 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
     };
 
     // no_delay=true: release words immediately without buffering for more context (Nova-3)
-    // vad_events=true: receive SpeechStarted/UtteranceEnd events from Deepgram's own VAD
+    //
+    // vad_events=true keeps the connection's parameters intact, which is its
+    // whole reason to stay. Deepgram's VAD events are not read here: the reader
+    // below has no branch for SpeechStarted or UtteranceEnd, and
+    // `parse_stream_json` returns None for those frames, so they are dropped on
+    // arrival. The flag is sent anyway because the query is built by appending
+    // pairs to one string, and a `#` in MODEL once truncated everything after
+    // it - silently disabling this alongside smart_format and interim_results.
+    // Sending the pair unconditionally keeps that from happening again.
+    //
     // filler_words: strip disfluencies when the provider supports it natively.
     // Providers that ignore it are still covered by the local filter below.
     let filler_words = if cfg.strip_fillers { "false" } else { "true" };
@@ -364,8 +373,15 @@ pub fn run_stream(
     // unchanged: ship the queued tail when the peer is healthy, and stop the
     // moment it is not.
     if !cancelled.load(Ordering::SeqCst) {
-        while let Ok(packet_i16) = rx.try_recv() {
+        loop {
+            let Ok(packet_i16) = rx.try_recv() else {
+                #[cfg(test)]
+                crate::test_hooks::record_drain_backlog_exhausted();
+                break;
+            };
             if ws.send_binary(&pcm_bytes(&packet_i16)).is_err() {
+                #[cfg(test)]
+                crate::test_hooks::record_drain_broke_early();
                 break;
             }
         }
@@ -801,6 +817,66 @@ mod tests {
             let cancelled = Arc::new(AtomicBool::new(false));
             run_stream(cfg, &stop, &cancelled, rx)
         }
+
+        /// A provider that answers the handshake and then never reads again.
+        ///
+        /// The same peer `unix_http`'s own `stalled_peer` builds: the kernel
+        /// window fills, so a send blocks for the transport's write bound rather
+        /// than failing immediately. That is the difference from a provider that
+        /// dropped the connection, whose dead socket answers `Err` at once and
+        /// costs nothing.
+        ///
+        /// Alongside the join handle it returns the release channel. The peer
+        /// has to keep the socket open while the session is stalled, but an
+        /// unconditional `sleep` banks its whole length on every run: tests
+        /// share the thread pool, and the live-provider tests either side of
+        /// this one assert against real post-stop waits, so a long fixed window
+        /// is a flake the fixture causes rather than a property it measures. A
+        /// deadline is kept so a session that never returns cannot leave this
+        /// peer holding a socket forever, and the test releases it inside that.
+        pub fn serve_stalled() -> (
+            u16,
+            std::thread::JoinHandle<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (port, server) = serve(move |stream| {
+                let mut sink = [0u8; 64];
+                // Read once so the handshake lands, then never read again while
+                // holding the socket open.
+                let _ = stream.read(&mut sink);
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            });
+            (port, server, release_tx)
+        }
+
+        /// A session whose audio producer keeps running past `stop`, so the
+        /// post-session drain finds a real backlog.
+        ///
+        /// The backlog only survives while the send loop is blocked inside
+        /// `send_binary` on a full window. If the producer has already quit when
+        /// the loop stops, the channel is empty and a test about the drain
+        /// passes without the drain doing anything - so the producer here runs
+        /// for the whole session.
+        pub fn drive_with_a_backlog(cfg: &Config, packets: usize) -> Result<String, String> {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+            let n = SAMPLE_RATE as usize / 10;
+            std::thread::spawn(move || {
+                for _ in 0..packets {
+                    if tx.send(vec![0i16; n]).is_err() {
+                        return;
+                    }
+                }
+            });
+            let stop = Arc::new(AtomicBool::new(false));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let stopper = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                stopper.store(true, Ordering::SeqCst);
+            });
+            run_stream(cfg, &stop, &cancelled, rx)
+        }
     }
 
     /// The intent's headline behaviour: a stream that dies after words were
@@ -831,6 +907,56 @@ mod tests {
         assert!(
             text.contains("[connection lost:"),
             "a fault after words must be marked, not silent: {text}"
+        );
+    }
+
+    /// A stalled peer must not cost the drain one write timeout per queued packet.
+    ///
+    /// The drain's job is to ship the queued tail so the provider can finalise
+    /// it. Once a send fails the socket can carry no more data, so the packets
+    /// behind it cannot be delivered either - continuing only re-pays the
+    /// transport's write bound for each one. Measured before this stopped: 50
+    /// queued packets cost 1.6 s against a peer that stopped reading and 500
+    /// cost 300 s, and on Windows the send is not bounded at all, so the drain
+    /// could not finish and `run_stream` never returned. The intent is
+    /// unchanged: ship the queued tail when the peer is healthy, and stop the
+    /// moment it is not.
+    ///
+    /// This asserts the decision rather than the clock. On Unix a peer that
+    /// drops the connection makes every send fail in microseconds, so a timing
+    /// assertion here would pass whether or not the drain breaks early - the
+    /// hook is what distinguishes the two.
+    #[test]
+    fn the_drain_stops_at_the_first_failed_send() {
+        let (port, server, release) = live_provider::serve_stalled();
+        let cfg = live_provider::cfg_for(port);
+
+        // While the peer cannot read, the live loop's send parks and the
+        // session cannot reach the drain until that peer goes away, so the
+        // release cannot wait for `run_stream` to return - it has to arrive
+        // while the session is stalled. Two seconds is past the point where the
+        // kernel window is full (the first ~60 sends land in under 40 ms) and
+        // past the helper's 1.5 s stop, so the drain still finds a real backlog
+        // to work through, and the suite does not bank the fixture's deadline.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2000));
+            let _ = release.send(());
+        });
+
+        crate::test_hooks::reset_drain_observation();
+        // Far more packets than the kernel window can take, still arriving when
+        // the session ends, so the drain has a real backlog to work through.
+        let _ = live_provider::drive_with_a_backlog(&cfg, 4000);
+        let _ = releaser.join();
+        server.join().unwrap();
+
+        assert!(
+            crate::test_hooks::drain_broke_early(),
+            "the drain must stop at the first failed send, not keep paying the write bound"
+        );
+        assert!(
+            !crate::test_hooks::drain_backlog_exhausted(),
+            "the drain must not walk the whole backlog after a failed send - if this fails, the break is gone but the record is not"
         );
     }
 

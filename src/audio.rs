@@ -98,22 +98,17 @@ impl AudioEngine {
     }
 }
 
+/// The live capture session.
+///
+/// `format` is a copy, not a pointer: `GetMixFormat` returns a
+/// `CoTaskMemAlloc`'d block that is released as soon as it has been copied and
+/// read, so nothing here has to free it and `Drop` has nothing to do. The two
+/// clients below release their own handles.
 struct EngineState {
     client: IAudioClient,
     capture_client: IAudioCaptureClient,
     format: WAVEFORMATEX,
     kind: SampleKind,
-    mix_ptr: *mut WAVEFORMATEX,
-}
-
-impl Drop for EngineState {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.mix_ptr.is_null() {
-                CoTaskMemFree(Some(self.mix_ptr as *const std::ffi::c_void));
-            }
-        }
-    }
 }
 
 unsafe fn init_wasapi() -> Result<EngineState, String> {
@@ -130,6 +125,14 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
     let mix_ptr = client
         .GetMixFormat()
         .map_err(|e| format!("GetMixFormat ({e})"))?;
+    // The format is copied out for `EngineState`, but `Initialize` still gets
+    // the original allocation - not this copy. WASAPI reads the format's `cbSize`
+    // bytes, and an extensible mix format's `WAVEFORMATEXTENSIBLE` is 40 bytes
+    // where `WAVEFORMATEX` is 18: handing `Initialize` a `WAVEFORMATEX` on the
+    // stack makes it read past the object. Passing the allocation is what the
+    // caller is entitled to, and `Initialize` copies what it needs, so the
+    // allocation is released straight afterwards - every exit path frees it
+    // exactly once, and no early return can leak it.
     let format = *mix_ptr;
     let kind = match sample_kind(&format, mix_ptr) {
         Ok(kind) => kind,
@@ -139,9 +142,11 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
         }
     };
 
-    client
-        .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None)
-        .map_err(|e| format!("audio client init ({e})"))?;
+    if let Err(e) = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_ptr, None) {
+        unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
+        return Err(format!("audio client init ({e})"));
+    }
+    unsafe { CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void)) };
 
     let capture_client: IAudioCaptureClient = client
         .GetService()
@@ -152,7 +157,6 @@ unsafe fn init_wasapi() -> Result<EngineState, String> {
         capture_client,
         format,
         kind,
-        mix_ptr,
     })
 }
 
@@ -199,6 +203,15 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 
     let deadline = Instant::now() + Duration::from_secs(req.max_seconds as u64);
     let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
+    // A tick that does not end on a frame boundary leaves this behind for the
+    // next one, which is what the Unix engine's `take_frames` does and why the
+    // two do not disagree about the same hardware condition. WASAPI hands the
+    // device's period, and a period that is not a whole number of frames
+    // arrives exactly when the shared-mode format changes mid-session - so the
+    // tail is real, not theoretical. Refusing it instead aborted a dictation
+    // over a sample or two, which is a far worse outcome than reading it on
+    // the next tick.
+    let mut carry: Vec<u8> = Vec::new();
 
     let mut silence = SilenceWindows::new();
     let block_align = engine.format.nBlockAlign.max(1) as usize;
@@ -224,10 +237,16 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             .map_err(|e| format!("capture buffer ({e})"))?;
 
         if frames > 0 && !ptr.is_null() {
-            let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
+            let tick = std::slice::from_raw_parts(ptr, frames as usize * block_align);
+            // The previous tick's tail goes in front of this one, so a frame
+            // split across two ticks is mixed as the one frame it is.
+            let bytes: Vec<u8> = carry.drain(..).chain(tick.iter().copied()).collect();
+            let block_align = block_align.max(1);
+            let whole = bytes.len() / block_align * block_align;
+            carry.extend_from_slice(&bytes[whole..]);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result.
-            let converted = convert_mix(bytes, &engine.format, engine.kind);
+            let converted = convert_mix(&bytes[..whole], &engine.format, engine.kind);
             engine
                 .capture_client
                 .ReleaseBuffer(frames)

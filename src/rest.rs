@@ -26,9 +26,7 @@ pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
     }
 
     let raw_text = String::from_utf8_lossy(&response.body);
-    let parsed =
-        parse_json_transcript(&raw_text).unwrap_or_else(|| raw_text.trim().to_string());
-    Ok(parsed.trim().to_string())
+    fallback_transcript(&raw_text)
 }
 
 /// The URL a transcription POST goes to.
@@ -52,6 +50,116 @@ fn endpoint_url(base_url: &str) -> Result<String, String> {
         "/v1/audio/transcriptions"
     };
     Ok(format!("{base_url}{endpoint_path}"))
+}
+
+/// Turns a 200 body into the transcript, or refuses it.
+///
+/// The order of the checks is the guard. The BOM comes off first, an empty body
+/// is refused, the JSON key scan runs only on a body that opens as a JSON
+/// object, the refusal shapes are checked, and only then is the whole body
+/// taken as the transcript.
+///
+/// The fallback is load-bearing and cannot be dropped: a provider that honours
+/// `response_format=text` returns the transcript as a bare body, with no JSON
+/// envelope at all, and that body has to be taken verbatim. But a 200 is not
+/// proof of a transcript - a proxy's HTML error page, or a JSON object whose
+/// `error` member is the whole payload, is also a 200 body, and typing either
+/// into the user's focused window is exactly the failure this function exists
+/// to prevent. So the fallback is taken only when the body does not look like
+/// a refusal.
+///
+/// The shapes checked are the ones a refusal actually arrives in, and they are
+/// checked in the body rather than by a content-type header, because a proxy
+/// that returns an error page has no obligation to label it one.
+fn fallback_transcript(raw: &str) -> Result<String, String> {
+    // A byte-order mark is not part of any transcript: str::trim does not
+    // strip U+FEFF (the same property config.rs documents), and a BOM left
+    // in place evades every clause below - a BOM'd error page or JSON
+    // error object would be typed into the user's window as the result.
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("the ASR endpoint returned an empty body".to_string());
+    }
+    // The JSON key scan is a heuristic, so it runs only on a body that
+    // opens as a JSON object. Over an arbitrary text body the scan let a
+    // dictated sentence containing "text": "..." be replaced by the one
+    // quoted word, and an HTML page's type="text" attribute satisfy the
+    // parser before the refusal guard ever ran.
+    if trimmed.starts_with('{') {
+        if let Some(transcript) = parse_json_transcript(trimmed) {
+            return Ok(transcript);
+        }
+    }
+    if looks_like_a_refusal(trimmed) {
+        return Err(format!(
+            "the ASR endpoint returned a refusal, not a transcript: {}",
+            preview(trimmed)
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// A bounded, char-safe prefix of a body, for the messages that quote one.
+///
+/// The only cap on what comes back is the transport's (`MAX_TRANSCRIPT_BYTES`,
+/// 8 MiB), and this string is appended verbatim to `%TEMP%\mnvoice.log` by the
+/// tray and printed by the CLI on a failed dictation, so a whole proxy page
+/// must not ride along with a one-line diagnosis. The sibling that turns a
+/// non-200 into an error (`Response::error_for_status`) bounds its preview the
+/// same way.
+fn preview(body: &str) -> String {
+    const LIMIT: usize = 200;
+    match body.char_indices().nth(LIMIT) {
+        Some((i, _)) => format!("{}...", &body[..i]),
+        None => body.to_string(),
+    }
+}
+
+/// Whether a 200 body is a provider's error payload rather than a transcript.
+///
+/// Kept deliberately narrow. A false positive would reject a real transcript,
+/// which loses a dictation the user already spoke; a false negative types an
+/// error page, which is what the guard is for. So only the shapes that can only
+/// be an error are listed - a JSON object with an `error` member, an HTML
+/// document, and an XML one - and anything ambiguous is left to the fallback.
+///
+/// The JSON clauses are read only when the body opens as a JSON object, for
+/// that same reason: a provider honouring `response_format=text` returns the
+/// words the user dictated, and a dictated bug report or commit body happily
+/// contains `"error"`. Quoted-key shapes found anywhere in a bare transcript
+/// would throw away a dictation that was actually heard.
+///
+/// The `"message"` value may be separated from its key and colon by ASCII
+/// whitespace, because providers pretty-print their JSON (`{"message": "..."}`
+/// is as common as the compact spelling).
+fn looks_like_a_refusal(body: &str) -> bool {
+    let start = body.trim_start();
+    let lower = start.to_ascii_lowercase();
+    if lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.starts_with("<?xml")
+    {
+        return true;
+    }
+    if !start.starts_with('{') {
+        return false;
+    }
+    if start.contains("\"error\"") {
+        return true;
+    }
+    const MESSAGE_KEY: &str = "\"message\"";
+    let Some(key_pos) = start.find(MESSAGE_KEY) else {
+        return false;
+    };
+    start[key_pos + MESSAGE_KEY.len()..]
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .strip_prefix(':')
+        .is_some_and(|after_colon| {
+            after_colon
+                .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                .starts_with('"')
+        })
 }
 
 pub fn parse_json_transcript(json: &str) -> Option<String> {
@@ -330,6 +438,187 @@ fn multipart_body(cfg: &Config, wav: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fallback has to survive: a provider honouring `response_format=text`
+    /// returns a bare transcript with no JSON envelope, and that body is the
+    /// answer. Without this the guard could grow a case that eats it.
+    #[test]
+    fn a_bare_text_transcript_is_taken_verbatim() {
+        assert_eq!(
+            fallback_transcript("  hello there  "),
+            Ok("hello there".to_string())
+        );
+    }
+
+    /// The adversarial half: a 200 whose body is not a transcript must be
+    /// refused rather than typed into whatever window the user was in.
+    ///
+    /// Both shapes arrive from real providers. The JSON one is a provider that
+    /// answers 200 with an error object; the HTML one is a proxy or a captive
+    /// portal's page.
+    #[test]
+    fn a_refusal_body_is_reported_rather_than_typed() {
+        let json = r#"{"error":{"message":"insufficient quota","type":"quota"}}"#;
+        let out = fallback_transcript(json);
+        assert!(out.is_err(), "a JSON error must not be typed: {out:?}");
+
+        let html = "<!DOCTYPE html><html><body>502 Bad Gateway</body></html>";
+        let out = fallback_transcript(html);
+        assert!(
+            out.is_err(),
+            "an HTML error page must not be typed: {out:?}"
+        );
+
+        let out = fallback_transcript("   ");
+        assert!(out.is_err(), "an empty body must not be typed: {out:?}");
+    }
+
+    /// The guard must not reject the envelope it is meant to pass through: a
+    /// JSON transcript still comes out of the parser, not the fallback.
+    #[test]
+    fn a_json_transcript_still_comes_out_of_the_parser() {
+        let out = fallback_transcript(r#"{"text":"half a sentence"}"#);
+        assert_eq!(out, Ok("half a sentence".to_string()));
+    }
+
+    /// The false positive this guard cannot afford: a bare transcript that
+    /// mentions an error is the user's own words, and refusing it loses a
+    /// dictation they already spoke. So the quoted-key shapes are only read in
+    /// a body that opens as a JSON object.
+    #[test]
+    fn a_transcript_that_names_an_error_is_still_typed() {
+        for body in [
+            "the error was in the parser",
+            "the log prints \"error\" and \"message\":\"failed to start\"",
+        ] {
+            assert_eq!(
+                fallback_transcript(body),
+                Ok(body.to_string()),
+                "a bare transcript that mentions an error must not be refused"
+            );
+        }
+    }
+
+    /// The JSON key scan is a heuristic over the whole body, so it runs only
+    /// when the body opens as a JSON object. A provider honouring
+    /// `response_format=text` returns the dictated words bare, and a sentence
+    /// containing `"text": "..."` was collapsed to the one quoted word by the
+    /// scan before the refusal guard ever ran - a whole dictation replaced by
+    /// one word, silently.
+    #[test]
+    fn a_bare_transcript_containing_a_json_key_is_taken_whole() {
+        let body = r#"set the field "text": "name" in the schema"#;
+        assert_eq!(
+            fallback_transcript(body),
+            Ok(body.to_string()),
+            "a dictated sentence must not be replaced by a quoted word inside it"
+        );
+    }
+
+    /// The same scan also mined an HTML page: `type="text"` satisfies it, and
+    /// the first quoted string after any later colon came back as a transcript.
+    /// The page is a refusal, not a dictation.
+    #[test]
+    fn an_html_page_that_satisfies_the_json_key_scan_is_refused() {
+        let page = r#"<!DOCTYPE html><html><body><input type="text" name="q"><p>error: "503 Service Unavailable"</p></body></html>"#;
+        let out = fallback_transcript(page);
+        assert!(out.is_err(), "an HTML page must not be typed: {out:?}");
+    }
+
+    /// A byte-order mark is not part of any transcript, and it also defeats
+    /// every anchored check: `str::trim` does not strip U+FEFF, so a BOM'd
+    /// error page or JSON error object passed the refusal guard and was typed
+    /// into the user's window with the mark in front.
+    #[test]
+    fn a_bom_does_not_smuggle_a_refusal_past_the_guard() {
+        let json = "\u{feff}{\"error\":{\"message\":\"insufficient quota\"}}";
+        let out = fallback_transcript(json);
+        assert!(
+            out.is_err(),
+            "a BOM'd JSON error must not be typed: {out:?}"
+        );
+
+        let html = "\u{feff}<!DOCTYPE html><html><body>502 Bad Gateway</body></html>";
+        let out = fallback_transcript(html);
+        assert!(out.is_err(), "a BOM'd HTML page must not be typed: {out:?}");
+
+        // A body that is nothing but a BOM is an empty body, not a transcript.
+        let out = fallback_transcript("\u{feff}");
+        assert!(out.is_err(), "a lone BOM must not be typed: {out:?}");
+    }
+
+    /// The BOM comes off a real transcript too, rather than being typed as an
+    /// invisible character in front of the user's words.
+    #[test]
+    fn a_bom_is_stripped_from_a_real_transcript() {
+        assert_eq!(
+            fallback_transcript("\u{feff}hello world"),
+            Ok("hello world".to_string())
+        );
+        assert_eq!(
+            fallback_transcript("\u{feff}{\"text\":\"hello\"}"),
+            Ok("hello".to_string())
+        );
+    }
+
+    /// The `"message"` key is the other error shape a provider returns, and
+    /// providers pretty-print: the exact byte run `"message":"` missed
+    /// `{"message": "..."}` and typed the error sentence into the focused
+    /// window. The quoted-value requirement is what keeps the clause narrow -
+    /// a bare `"message"` mention or a null value is not a refusal.
+    #[test]
+    fn a_message_key_with_a_quoted_value_is_a_refusal() {
+        for body in [
+            r#"{"message": "insufficient quota"}"#,
+            r#"{"message":"insufficient quota"}"#,
+            r#"{"message" : "insufficient quota"}"#,
+            "{\"message\":\t\"insufficient quota\"}",
+        ] {
+            let out = fallback_transcript(body);
+            let err = out.expect_err("a message error must not be typed");
+            assert!(
+                err.starts_with("the ASR endpoint returned a refusal"),
+                "{err}"
+            );
+        }
+
+        let body = r#"{"message": null}"#;
+        assert_eq!(
+            fallback_transcript(body),
+            Ok(body.to_string()),
+            "a null message is not a refusal"
+        );
+
+        assert_eq!(
+            fallback_transcript(r#"{"text": "hello"}"#),
+            Ok("hello".to_string()),
+            "a JSON transcript still parses"
+        );
+    }
+
+    /// A refusal names the body it rejected without carrying it: the message
+    /// goes to the log and the CLI's stdout, and the body is bounded only by
+    /// the transport's 8 MiB.
+    #[test]
+    fn a_refusal_reports_a_preview_not_the_whole_body() {
+        let mut json = String::from(r#"{"error":{"message":"quota"}}"#);
+        json.push_str(&"x".repeat(200 * 1024));
+        let err = fallback_transcript(&json).expect_err("a JSON error object is a refusal");
+        assert!(
+            err.len() < 300,
+            "the message must stay bounded, got {} bytes: {}",
+            err.len(),
+            &err[..err.len().min(80)]
+        );
+        assert!(
+            !err.contains(&"x".repeat(300)),
+            "the tail of the body must not be carried"
+        );
+        assert!(
+            err.starts_with("the ASR endpoint returned a refusal"),
+            "{err}"
+        );
+    }
 
     /// A cancelled REST session must not upload and must not type. The guard
     /// runs before any network or injection, so a cancelled call is
