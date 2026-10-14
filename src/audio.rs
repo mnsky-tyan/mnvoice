@@ -332,9 +332,11 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 /// point. The channel count is not clamped, and a format declaring zero
 /// channels does yield a zero stride: that slice is read empty and
 /// `convert_mix` refuses `channels == 0` before any decode, so it is loud
-/// rather than silent. Neither clamp makes an unreadable format readable;
-/// both keep an unreadable format from reading out of bounds or dividing by
-/// zero before the refusal can happen.
+/// rather than silent. The clamp does not make an unreadable format readable.
+/// It only decides which refusal catches one: with a zero byte width the stride
+/// stays non-zero and `convert_mix` refuses "invalid mix format"; the
+/// zero-channel format is caught by its `channels == 0` refusal before any
+/// decode. Both end the session loudly, and neither reads out of bounds first.
 fn frame_bytes(format: &WAVEFORMATEX) -> usize {
     let declared = format.nBlockAlign as usize;
     if declared > 0 {
