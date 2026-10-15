@@ -3,11 +3,16 @@
 // cost once at application startup. When Alt+Space is pressed, client.Start() executes in ~4ms,
 // capturing the first audio frame within ~15ms so no speech is ever truncated.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::platform::audio::{
+    resample_linear, resample_step, SilenceWindows, I16_SCALE, SAMPLE_RATE,
+};
 
 use windows::core::GUID;
 use windows::Win32::Media::Audio::*;
@@ -49,8 +54,6 @@ fn sample_kind(format: &WAVEFORMATEX, mix_ptr: *const WAVEFORMATEX) -> Result<Sa
         other => Err(format!("unsupported mix format tag: {other}")),
     }
 }
-
-use crate::platform::audio::{resample_linear, resample_step, SilenceWindows, I16_SCALE};
 
 struct CaptureRequest {
     stop: Arc<AtomicBool>,
@@ -219,6 +222,12 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     // without erroring.
     const POLL_MS: u64 = 2;
 
+    // One streaming chunk: 40 ms of the provider rate, so 640 samples at
+    // 16 kHz. Tied to SAMPLE_RATE because the size only means "40 ms" through
+    // that rate - a bare 640 would stay put if the target rate moved, and the
+    // transcript's latency is the number that would silently change.
+    const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * 40 / 1000;
+
     while !req.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let packet = engine
             .capture_client
@@ -258,11 +267,12 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             let bytes = std::slice::from_raw_parts(ptr, frames as usize * block_align);
             // Convert while the raw buffer is still borrowed, then always
             // release it below before acting on the result. The silent case
-            // reads a shared all-zero slice rather than allocating one: a
-            // silent packet arrives in bursts, and `convert_mix` only reads
-            // the buffer it is handed.
+            // borrows a shared all-zero slice for ordinary packet sizes, so a
+            // burst of silent packets costs no allocation on this loop; only a
+            // format whose packet exceeds that slice allocates (see
+            // `silent_bytes`).
             let converted = if silent {
-                convert_mix(silent_bytes(bytes.len()), &engine.format, engine.kind)
+                convert_mix(&silent_bytes(bytes.len()), &engine.format, engine.kind)
             } else {
                 convert_mix(bytes, &engine.format, engine.kind)
             };
@@ -293,9 +303,9 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
                 .map_err(|e| format!("capture release ({e})"))?;
         }
 
-        // Push 40ms chunks (640 samples) for ultra-low latency streaming
-        while sample_buf.len() >= 640 {
-            let chunk: Vec<i16> = sample_buf.drain(..640).collect();
+        // Push CHUNK_SAMPLES chunks (40 ms) for ultra-low latency streaming
+        while sample_buf.len() >= CHUNK_SAMPLES {
+            let chunk: Vec<i16> = sample_buf.drain(..CHUNK_SAMPLES).collect();
 
             // Compute RMS for Voice Activity Detection. The metric is shared
             // with the Unix engines (platform::audio::rms_of) so a threshold
@@ -367,19 +377,25 @@ fn sample_bytes(format: &WAVEFORMATEX) -> usize {
     format.wBitsPerSample as usize / 8
 }
 
-/// A shared all-zero buffer of `len` bytes, for where a packet's contents are
-/// not valid audio and the zeros are what the caller should see. The buffer is
-/// all zeros, so the caller can read past its logical end into the padding
-/// without seeing anything other than zeros - which keeps the capture loop
-/// allocation-free on the silent path.
-fn silent_bytes(len: usize) -> &'static [u8] {
+/// A zero-filled buffer of `len` bytes, for where a packet's contents are not
+/// valid audio and the zeros are what the caller should see.
+///
+/// The common case is served from a shared const slice, so a burst of silent
+/// packets costs no allocation on the 2 ms capture loop. A packet larger than
+/// that slice gets a real allocation instead of a truncated one: the previous
+/// version clamped with `len.min(ZEROS.len())` behind a `debug_assert`, which
+/// silently dropped samples in release for any format whose packet exceeds
+/// 4 KiB. `frame_bytes` returns the *declared* `nBlockAlign` whenever the
+/// device declares one, so the packet size is whatever the device asks for - an
+/// 8-channel 96 kHz 32-bit mix format is 30 KiB per 10 ms packet, well past
+/// 4 KiB. The comment here used to claim the block-align fallback capped it
+/// "far below"; that fallback only runs when the declaration is zero.
+fn silent_bytes(len: usize) -> Cow<'static, [u8]> {
     const ZEROS: [u8; 4096] = [0u8; 4096];
-    debug_assert!(len <= ZEROS.len());
-    // A packet larger than the static buffer would need a real allocation;
-    // 4 KiB covers any packet format the engine declares (the block-align
-    // fallback caps it far below), so the debug assert is the guard and the
-    // release path can truncate rather than fail a capture.
-    &ZEROS[..len.min(ZEROS.len())]
+    match len {
+        0..=4096 => Cow::Borrowed(&ZEROS[..len]),
+        _ => Cow::Owned(vec![0u8; len]),
+    }
 }
 
 fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Vec<i16>, String> {
@@ -442,7 +458,26 @@ fn convert_mix(raw: &[u8], format: &WAVEFORMATEX, kind: SampleKind) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::audio::SAMPLE_RATE;
+
+    /// An oversized silent packet must arrive whole. `silent_bytes` serves the
+    /// common case from a shared slice, and clamping to that slice's length
+    /// instead of allocating (the first version did, behind a `debug_assert`)
+    /// would hand `convert_mix` fewer bytes than the device delivered - a
+    /// short packet, silently. In a release build that is not a crash, it is a
+    /// transcript that lost the tail and silence windows that counted too little
+    /// audio time, which is the failure this whole path exists to prevent.
+    #[test]
+    fn an_oversized_silent_packet_is_not_truncated() {
+        // 30 KiB: an 8-channel 96 kHz 32-bit mix format delivers more than
+        // 4 KiB per 10 ms packet, so a format this engine accepts can exceed
+        // the shared slice.
+        let len = 30 * 1024 + 7;
+        let zeros = silent_bytes(len);
+        assert_eq!(zeros.len(), len, "every delivered byte must be present");
+        assert!(zeros.iter().all(|&b| b == 0), "and they must be zeros");
+        // The ordinary case still borrows rather than allocating.
+        assert!(matches!(silent_bytes(1920), Cow::Borrowed(_)));
+    }
 
     /// A mix format this converter cannot represent must be an Err, never a
     /// best-effort read: the old catch-all read four bytes for every
