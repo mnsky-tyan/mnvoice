@@ -20,6 +20,10 @@
 /// out, while ureq substitutes its own agent string when the caller sets none.
 /// A client that identifies itself differently per platform is a client whose
 /// server-side logs cannot be correlated.
+// The updater that sends it is Windows-only (`#[cfg(windows)] mod update`), so
+// the Unix builds compile the constant without a caller. The name is kept here
+// because both backends are meant to put one user agent on the wire.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const USER_AGENT: &str = "mnvoice-update";
 
 /// Ceiling on a REST transcription response, in bytes.
@@ -40,6 +44,7 @@ pub const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
 /// for a larger future build while still refusing to buffer an endless body.
 /// Sharing one constant between the two would make whichever bound is larger
 /// the effective one for both, which is why they are named apart.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The longest body preview a diagnostic message may quote, in characters.
@@ -151,6 +156,9 @@ pub trait Transport {
     /// constant because this one call serves two callers with very different
     /// payloads - a JSON transcript and a whole release executable - and a
     /// single bound would be whichever of theirs happened to be larger.
+    // Reached in production only by the Windows updater; the Unix builds use it
+    // from tests alone, so the declaration is unheld there outside `cfg(test)`.
+#[cfg_attr(not(windows), allow(dead_code))]
     fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String>;
 
     /// A POST with a raw body. Used by the REST transcription fallback, which

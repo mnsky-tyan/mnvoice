@@ -225,6 +225,11 @@ pub fn auth_value(api_key: &str, default_scheme: &str) -> String {
 /// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
 /// the rest of the config being valid. `load()` fails outright on a missing API
 /// key, so this is what keeps a typo'd config from also silencing updates.
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn auto_update_enabled() -> bool {
     let mut raw = auto_update_from_file();
     // The real environment wins over the file beside the exe, matching load().
@@ -236,6 +241,11 @@ pub fn auto_update_enabled() -> bool {
 
 /// The `AUTO_UPDATE` value from `mnvoice.env` beside the executable, if it names
 /// one. Last entry wins so a later correction overrides an earlier one.
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn auto_update_from_file() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let text = std::fs::read_to_string(exe.with_file_name("mnvoice.env")).ok()?;
@@ -252,6 +262,11 @@ fn auto_update_from_file() -> Option<String> {
 /// does mean `auto_update=1` in a file arms automatic installs while a
 /// lowercased `api_key=` in the same file is silently ignored. Pinned by a test
 /// rather than being an accident.
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_auto_update_text(text: &str) -> Option<String> {
     let mut found = None;
     parse(text, |k, v| {
@@ -264,6 +279,11 @@ pub fn parse_auto_update_text(text: &str) -> Option<String> {
 
 /// Whether an `AUTO_UPDATE` value asks for automatic installs. Opt-in, so an
 /// empty string, a typo and every other spelling all mean "off".
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_auto_update(s: &str) -> bool {
     matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }

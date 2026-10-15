@@ -207,9 +207,9 @@ pub fn rms_of(samples: &[i16]) -> f64 {
 ///
 /// On Windows nothing names this trait: the app holds its concrete
 /// `AudioEngine` and calls its inherent method. The Unix engines implement it,
-/// and the CLI is the one caller - through the concrete `CpalAudio` rather than
-/// a trait object, so the trait is a specification the Unix side satisfies
-/// rather than a value that is passed around as `dyn Audio`.
+/// and the CLI is the one caller - it takes `&dyn audio::Audio` (see
+/// `platform::cli`), so the trait is a real dyn seam on that one platform and
+/// the specification the Unix side satisfies on the others.
 ///
 /// "Persistent" is the Windows engine's shape, not a requirement of this
 /// trait: WASAPI is initialized once at startup and armed per session, which is
@@ -217,7 +217,13 @@ pub fn rms_of(samples: &[i16]) -> f64 {
 /// session instead, because cpal offers no equivalent of "open now, configure
 /// later" (see unix_audio.rs). Both satisfy the same contract: the returned
 /// receiver yields exactly one result when the session ends.
-#[allow(dead_code)]
+// The Windows build never names this trait (the app holds its concrete
+/// `AudioEngine`), so `dead_code` fires there while the Unix builds, which do
+/// implement it, would warn about a suppression that is not needed. Verified:
+/// deleting this attribute makes a Windows `clippy -D warnings` build fail with
+/// "trait `Audio` is never used". The trait is the Unix side's contract, so the
+/// suppression is scoped to the platform that cannot see an implementor.
+#[cfg_attr(windows, allow(dead_code))]
 pub trait Audio: Send {
     /// Begin a capture session.
     ///
