@@ -933,6 +933,11 @@ fn left_old_image_behind_at(exe: &Path) -> bool {
 mod tests {
     use super::*;
 
+    // Named rather than spelled as a bare number: `windows_app.rs` already
+    // uses this constant for the same flag, and a test that hard-codes the
+    // value can drift from the app without either side noticing.
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
@@ -2194,7 +2199,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
             .args(["/c", "ping -n 60 127.0.0.1 >NUL"])
             // CREATE_NO_WINDOW: a console child would otherwise flash a window
             // on whatever desktop the test runs on, which a test must never do.
-            .creation_flags(0x0800_0000)
+            .creation_flags(CREATE_NO_WINDOW.0)
             .spawn()
             .expect("a harmless stay-alive child must spawn");
         std::thread::sleep(std::time::Duration::from_millis(300));

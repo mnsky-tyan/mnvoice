@@ -152,18 +152,19 @@ fn derive(raw: RawFields) -> Result<Config, String> {
     // below, so one word cannot mean "default" for one key and "off" for the
     // other. Without a toggle hotkey the tray menu still starts and stops a
     // dictation.
+    //
+    // Both keys go through `hotkey_with_display`, which owns that contract
+    // once: it used to be spelled inline here and again inside
+    // `cancel_key_with_display`, and the two copies had already drifted on what
+    // "none" displays (this one normalized to lowercase, that one kept the
+    // user's case). One helper is what keeps the pair and the advertised
+    // spelling in step for whichever key it is.
     let hotkey_input = raw.hotkey_str.trim().to_string();
-    let (hotkey, hotkey_actual_str) = if hotkey_input.eq_ignore_ascii_case("none") {
-        ((0, 0), "none".to_string())
-    } else {
-        let parsed = parse_hotkey(&hotkey_input);
-        let pair = parsed.unwrap_or((DEFAULT_HOTKEY_MOD, DEFAULT_HOTKEY_VK));
-        let display = match (hotkey_input.is_empty(), parsed) {
-            (false, Some(_)) => hotkey_input,
-            _ => DEFAULT_HOTKEY_STR.to_string(),
-        };
-        (pair, display)
-    };
+    let (hotkey, hotkey_actual_str) = hotkey_with_display(
+        &hotkey_input,
+        (DEFAULT_HOTKEY_MOD, DEFAULT_HOTKEY_VK),
+        DEFAULT_HOTKEY_STR,
+    );
 
     let cancel_input = raw.cancel_key_str.trim().to_string();
     // "none" disables the cancel key outright: a zero virtual key is what the
@@ -224,6 +225,11 @@ pub fn auth_value(api_key: &str, default_scheme: &str) -> String {
 /// Whether `AUTO_UPDATE` asks for automatic installs, read without depending on
 /// the rest of the config being valid. `load()` fails outright on a missing API
 /// key, so this is what keeps a typo'd config from also silencing updates.
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn auto_update_enabled() -> bool {
     let mut raw = auto_update_from_file();
     // The real environment wins over the file beside the exe, matching load().
@@ -235,6 +241,11 @@ pub fn auto_update_enabled() -> bool {
 
 /// The `AUTO_UPDATE` value from `mnvoice.env` beside the executable, if it names
 /// one. Last entry wins so a later correction overrides an earlier one.
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn auto_update_from_file() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let text = std::fs::read_to_string(exe.with_file_name("mnvoice.env")).ok()?;
@@ -251,6 +262,11 @@ fn auto_update_from_file() -> Option<String> {
 /// does mean `auto_update=1` in a file arms automatic installs while a
 /// lowercased `api_key=` in the same file is silently ignored. Pinned by a test
 /// rather than being an accident.
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_auto_update_text(text: &str) -> Option<String> {
     let mut found = None;
     parse(text, |k, v| {
@@ -263,6 +279,11 @@ pub fn parse_auto_update_text(text: &str) -> Option<String> {
 
 /// Whether an `AUTO_UPDATE` value asks for automatic installs. Opt-in, so an
 /// empty string, a typo and every other spelling all mean "off".
+// Read only by the Windows updater (`#[cfg(windows)] mod update`); the
+// Unix builds store and parse the value but have no auto-install path yet,
+// so the functions ride along unused. Same house pattern as the
+// Windows-only Config fields above.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_auto_update(s: &str) -> bool {
     matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
@@ -471,20 +492,23 @@ impl RawFields {
     /// overrides anything the file set and is not subject to the guards.
     fn set(&mut self, field: Field, k: &str, v: &str, from_file: bool) {
         let canonical_overrides = from_file && k == field.canonical();
+        // The four string fields below share one guard, so the guard is one
+        // function: they differ only in which field they write, and a fifth
+        // field with the same alias-priority semantics should not have to
+        // copy the same condition to get them. `canonical_overrides` has to be
+        // read before `self` is borrowed mutably, hence two calls rather than
+        // one with a closure over `self`.
         match field {
             Field::Protocol => self.protocol_str = v.to_string(),
-            Field::ApiKey if !from_file || canonical_overrides || self.api_key.is_empty() => {
-                self.api_key = v.to_string()
-            }
-            Field::Model if !from_file || canonical_overrides || self.model.is_empty() => {
-                self.model = v.to_string()
-            }
-            Field::Language if !from_file || canonical_overrides || self.language.is_empty() => {
-                self.language = v.to_string()
-            }
-            Field::BaseUrl if !from_file || canonical_overrides || self.base_url.is_empty() => {
-                self.base_url = v.to_string()
-            }
+            Field::ApiKey => guarded_set(
+                &mut self.api_key,
+                from_file,
+                canonical_overrides,
+                v,
+            ),
+            Field::Model => guarded_set(&mut self.model, from_file, canonical_overrides, v),
+            Field::Language => guarded_set(&mut self.language, from_file, canonical_overrides, v),
+            Field::BaseUrl => guarded_set(&mut self.base_url, from_file, canonical_overrides, v),
             Field::OrbColor => self.orb_color_str = v.to_string(),
             Field::OrbFluid => self.orb_fluid_str = v.to_string(),
             Field::Hotkey => self.hotkey_str = v.to_string(),
@@ -499,7 +523,13 @@ impl RawFields {
             // default on: TRAILING_SPACE defaults to enabled, and treating a
             // typo as "off" would let `TRAILING_SPACE=flase` silently strip
             // the space. Only the exact spelling 0 disables.
-            Field::TrailingSpace => self.trailing_space = v != "0",
+            // Trimmed like every other field's value: the file pass trims and
+            // strips quotes (see `parse`), the environment pass does not, so
+            // `TRAILING_SPACE=" 0"` from a shell or a wrapper script would
+            // otherwise keep the trailing space that the user asked to turn
+            // off. Treating a padded "0" as on is the same typo the module's
+            // other fields already refuse to treat as off.
+            Field::TrailingSpace => self.trailing_space = v.trim() != "0",
             Field::Keywords => parse_keywords_text(v, &mut self.keywords),
             Field::VadSilenceMs => {
                 if let Ok(n) = v.parse() {
@@ -511,10 +541,6 @@ impl RawFields {
                     self.vad_rms_threshold = n;
                 }
             }
-            // The alias guards leave the four guarded variants uncovered when
-            // a guard fails, so this fallback is what makes the match legal -
-            // not dead code.
-            _ => {}
         }
     }
 }
@@ -570,22 +596,43 @@ pub const DEFAULT_VAD_RMS_THRESHOLD: f64 = 400.0;
 /// that was registered, and the fallbacks live here rather than being
 /// re-derived by each caller.
 fn cancel_key_with_display(s: &str) -> ((u32, u32), String) {
-    let s = s.trim();
-    if s.is_empty() {
-        return (
-            (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
-            DEFAULT_CANCEL_STR.to_string(),
-        );
+    hotkey_with_display(s, (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK), DEFAULT_CANCEL_STR)
+}
+
+/// Writes `v` into `dest` under the alias-priority rule the string fields
+/// share: a real environment variable always lands, a file's canonical key
+/// overrides an alias the file set first, and a file's alias only fills a
+/// field that is still empty.
+///
+/// The three conditions are the field-independent half of that rule, so they
+/// live here rather than in four match arms that have to be edited together
+/// whenever the rule changes.
+fn guarded_set(dest: &mut String, from_file: bool, canonical_overrides: bool, v: &str) {
+    if !from_file || canonical_overrides || dest.is_empty() {
+        *dest = v.to_string();
     }
+}
+
+/// One key's registration pair plus the spelling to show for it.
+///
+/// Shared by the toggle hotkey and the cancel key so the two cannot drift:
+/// they answer the same question ("what pair is registered, and what does the
+/// tray tip say") with the same three fallbacks - empty and unparseable both
+/// land on `default`, and the case-insensitive word "none" registers the
+/// zero-pair sentinel that means "bind nothing".
+///
+/// The display rule for "none" is lowercase, and it is a rule rather than an
+/// accident of one caller's input: the tray tip and the log read better with
+/// one canonical spelling, and both callers route through here so they cannot
+/// show `NONE` to a user who typed `none`.
+fn hotkey_with_display(s: &str, default: (u32, u32), default_str: &str) -> ((u32, u32), String) {
+    let s = s.trim();
     if s.eq_ignore_ascii_case("none") {
-        return ((0, 0), s.to_string());
+        return ((0, 0), "none".to_string());
     }
     match parse_hotkey(s) {
-        Some(pair) => (pair, s.to_string()),
-        None => (
-            (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
-            DEFAULT_CANCEL_STR.to_string(),
-        ),
+        Some(pair) if !s.is_empty() => (pair, s.to_string()),
+        _ => (default, default_str.to_string()),
     }
 }
 
@@ -1107,5 +1154,31 @@ mod tests {
         assert_eq!(cfg.hotkey_str, "Ctrl+Shift+D");
         assert_eq!(cfg.cancel_key, (0, 0));
         assert_eq!(cfg.cancel_key_str, "none");
+    }
+
+    /// Both keys now resolve through one helper, so "none" displays the same
+    /// canonical spelling whichever key it disables. They used to disagree:
+    /// the hotkey normalized to lowercase while the cancel key echoed the
+    /// user's case, so `CANCEL_KEY=NONE` showed `NONE` in the tray tip and
+    /// `HOTKEY=NONE` showed `none` for the identical input.
+    #[test]
+    fn none_displays_one_spelling_for_both_keys() {
+        let cfg = load_from("API_KEY=k\nHOTKEY=NONE\nCANCEL_KEY=NoNe");
+        assert_eq!(cfg.hotkey_str, "none");
+        assert_eq!(cfg.cancel_key_str, "none");
+        assert_eq!(cfg.hotkey, (0, 0));
+        assert_eq!(cfg.cancel_key, (0, 0));
+    }
+
+    /// A padded value is the same value: the file pass trims every field, so
+    /// `TRAILING_SPACE=" 0"` written in the config file must disable the
+    /// trailing space exactly as the unpadded spelling does.
+    #[test]
+    fn a_padded_zero_still_turns_the_trailing_space_off() {
+        let cfg = load_from("API_KEY=k\nTRAILING_SPACE=\" 0 \"");
+        assert!(
+            !cfg.trailing_space,
+            "a whitespace-padded 0 is the 0 the user typed"
+        );
     }
 }

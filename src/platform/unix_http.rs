@@ -21,9 +21,7 @@
 // Like the Windows transport, every call is stateless: open, complete, close.
 // A failed request cannot poison the next one.
 
-use crate::platform::http::{
-    Response, Transport, WebSocket, MAX_ASSET_BYTES, MAX_TRANSCRIPT_BYTES, USER_AGENT,
-};
+use crate::platform::http::{Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, USER_AGENT};
 use std::io::Read as _;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -46,7 +44,9 @@ const REST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REST_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-phase bounds on an updater download, same shape as the Windows GET.
+#[cfg_attr(not(windows), allow(dead_code))]
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg_attr(not(windows), allow(dead_code))]
 const DOWNLOAD_IO_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Bound on the TCP connect and on the WebSocket handshake that follows it.
@@ -119,6 +119,7 @@ fn finish(resp: ureq::Response, max_bytes: u64) -> Result<Response, String> {
 /// They are built once rather than per call so the connection pool survives,
 /// which is what the global agent behind `ureq::get` would have provided.
 static REST_AGENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
+#[cfg_attr(not(windows), allow(dead_code))]
 static DOWNLOAD_AGENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
 
 fn rest_agent() -> Result<&'static ureq::Agent, String> {
@@ -136,6 +137,7 @@ fn rest_agent() -> Result<&'static ureq::Agent, String> {
         .map_err(|e| e.clone())
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn download_agent() -> Result<&'static ureq::Agent, String> {
     DOWNLOAD_AGENT
         .get_or_init(|| {
@@ -155,7 +157,9 @@ fn download_agent() -> Result<&'static ureq::Agent, String> {
 ///
 /// `max_bytes` bounds the buffered body: the caller knows whether it asked for
 /// a JSON transcript or a release executable, and the two want different
-/// ceilings. See [`MAX_TRANSCRIPT_BYTES`] and [`MAX_ASSET_BYTES`].
+/// ceilings. See [`MAX_TRANSCRIPT_BYTES`] and
+/// [`MAX_ASSET_BYTES`](crate::platform::http::MAX_ASSET_BYTES).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
     ensure_tls_ready();
     match download_agent()?
@@ -495,6 +499,11 @@ impl WebSocket for UnixSocket {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    // The asset ceiling is the bound the release-download case below asserts,
+    // and that case is the only place this file names it, so it is imported
+    // here rather than at module level - a module-level import is unused in a
+    // non-test build.
+    use crate::platform::http::MAX_ASSET_BYTES;
     // `Read` comes in through `super::*`; only `Write` is new here.
     use std::io::Write as _;
 

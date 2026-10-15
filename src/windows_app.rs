@@ -598,6 +598,27 @@ struct AppInit {
     audio_engine: audio::AudioEngine,
 }
 
+/// The three per-session arcs, all brand new.
+///
+/// Two places start a session: the `App` built at `WM_CREATE`, and the Idle arm
+/// of `toggle`. Both must write the same shape, because the stale-worker
+/// argument in the field docs (`stop`/`cancelled`/`outcome`) depends on a new
+/// session getting fresh arcs rather than a reset of the old ones - a stale
+/// worker then writes into storage nothing reads anymore. Spelled twice, the pair
+/// could drift and the first session would silently run on whatever the other one
+/// wrote.
+fn fresh_session_arcs() -> (
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<Mutex<Option<(bool, String)>>>,
+) {
+    (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(None)),
+    )
+}
+
 /// The live `App`, or nothing if the window has none.
 ///
 /// Returns `Option` rather than a `&'static mut` into a null pointer. Window
@@ -609,12 +630,20 @@ struct AppInit {
 /// exactly when the window is going away. Nothing today creates a second tray
 /// window, but the unchecked cast is what would make that a silent aliasing bug
 /// instead of a compile error at the call site.
-fn app_ref(hwnd: HWND) -> Option<&'static mut App> {
-    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+///
+/// `unsafe` because it hands out a `&'static mut` whose validity is exactly the
+/// reasoning above and nothing the compiler can see. Every sibling Win32 helper
+/// in this file already says so in its signature (`app_icon`, `add_tray`,
+/// `set_tray_tip`, `push_tip`, `show_menu`); a safe fn vouching for a reference
+/// built from a pointer cast was the one place a caller could take that on trust.
+/// Every call site here already sits inside an `unsafe` block, so this asks
+/// nothing new of them.
+unsafe fn app_ref(hwnd: HWND) -> Option<&'static mut App> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if ptr.is_null() {
         return None;
     }
-    Some(unsafe { &mut *ptr })
+    Some(&mut *ptr)
 }
 
 unsafe fn add_tray(hwnd: HWND, tip: &str) {
@@ -804,13 +833,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         e
                     })
                     .ok();
+                let (stop, cancelled, outcome) = fresh_session_arcs();
                 let app = Box::into_raw(Box::new(App {
                     hwnd,
                     state: State::Idle,
                     config: init.config,
-                    stop: Arc::new(AtomicBool::new(false)),
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                    outcome: Arc::new(Mutex::new(None)),
+                    stop,
+                    cancelled,
+                    outcome,
                     session_id: 0,
                     hotkey_str: init.hotkey_str,
                     // The registration result arrives after WM_CREATE (the
@@ -1022,12 +1052,10 @@ fn toggle(app: &mut App) {
             // handler skips) and can no longer tear the new session down.
             app.session_id = app.session_id.wrapping_add(1);
             let session_id = app.session_id;
-            app.stop = Arc::new(AtomicBool::new(false));
-            app.cancelled = Arc::new(AtomicBool::new(false));
-            app.outcome = Arc::new(Mutex::new(None));
-            let stop = app.stop.clone();
-            let cancelled = app.cancelled.clone();
-            let outcome = app.outcome.clone();
+            let (stop, cancelled, outcome) = fresh_session_arcs();
+            app.stop = stop.clone();
+            app.cancelled = cancelled.clone();
+            app.outcome = outcome.clone();
             let hwnd_bits = app.hwnd.0 as usize;
             let audio_engine = app.audio_engine.clone();
 

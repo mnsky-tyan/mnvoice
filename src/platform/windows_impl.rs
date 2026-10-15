@@ -649,14 +649,20 @@ impl WebSocket for WinHttpSocket {
 /// honouring it. paste.rs owns the mechanics - one unicode event per
 /// character with a 2 ms gap so no target window's message queue drops
 /// characters - and stays the single source of that behaviour.
-// Only named by `platform_injector`, which is compiled out under tests in
-// favour of the no-op test injector, so a test build has no other reference to them.
-#[cfg_attr(test, allow(dead_code))]
+// Both are named by `platform_injector`, whose body is compiled on every build
+// (under tests `global` returns the no-op injector, so it is never *called*
+// there). A reference from that live body is enough to keep them reachable -
+// the shape verified on the Unix builds, where the same arrangement cleared
+// `default_injector`, its injector struct and `KEY_GAP` with one attribute at
+// the root. The suppression therefore lives once, on `platform_injector`.
+//
+// This used to read "compiled out under tests", which was true while the
+// function carried `#[cfg(not(test))]` and is what orphaned the whole injector
+// chain into a warning per backend in a test build.
 pub struct SendInputInjector;
 
 /// The process-wide instance, registered as the global injector at startup by
 /// the Windows app shell.
-#[cfg_attr(test, allow(dead_code))]
 pub static SEND_INPUT_INJECTOR: SendInputInjector = SendInputInjector;
 
 impl crate::platform::input::Injector for SendInputInjector {
