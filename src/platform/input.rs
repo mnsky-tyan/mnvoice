@@ -40,7 +40,7 @@ pub const KEY_GAP: Duration = Duration::from_millis(2);
 static INJECTOR: OnceLock<&'static dyn Injector> = OnceLock::new();
 static FAILING: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(test))]
+#[cfg_attr(test, allow(dead_code))]
 fn platform_injector() -> &'static dyn Injector {
     #[cfg(windows)]
     {
