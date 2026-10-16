@@ -16,6 +16,7 @@
 #[cfg(windows)]
 mod audio;
 mod config;
+mod locks;
 #[cfg(windows)]
 mod orb;
 #[cfg(windows)]

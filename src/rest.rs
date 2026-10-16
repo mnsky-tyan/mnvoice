@@ -9,7 +9,10 @@ use crate::platform::http::{preview, Transport};
 const BOUNDARY: &str = "mnvoiceboundary9f2a";
 
 /// Transcribe a WAV clip using an OpenAI-compatible REST endpoint. Returns plain text.
-pub fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
+///
+/// Reached only through `dictate_rest` below, so this is module-private: the
+/// crate is a binary and the streaming path has its own `run_stream`.
+fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
     let url = endpoint_url(&cfg.base_url)?;
     let body = multipart_body(cfg, wav)?;
     let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
@@ -218,11 +221,18 @@ pub fn is_disfluency(word: &str) -> bool {
 /// parameter, so the local stoplist is the only filter. The streaming path
 /// filters word-by-word as commits arrive (see stream.rs), which is why this
 /// does not appear there.
-pub fn strip_disfluencies(text: &str) -> String {
+fn strip_disfluencies(text: &str) -> String {
     text.split_whitespace()
         .filter(|w| !is_disfluency(w))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// True when a trailing space should be appended: trailing space is enabled
+/// and the typed text is non-empty. Single-sourced so REST and streaming
+/// agree by construction.
+pub fn trailing_space_due(trailing_space: bool, text: &str) -> bool {
+    trailing_space && !text.is_empty()
 }
 
 /// What the REST path types for a transcript, and whether a trailing space
@@ -234,14 +244,10 @@ pub fn strip_disfluencies(text: &str) -> String {
 /// control surfaces state the rule the same way; it lives here because the
 /// Windows tray and the Unix terminal CLI would otherwise each keep their own
 /// copy and drift.
-/// True when a trailing space should be appended: trailing space is enabled
-/// and the typed text is non-empty. Single-sourced so REST and streaming
-/// agree by construction.
-pub fn trailing_space_due(trailing_space: bool, text: &str) -> bool {
-    trailing_space && !text.is_empty()
-}
-
-pub fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
+///
+/// (The paragraph above used to sit on `trailing_space_due` - two functions'
+/// docs collided onto the wrong item, and this one had none.)
+pub(crate) fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
     let text = if strip_fillers {
         strip_disfluencies(raw.trim())
     } else {

@@ -7,6 +7,7 @@
 // calls is what lets the Linux and macOS ports reuse it unchanged. The
 // full-duplex guarantee the loop depends on is documented on the trait.
 
+use crate::locks::lock_poisoned;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -25,7 +26,7 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
-pub fn url_encode(s: &str) -> String {
+fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -38,17 +39,17 @@ pub fn url_encode(s: &str) -> String {
     out
 }
 
-pub struct StreamResult {
-    pub transcript: String,
-    pub is_final: bool,
-    pub speech_final: bool,
+struct StreamResult {
+    transcript: String,
+    is_final: bool,
+    speech_final: bool,
 }
 
 /// Dependency-free frame parser. A real JSON pull would drag in a crate for
 /// four fields, and the provider's payload shape is stable; the contains()
 /// checks are also how frames that are not transcript results at all (metadata,
 /// errors, pings) get rejected cheaply before any parsing work happens.
-pub fn parse_stream_json(json: &str) -> Option<StreamResult> {
+fn parse_stream_json(json: &str) -> Option<StreamResult> {
     if !json.contains("\"Results\"") && !json.contains("\"results\"") && !json.contains("\"text\"") {
         return None;
     }
@@ -136,14 +137,6 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
     Ok(format!("{scheme}://{authority}:{port}{path}"))
 }
 
-/// The Authorization header value for this config: Deepgram wants `Token`,
-/// OpenAI-compatible endpoints want `Bearer`; whatever the user already typed
-/// is passed through so either spelling works.
-/// The streaming scheme is `Token`, per Deepgram; see `config::auth_value`.
-fn auth_value(cfg: &Config) -> String {
-    crate::config::auth_value(&cfg.api_key, "Token")
-}
-
 /// Types the words in `words[from..to]` at the cursor and appends them to the
 /// running transcript, space-separated from whatever is already there. This is
 /// the one place a decided word becomes typed text; the reader's branches all
@@ -171,7 +164,7 @@ fn commit_words(
     input::type_text(&to_type);
     *has_typed_any = true;
 
-    let mut full = full.lock().unwrap_or_else(|e| e.into_inner());
+    let mut full = lock_poisoned(&full);
     if !full.is_empty() {
         full.push(' ');
     }
@@ -187,7 +180,9 @@ pub fn run_stream(
     rx: Receiver<Vec<i16>>,
 ) -> Result<String, String> {
     let url = listen_url(cfg)?;
-    let auth_value = auth_value(cfg);
+    // Deepgram wants the `Token` scheme; `config::auth_value` owns the rule
+    // that a key already carrying a scheme is passed through unchanged.
+    let auth_value = crate::config::auth_value(&cfg.api_key, "Token");
     let auth_header = ("Authorization", auth_value.as_str());
 
     let socket = NativeTransport.websocket(&url, &[auth_header])?;
@@ -268,7 +263,7 @@ pub fn run_stream(
                         && !stop_clone.load(Ordering::SeqCst)
                     {
                         let mut slot =
-                            read_error_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            lock_poisoned(&read_error_clone);
                         *slot = Some(e);
                     }
                     break;
@@ -348,7 +343,7 @@ pub fn run_stream(
                     // has already gone away is the expected end of a finished
                     // dictation, not a lost connection.
                     if !stop.load(Ordering::SeqCst) && !cancelled.load(Ordering::SeqCst) {
-                        let mut slot = send_error.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut slot = lock_poisoned(&send_error);
                         if slot.is_none() {
                             *slot = Some(e.to_string());
                         }
@@ -409,9 +404,9 @@ pub fn run_stream(
 
     let _ = reader_thread.join();
 
-    let full_text = full_transcript.lock().unwrap_or_else(|e| e.into_inner()).trim().to_string();
-    let read_error = read_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let send_error = send_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let full_text = lock_poisoned(&full_transcript).trim().to_string();
+    let read_error = lock_poisoned(&read_error).clone();
+    let send_error = lock_poisoned(&send_error).clone();
     // A fault from either side is a fault. The reader's error is preferred when
     // both fired because it is the one the provider actually reported, and a
     // send that failed first is usually what made the read fail.
@@ -583,15 +578,6 @@ mod tests {
             url.starts_with("wss://stt.corp:443/deepgram?"),
             "a configured path is used verbatim: {url}"
         );
-    }
-
-    #[test]
-    fn the_auth_value_passes_a_prefixed_scheme_through() {
-        let mut cfg = test_cfg();
-        cfg.api_key = "Bearer sk-x".into();
-        assert_eq!(auth_value(&cfg), "Bearer sk-x");
-        cfg.api_key = "raw-key".into();
-        assert_eq!(auth_value(&cfg), "Token raw-key");
     }
 
     /// The whole point of the connection-lost work: `run_stream` is driven
@@ -1032,7 +1018,7 @@ mod tests {
         cfg.api_key = "Token my-own-prefix".into();
         let out = live_provider::drive(&cfg, 10);
         let _ = server.join();
-        let head = head.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let head = lock_poisoned(&head).clone();
         let request_line = head.lines().next().unwrap_or_default().to_string();
 
         assert!(out.is_ok(), "a hostile model must not break the session: {out:?}");

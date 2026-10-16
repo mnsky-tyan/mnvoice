@@ -257,6 +257,10 @@ fn dictate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both poison-recovery sites in this file are test-only helpers, so the
+    // import belongs here rather than at the module top, where a production
+    // build would see it as an unused import.
+    use crate::locks::lock_poisoned;
     use std::io::Read;
     use std::sync::Mutex;
 
@@ -281,7 +285,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             drop(tx);
-            *engine_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            *lock_poisoned(&engine_ended) = Some(Instant::now());
             let _ = done_tx.send(Ok(()));
         });
 
@@ -304,7 +308,7 @@ mod tests {
         let (packets, fed_at) = outcome.expect("the transcriber ran to completion");
         assert_eq!(packets, 10, "every captured packet reached the transcriber");
         let fed_at = fed_at.expect("the transcriber was handed packets");
-        let ended_at = ended_at.lock().unwrap_or_else(|e| e.into_inner()).expect("the capture reported done");
+        let ended_at = lock_poisoned(&ended_at).expect("the capture reported done");
         assert!(
             fed_at < ended_at,
             "the transcriber must be fed before the capture ends, not after"
