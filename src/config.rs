@@ -72,11 +72,7 @@ pub fn load() -> Result<Config, String> {
     if let Ok(exe) = std::env::current_exe() {
         let path = exe.with_file_name("mnvoice.env");
         if let Ok(text) = std::fs::read_to_string(&path) {
-            parse(&text, |k, v| {
-                if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
-                    raw.set(*field, k, v, true);
-                }
-            });
+            apply_env_text(&text, &mut raw);
         }
     }
 
@@ -256,7 +252,12 @@ pub fn auto_update_enabled() -> bool {
     if let Ok(v) = std::env::var("AUTO_UPDATE") {
         raw = Some(v);
     }
-    raw.as_deref().map(parse_auto_update).unwrap_or(false)
+    // `matches!` over an Option, the same idiom `parse_auto_update` and
+    // `derive`'s strip_fillers use for the same "does this value arm the
+    // feature" question - the file's convention everywhere else. The
+    // `map(..).unwrap_or(false)` spelling made one reader stop and check
+    // whether the two forms differed.
+    raw.as_deref().is_some_and(parse_auto_update)
 }
 
 /// The `AUTO_UPDATE` value from `mnvoice.env` beside the executable, if it names
@@ -315,6 +316,31 @@ fn parse_num(key: &str, v: &str) -> Result<f64, String> {
     })
 }
 
+/// One env-file value, with the quote and comment rules applied in the order
+/// the rules require: a wholly-quoted value is taken verbatim (quoting is the
+/// request that its content not be reinterpreted), and an unquoted value loses
+/// a whitespace-separated trailing comment before a single matched quote pair
+/// is stripped.
+///
+/// Named because the ordering is the part that was once a bug (the comment
+/// scan reaching inside a quoted value cut `KEYWORDS="k8s #cluster"` at the
+/// ` #`), and a fourth rule cannot be added to an inline nested `match` with-
+/// out another level that hides which rule runs when.
+fn parse_env_value(v: &str) -> &str {
+    let v = v.trim();
+    match strip_quote_pair(v) {
+        Some(inner) => inner,
+        None => {
+            let v = match v.find(" #").or_else(|| v.find("\t#")) {
+                Some(i) => &v[..i],
+                None => v,
+            };
+            let v = v.trim();
+            strip_quote_pair(v).unwrap_or(v)
+        }
+    }
+}
+
 /// A non-negative integer field (`VAD_SILENCE_MS`); `f64` first so "3000.5"
 /// and "3000x" both fail loudly rather than half-parsing.
 fn parse_u32_num(key: &str, v: &str) -> Result<u32, String> {
@@ -332,6 +358,24 @@ fn parse_positive_num(key: &str, v: &str) -> Result<u32, String> {
         return Err(format!("{key} must be at least 1 second (0 would end every session before it captured anything): {v:?}"));
     }
     Ok(n)
+}
+
+/// Run the file-shaped pass over `text` into `raw`: parse each line, map the
+/// key through `FIELDS`, and hand the pair to `RawFields::set` as a
+/// file-sourced value (the alias-priority guard applies).
+///
+/// Extracted because the test helper `load_from` had to reproduce this whole
+/// block to feed an in-memory config file: the copy is the kind that drifts -
+/// if `load` grew a fourth source or the lookup changed shape, the tests would
+/// quietly keep exercising the old one. The one difference from `load`'s own
+/// use remains deliberate and is `load_from`'s business: it never reads the
+/// keyword files, because tests supply their words in the env text itself.
+fn apply_env_text(text: &str, raw: &mut RawFields) {
+    parse(text, |k, v| {
+        if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
+            raw.set(*field, k, v, true);
+        }
+    });
 }
 
 /// The line prelude both file formats share: a UTF-8 BOM has to come off
@@ -407,18 +451,7 @@ fn parse<F: FnMut(&str, &str)>(text: &str, mut f: F) {
             // whitespace-separated (`MODEL=nova-3  # my model` drops the
             // comment; a `#` in a URL fragment stays), and quotes are stripped
             // after the comment is removed so `KEY="a" # c` still yields `a`.
-            let v = v.trim();
-            let v = match strip_quote_pair(v) {
-                Some(inner) => inner,
-                None => {
-                    let v = match v.find(" #").or_else(|| v.find("\t#")) {
-                        Some(i) => &v[..i],
-                        None => v,
-                    };
-                    let v = v.trim();
-                    strip_quote_pair(v).unwrap_or(v)
-                }
-            };
+            let v = parse_env_value(v);
             // An empty key names no field; `f` filters on the FIELDS list so
             // this is inert today, but rejecting it here means a malformed line
             // is a parse decision rather than an accident of a later filter.
@@ -1165,11 +1198,7 @@ mod tests {
     /// always supplied so the config derives instead of erroring.
     fn load_from(text: &str) -> Config {
         let mut raw = RawFields::new();
-        parse(text, |k, v| {
-            if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
-                raw.set(*field, k, v, true);
-            }
-        });
+        apply_env_text(text, &mut raw);
         if raw.api_key.trim().is_empty() {
             raw.api_key = "test-key".to_string();
         }

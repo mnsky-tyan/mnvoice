@@ -212,11 +212,16 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     // without erroring.
     const POLL_MS: u64 = 2;
 
-    // One streaming chunk: 40 ms of the provider rate, so 640 samples at
+    // How much audio one streaming chunk carries, in milliseconds. This is the
+    // product's latency setting: a smaller chunk reaches the provider sooner and
+    // sends more frames per second of speech.
+    const CHUNK_MS: usize = 40;
+
+    // One streaming chunk: CHUNK_MS of the provider rate, so 640 samples at
     // 16 kHz. Tied to SAMPLE_RATE because the size only means "40 ms" through
     // that rate - a bare 640 would stay put if the target rate moved, and the
     // transcript's latency is the number that would silently change.
-    const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * 40 / 1000;
+    const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * CHUNK_MS / 1000;
 
     // Both VAD bounds are `Copy` fields read through `req` at each use site;
     // they used to be aliased to locals that shortened nothing and were not

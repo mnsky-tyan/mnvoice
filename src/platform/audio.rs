@@ -119,14 +119,13 @@ impl SilenceWindows {
             // is what VAD_SILENCE_MS documents; waiting that long before the
             // first word would stop a session the user is still thinking in.
             self.since_voice_ms += audio_ms(samples);
-            silence_expired(self.since_voice_ms, vad_silence_ms)
+            self.expired(vad_silence_ms)
         } else {
             // Nothing said at all: the shared no-speech cutoff, so a forgotten
-            // open mic cannot hold the device for max_seconds. The comparison
-            // goes through `silence_expired` like the branch above rather than
-            // being written out again, so both windows keep one rule.
+            // open mic cannot hold the device for max_seconds. The limit choice
+            // lives in `expired`, shared with `advance_stalled`.
             self.no_speech_ms += audio_ms(samples);
-            silence_expired(self.no_speech_ms, NO_SPEECH_LIMIT_MS as u32)
+            self.expired(vad_silence_ms)
         }
     }
 
@@ -150,9 +149,24 @@ impl SilenceWindows {
     pub fn advance_stalled(&mut self, elapsed_ms: u64, vad_silence_ms: u32) -> bool {
         if self.heard_voice {
             self.since_voice_ms += elapsed_ms;
-            silence_expired(self.since_voice_ms, vad_silence_ms)
         } else {
             self.no_speech_ms += elapsed_ms;
+        }
+        self.expired(vad_silence_ms)
+    }
+
+    /// Whether the window that currently governs the session has reached its
+    /// limit: the configured silence once any speech has been heard, the
+    /// shared no-speech cutoff before it.
+    ///
+    /// Both `advance` and `advance_stalled` end on exactly this test, and each
+    /// used to spell the comparison and its limit choice out again. Keeping the
+    /// choice in one method is what stops the two paths from disagreeing about
+    /// which window applies if a third advance path is ever added.
+    fn expired(&self, vad_silence_ms: u32) -> bool {
+        if self.heard_voice {
+            silence_expired(self.since_voice_ms, vad_silence_ms)
+        } else {
             silence_expired(self.no_speech_ms, NO_SPEECH_LIMIT_MS as u32)
         }
     }

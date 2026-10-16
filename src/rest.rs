@@ -120,12 +120,30 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
 /// The `"message"` value may be separated from its key and colon by ASCII
 /// whitespace, because providers pretty-print their JSON (`{"message": "..."}`
 /// is as common as the compact spelling).
+/// ASCII-case-insensitive "does `haystack` begin with `needle`", comparing
+/// bytes without lowercasing (or copying) either side. Both sides are folded,
+/// so neither argument has to be pre-lowercased for the comparison to hold.
+fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .bytes()
+            .zip(needle.bytes())
+            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+}
+
 fn looks_like_a_refusal(body: &str) -> bool {
     let start = body.trim_start();
-    let lower = start.to_ascii_lowercase();
-    if lower.starts_with("<!doctype html")
-        || lower.starts_with("<html")
-        || lower.starts_with("<?xml")
+    // Only the marker prefixes are examined, never a copy of the whole body.
+    // This runs on every REST response, and the body is bounded at 8 MiB
+    // (`MAX_TRANSCRIPT_BYTES`), so the old `start.to_ascii_lowercase()`
+    // allocated and lowercased up to 8 MiB to answer a question about its
+    // first 14 bytes. Behaviour is identical: the same three markers, matched
+    // ASCII-case-insensitively, against a string that no longer pays for a
+    // full copy. Byte-slicing is avoided on purpose - clamping to a fixed
+    // length would panic on a multibyte character at that boundary.
+    if starts_with_ignore_case(start, "<!doctype html")
+        || starts_with_ignore_case(start, "<html")
+        || starts_with_ignore_case(start, "<?xml")
     {
         return true;
     }
@@ -149,6 +167,11 @@ fn looks_like_a_refusal(body: &str) -> bool {
         })
 }
 
+/// The transcript a provider's JSON body carries, or None when there is none.
+///
+/// Shared by both paths: the REST fallback and the streaming frame parser
+/// (`stream::parse_stream_json`) go through here, which is why the unescape
+/// rules and the "is this a transcript-shaped object" test live once.
 pub fn parse_json_transcript(json: &str) -> Option<String> {
     for key in ["\"text\"", "\"transcript\""] {
         if let Some(key_pos) = json.find(key) {
@@ -247,7 +270,15 @@ pub fn trailing_space_due(trailing_space: bool, text: &str) -> bool {
 ///
 /// (The paragraph above used to sit on `trailing_space_due` - two functions'
 /// docs collided onto the wrong item, and this one had none.)
-pub(crate) fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
+/// What the REST path types, and whether a trailing space follows it.
+///
+/// Module-private: `dictate_rest` is its only production caller, and the API
+/// deliberately cannot be called twice by the same caller (the second call
+/// would re-type), which is what the `bool` half of the return exists to serve.
+/// The shared questions it composes - `strip_disfluencies` locally, and
+/// `trailing_space_due` for the streaming path too - are the parts with more
+/// than one user.
+fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
     let text = if strip_fillers {
         strip_disfluencies(raw.trim())
     } else {
@@ -298,6 +329,12 @@ pub fn dictate_rest(
     Ok(text)
 }
 
+/// Split a base URL into `(host, port, secure, path)`.
+///
+/// The host is returned WITHOUT IPv6 brackets on purpose - see
+/// [`url_authority`] for the rule that puts them back for a URL. A scheme is
+/// allow-listed rather than assumed, so a mistyped one is an error instead of
+/// an unencrypted upload.
 pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> {
     let (scheme, rest) = url
         .split_once("://")
@@ -351,6 +388,27 @@ pub fn parse_base_url(url: &str) -> Result<(String, u16, bool, String), String> 
         }
     };
     Ok((host, port, secure, path))
+}
+
+/// The URL-authority spelling of a host that `parse_base_url` returns.
+///
+/// `parse_base_url` deliberately hands back an IPv6 literal WITHOUT brackets,
+/// because `WinHttpConnect` wants the bare address - that dependency lives at
+/// `platform::windows_impl`'s connect call. Anything building a URL must put
+/// the brackets back, because a URI authority requires them. The rule used to
+/// be re-derived from the shape of the string inside `stream::listen_url` (a
+/// `host.contains(':')` test), which is the same knowledge written down twice:
+/// correct today, and free to drift tomorrow. This is the one place it is
+/// written.
+///
+/// Borrows in the ordinary case (a DNS host or a bare IPv4 needs no brackets);
+/// allocates only for the IPv6 literal.
+pub(crate) fn url_authority(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
 }
 
 /// Refuse a value that would break out of its multipart part.
@@ -438,6 +496,46 @@ mod tests {
             fallback_transcript("  hello there  "),
             Ok("hello there".to_string())
         );
+    }
+
+    /// The refusal guard must not panic or misclassify on a body whose leading
+    /// bytes are multibyte. The old shape copied the entire body to lowercase
+    /// it; the replacement compares in place, and a naive byte-slice clamp to
+    /// the marker length would panic mid-character. A transcript that happens
+    /// to start with a non-ASCII word is the real-world case.
+    #[test]
+    fn a_multibyte_transcript_is_not_a_refusal_and_does_not_panic() {
+        let out = fallback_transcript("\u{00e9}coute: a French transcript");
+        assert_eq!(out.as_deref(), Ok("\u{00e9}coute: a French transcript"));
+        // Case folding still fires on the markers however they are cased.
+        for marker in [
+            "<!doctype html",
+            "<!DOCType HTML",
+            "<HTML lang=en>",
+            "<?xml version=\"1.0\">",
+        ] {
+            assert!(looks_like_a_refusal(marker), "{marker:?} is a refusal page");
+        }
+        // ...and does not fire on a body merely beginning with `<h`, the
+        // shorter marker's own prefix.
+        assert!(!looks_like_a_refusal("<h1>not a marker</h1>"));
+    }
+
+    /// The case-insensitive prefix comparison folds BOTH sides, so a caller
+    /// passing a mixed-case needle is not silently mis-handled.
+    #[test]
+    fn the_prefix_check_folds_both_sides() {
+        assert!(starts_with_ignore_case("<!DOCTYPE html>", "<!doctype html"));
+        assert!(starts_with_ignore_case("<!doctype html>", "<!DOCTYPE HTML"));
+        assert!(!starts_with_ignore_case("<htm", "<html"));
+        assert!(starts_with_ignore_case("", ""));
+        // Only ASCII letters fold: an 't'/'T' difference matches, because the
+        // comparison is bytewise-with-ASCII-fold, while a real accented
+        // difference (the precomposed E vs e, two different UTF-8 sequences)
+        // does not. The refusal markers are pure ASCII, so this is exactly the
+        // behaviour the caller needs and nothing more.
+        assert!(starts_with_ignore_case("\u{00e9}tale", "\u{00e9}Tale"));
+        assert!(!starts_with_ignore_case("\u{00c9}tale", "\u{00e9}tale"));
     }
 
     /// The adversarial half: a 200 whose body is not a transcript must be

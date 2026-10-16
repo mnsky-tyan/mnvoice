@@ -80,7 +80,7 @@ fn run_session(
     let supported = device
         .default_input_config()
         .map_err(|e| format!("cannot query input device ({e})"))?;
-    let in_rate = supported.sample_rate().0;
+    let device_rate = supported.sample_rate().0;
     let channels = supported.channels().max(1) as usize;
     // Input samples per output sample. Fractional on purpose: a device rate
     // that is not a multiple of the provider rate (44.1 kHz, the macOS
@@ -94,7 +94,7 @@ fn run_session(
     // legal, but a reader cannot tell which without counting lines. The rate
     // needs no cast: `sample_rate().0` is already a `u32`, the argument
     // `resample_step` takes, and the old `in_rate as u32` did nothing.
-    let step = resample_step(in_rate);
+    let step = resample_step(device_rate);
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -171,11 +171,8 @@ fn run_session(
 
         // A device that failed mid-session stops delivering frames; report it
         // as the error it is rather than as a silent, successful timeout.
-        {
-            let slot = lock_poisoned(&stream_error);
-            if let Some(e) = slot.as_ref() {
-                return Err(e.clone());
-            }
+        if let Some(e) = taken_error(&stream_error) {
+            return Err(e);
         }
 
         // Frames arrive interleaved, so the channels are averaged into mono
@@ -227,11 +224,18 @@ fn run_session(
     // the drop left a residual window where a failure that landed exactly
     // here was swallowed and a clean Ok returned.
     drop(stream);
-    let slot = lock_poisoned(&stream_error);
-    if let Some(e) = slot.as_ref() {
-        return Err(e.clone());
-    }
-    Ok(())
+    let taken = taken_error(&stream_error);
+    taken.map_or(Ok(()), Err)
+}
+
+/// The cpal error stored in the session's slot, if any.
+///
+/// The loop and the exit check both read the same slot the same way - take the
+/// lock poisoned-tolerantly, clone out the message. Two spellings of that let
+/// one of them drift (the in-loop version once read the slot before the stream
+/// was dropped, which swallowed a teardown error), so the read lives here.
+fn taken_error(slot: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    lock_poisoned(slot).clone()
 }
 
 /// Mixes the interleaved frames in `buf` down to mono and leaves a partial
