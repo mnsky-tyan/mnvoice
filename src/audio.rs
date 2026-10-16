@@ -204,16 +204,6 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     // Ultra-fast start: client was already initialized in standby! Takes ~4ms.
     engine.client.Start().map_err(|e| format!("capture start ({e})"))?;
 
-    let deadline = Instant::now() + Duration::from_secs(req.max_seconds as u64);
-    let mut sample_buf: Vec<i16> = Vec::with_capacity(3200);
-
-    let mut silence = SilenceWindows::new();
-    // The frame width comes from `frame_bytes`, the same definition the decoder
-    // below uses, so the buffer sizing and the decode cannot disagree.
-    let block_align = frame_bytes(&engine.format);
-    let vad_silence_ms = req.vad_silence_ms;
-    let vad_rms_threshold = req.vad_rms_threshold;
-
     // The tick length the stalled path charges to the silence windows. This
     // loop asks for the next packet every 2 ms, so that is what a tick that
     // consumed nothing covered. A literal rather than a measured delta: the
@@ -228,6 +218,22 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
     // transcript's latency is the number that would silently change.
     const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * 40 / 1000;
 
+    // Both VAD bounds are `Copy` fields read through `req` at each use site;
+    // they used to be aliased to locals that shortened nothing and were not
+    // `req`'s fields for any reason the compiler or a reader could use.
+    let deadline = Instant::now() + Duration::from_secs(req.max_seconds as u64);
+    // Five streaming chunks of pre-allocation. Written through CHUNK_SAMPLES
+    // rather than a bare 3200 so the sizing moves with the sample rate the same
+    // way the chunk size does - a raw 3200 silently stops meaning "five chunks"
+    // the moment SAMPLE_RATE changes.
+    let mut sample_buf: Vec<i16> = Vec::with_capacity(CHUNK_SAMPLES * 5);
+
+    let mut silence = SilenceWindows::new();
+    // The frame width comes from `frame_bytes`, the same definition the decoder
+    // below uses, so the buffer sizing and the decode cannot disagree.
+    let block_align = frame_bytes(&engine.format);
+
+
     while !req.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let packet = engine
             .capture_client
@@ -239,7 +245,7 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
             // packets is the accidental-open-mic case NO_SPEECH_LIMIT_MS
             // exists for, so charge the tick's own duration instead of letting
             // the session run to `max_seconds`.
-            if silence.advance_stalled(POLL_MS, vad_silence_ms) {
+            if silence.advance_stalled(POLL_MS, req.vad_silence_ms) {
                 req.stop.store(true, Ordering::SeqCst);
                 break;
             }
@@ -314,7 +320,7 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
 
             // Advance the voice-activity windows by the audio the chunk
             // carries (see platform::audio::audio_ms), not by loop ticks.
-            if silence.advance(chunk.len(), rms, vad_rms_threshold, vad_silence_ms) {
+            if silence.advance(chunk.len(), rms, req.vad_rms_threshold, req.vad_silence_ms) {
                 // silence after speech, or 10s with no speech at all
                 req.stop.store(true, Ordering::SeqCst);
             }

@@ -14,6 +14,11 @@
 // SendInput call can outpace the target window's message queue and drop
 // characters.
 
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::time::Duration;
+
 /// Types `text` into the currently focused window, as if the user typed it.
 pub trait Injector: Send + Sync {
     /// Type the whole string. Returns an error only when injection is
@@ -21,11 +26,6 @@ pub trait Injector: Send + Sync {
     /// no - so the caller can surface that instead of failing silently.
     fn type_text(&self, text: &str) -> Result<(), String>;
 }
-
-use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::time::Duration;
 
 /// The gap between synthesized keystrokes.
 ///
@@ -76,6 +76,35 @@ fn global() -> &'static dyn Injector {
     {
         *INJECTOR.get_or_init(platform_injector)
     }
+}
+
+/// Types `text` one character at a time with [`KEY_GAP`] after each, the
+/// pacing contract the trait doc says every backend must keep.
+///
+/// The Linux and macOS backends used to spell this loop out independently -
+/// build the handle, `for c in text.chars()`, send one character, on failure
+/// drop the cached handle so the next commit reconnects, sleep `KEY_GAP` - and
+/// only the handle cache and the permission check differ between them. Two
+/// copies of the pacing rule is exactly the drift the shared `KEY_GAP` exists
+/// to prevent, so the loop lives here once and each backend hands it a closure
+/// that owns its own handle and its own cache-drop.
+///
+/// Compiled only where a backend calls it: Windows synthesizes its own
+/// Unicode pairs in `crate::paste`, so an ungated helper would be dead code
+/// there.
+///
+/// The first closure error ends the walk and is returned, so a backend that
+/// dropped its handle inside the closure does not keep sending into it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn type_paced<F>(text: &str, mut send: F) -> Result<(), String>
+where
+    F: FnMut(char) -> Result<(), String>,
+{
+    for c in text.chars() {
+        send(c)?;
+        std::thread::sleep(KEY_GAP);
+    }
+    Ok(())
 }
 
 /// Convenience matching the pre-seam call sites: type, and report a failure

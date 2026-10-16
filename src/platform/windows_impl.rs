@@ -41,6 +41,24 @@ const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 /// arithmetic.
 const WEBSOCKET_WRITE_TIMEOUT_MS: i32 = 2_000;
 
+/// The four timeouts `WinHttpSetTimeouts` takes: resolve, connect, send,
+/// receive. Named per request shape because the same four numbers are the
+/// Unix backend's `REST_*`/`DOWNLOAD_*` constants seen from this side, and a
+/// bare tuple let one platform's timeout change without the other noticing.
+///
+/// `HTTP_REST_TIMEOUTS` mirrors `unix_http::REST_CONNECT_TIMEOUT`/`REST_IO_TIMEOUT`
+/// (10s connect, 60s both directions: uploads carry audio). `HTTP_DOWNLOAD_TIMEOUTS`
+/// mirrors `DOWNLOAD_CONNECT_TIMEOUT`/`DOWNLOAD_IO_TIMEOUT` (15s/45s for the
+/// release feed). `WEBSOCKET_TIMEOUTS` shares the REST connect bound and carries
+/// the send bound above; its receive bound is 0 - unlimited - because a streaming
+/// session is held open for the length of a dictation and `read` blocks until a
+/// frame, a close or a transport error, the contract the trait documents. A
+/// change to either platform's numbers should land on both; the names are where
+/// to look.
+const HTTP_REST_TIMEOUTS: (i32, i32, i32, i32) = (0, 10_000, 60_000, 60_000);
+const HTTP_DOWNLOAD_TIMEOUTS: (i32, i32, i32, i32) = (0, 15_000, 45_000, 45_000);
+const WEBSOCKET_TIMEOUTS: (i32, i32, i32, i32) = (0, 10_000, WEBSOCKET_WRITE_TIMEOUT_MS, 0);
+
 /// The close handshake bound handed to `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`.
 ///
 /// Deliberately not shared with the send bound: that one is recorded as
@@ -204,19 +222,26 @@ impl WinHttpTransport {
 
     /// Pull the status code off an open response. Only readable while the
     /// response is still open, so it must happen before the handles close.
-    unsafe fn status_of(request: *mut std::ffi::c_void) -> u16 {
+    ///
+    /// The query result is propagated, not discarded: a failure used to leave
+    /// `status` at 0 and hand back `Ok(status)`, so a response whose headers
+    /// could not be read looked like an HTTP 0. Both callers demand exactly 200
+    /// so it still surfaced as an error rather than a false success, but the
+    /// Win32 failure behind it was gone, and a status of 0 is a strange thing
+    /// to report as a status code. `open` checks the sibling call already.
+    unsafe fn status_of(request: *mut std::ffi::c_void) -> windows::core::Result<u16> {
         let mut status: u32 = 0;
         let mut len = std::mem::size_of::<u32>() as u32;
         let mut index = 0u32;
-        let _ = WinHttpQueryHeaders(
+        WinHttpQueryHeaders(
             request,
             WINHTTP_QUERY_STATUS | WINHTTP_QUERY_FLAG_NUMBER,
             PCWSTR::null(),
             Some(&mut status as *mut u32 as *mut std::ffi::c_void),
             &mut len,
             &mut index,
-        );
-        status as u16
+        )?;
+        Ok(status as u16)
     }
 
     /// Drain the body of an open response, up to `max_bytes`.
@@ -226,7 +251,20 @@ impl WinHttpTransport {
     /// stay responsive. The bound is passed in rather than fixed here because
     /// this one function serves both a JSON transcript and a release
     /// executable.
-    unsafe fn read_body(request: *mut std::ffi::c_void, max_bytes: u64) -> Vec<u8> {
+    ///
+    /// A failed read is an error, not the end of the body. `read == 0` is what
+    /// means "no more bytes"; `WinHttpReadData` returning an error used to
+    /// break the same way, so a connection that died mid-body was handed back
+    /// as a short body with a 200 status and no trace of the failure. The unix
+    /// backend propagates that case as `Err` (`unix_http::finish`), and the
+    /// REST path - which types its result straight into the user's focused
+    /// window - was the hazard: a truncated transcript would have looked like
+    /// a complete one. The updater is safe either way because its checksum
+    /// gate re-reads the staged file.
+    unsafe fn read_body(
+        request: *mut std::ffi::c_void,
+        max_bytes: u64,
+    ) -> windows::core::Result<Vec<u8>> {
         let mut body = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
         let cap = max_bytes as usize;
@@ -235,19 +273,19 @@ impl WinHttpTransport {
                 break;
             }
             let mut read = 0u32;
-            let ok = WinHttpReadData(
+            WinHttpReadData(
                 request,
                 chunk.as_mut_ptr() as *mut std::ffi::c_void,
                 chunk.len() as u32,
                 &mut read,
-            );
-            if ok.is_err() || read == 0 {
+            )?;
+            if read == 0 {
                 break;
             }
             let room = cap - body.len();
             body.extend_from_slice(&chunk[..(read as usize).min(room)]);
         }
-        body
+        Ok(body)
     }
 }
 
@@ -256,7 +294,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
-            let (handles, _) = Self::open("GET", url, (0, 15_000, 45_000, 45_000))?;
+            let (handles, _) = Self::open("GET", url, HTTP_DOWNLOAD_TIMEOUTS)?;
             let request = handles.request();
 
             let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: {USER_AGENT}\r\n"));
@@ -271,8 +309,8 @@ impl Transport for WinHttpTransport {
                 )?;
                 WinHttpSendRequest(request, None, None, 0, 0, 0)?;
                 WinHttpReceiveResponse(request, std::ptr::null_mut())?;
-                let status = Self::status_of(request);
-                let body = Self::read_body(request, max_bytes);
+                let status = Self::status_of(request)?;
+                let body = Self::read_body(request, max_bytes)?;
                 Ok::<Response, windows::core::Error>(Response { status, body })
             })();
 
@@ -293,7 +331,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // Uploads carry audio, so the read timeout is longer than the
             // feed's: a slow provider transcoding a long clip is not an error.
-            let (handles, _) = Self::open("POST", url, (0, 10_000, 60_000, 60_000))?;
+            let (handles, _) = Self::open("POST", url, HTTP_REST_TIMEOUTS)?;
             let request = handles.request();
 
             let auth_line = auth
@@ -318,8 +356,8 @@ impl Transport for WinHttpTransport {
                     0,
                 )?;
                 WinHttpReceiveResponse(request, std::ptr::null_mut())?;
-                let status = Self::status_of(request);
-                let resp_body = Self::read_body(request, MAX_TRANSCRIPT_BYTES);
+                let status = Self::status_of(request)?;
+                let resp_body = Self::read_body(request, MAX_TRANSCRIPT_BYTES)?;
                 Ok::<Response, windows::core::Error>(Response {
                     status,
                     body: resp_body,
@@ -360,7 +398,7 @@ impl Transport for WinHttpTransport {
             // backend's `WRITE_TIMEOUT`; that asymmetry is the reason this is
             // written down rather than left to the constant's name.
             let (mut handles, _) =
-                Self::open("GET", url, (0, 10_000, WEBSOCKET_WRITE_TIMEOUT_MS, 0))?;
+                Self::open("GET", url, WEBSOCKET_TIMEOUTS)?;
             let request = handles.request();
 
             let opt_ok =
@@ -401,7 +439,8 @@ impl Transport for WinHttpTransport {
                 return Err(format!("WebSocket response failed ({e})"));
             }
 
-            let status = Self::status_of(request);
+            let status = Self::status_of(request)
+                .map_err(|e| format!("WebSocket status unreadable ({e})"))?;
             if status != 101 {
                 return Err(format!("WebSocket handshake rejected with HTTP {status}"));
             }
@@ -610,8 +649,17 @@ impl WebSocket for WinHttpSocket {
         // close. The streaming loop re-checks its flags before every call.
         unsafe {
             let mut message: Vec<u8> = Vec::new();
+            // One receive buffer for the whole message. It used to be rebuilt
+            // - allocated and zeroed, 64 KiB at a time - inside the loop, so a
+            // message arriving in N fragments paid for N buffers to hold the
+            // same bytes. `read_body` above shows the intended shape: a buffer
+            // hoisted outside the loop and reused. Re-allocating per fragment
+            // is the same defect class as the per-packet silent-packet zeros
+            // this repo already removed (commit 909c836), and a fragmented
+            // transcript frame is exactly the ordinary case on a provider that
+            // streams word-by-word.
+            let mut buffer = vec![0u8; 64 * 1024];
             loop {
-                let mut buffer = vec![0u8; 64 * 1024];
                 let mut read = 0u32;
                 let mut buf_type = WINHTTP_WEB_SOCKET_BUFFER_TYPE::default();
                 let result = WinHttpWebSocketReceive(

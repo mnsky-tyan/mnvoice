@@ -225,6 +225,15 @@ const READ_POLL_MS: u64 = 1;
 /// that timeouts can be put on the socket: `connect` leaves the connect and
 /// the handshake unbounded, and a host that resolves but never answers would
 /// hold the CLI forever.
+/// Error text for the handful of socket options that must succeed before a
+/// WebSocket handshake can even start. They used to each spell an identical
+/// `format!("websocket socket setup failed ({e})")` closure - six copies that
+/// buried the messages which ARE distinct ("websocket connect failed") and
+/// gave six places to edit if the wording ever moved. One owner, one wording.
+fn socket_setup(e: std::io::Error) -> String {
+    format!("websocket socket setup failed ({e})")
+}
+
 pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> {
     use tungstenite::client::IntoClientRequest;
 
@@ -257,22 +266,22 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
     // so the mode is set back explicitly rather than assumed.
     stream
         .set_nonblocking(false)
-        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+        .map_err(socket_setup)?;
     // The handshake runs under its own bound; it is replaced by the much
     // shorter poll interval once the socket exists.
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
-        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+        .map_err(socket_setup)?;
     // tungstenite's own `connect` sets this; the streaming loop types words as
     // they arrive, so a delayed small frame is a visible stutter.
     stream
         .set_nodelay(true)
-        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+        .map_err(socket_setup)?;
     // A second handle on the same socket: the stream itself moves into the TLS
     // wrapper, and a duplicated descriptor shares the socket's options.
     let options = stream
         .try_clone()
-        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+        .map_err(socket_setup)?;
 
     let (socket, _) = tungstenite::client_tls_with_config(request, stream, None, None)
         .map_err(|e| format!("websocket connect failed ({e})"))?;
@@ -283,10 +292,10 @@ pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, Stri
     // teardown has nothing after it that could run.
     options
         .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))
-        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+        .map_err(socket_setup)?;
     options
         .set_write_timeout(Some(WRITE_TIMEOUT))
-        .map_err(|e| format!("websocket socket setup failed ({e})"))?;
+        .map_err(socket_setup)?;
 
     Ok(UnixSocket {
         socket: Arc::new(Mutex::new(socket)),
