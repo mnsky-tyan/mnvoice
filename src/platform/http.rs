@@ -84,8 +84,12 @@ impl Response {
     /// bounded preview of the body, so a provider's explanation survives
     /// without a megabyte of HTML in the log.
     pub fn error_for_status(&self, what: &str) -> String {
-        let preview = preview(&String::from_utf8_lossy(&self.body));
-        format!("{what} returned HTTP {}: {preview}", self.status)
+        // Named apart from the `preview` function it calls: `let preview =
+        // preview(..)` shadowed the function for the rest of the scope, so a
+        // second call below the binding would not compile and a reader has to
+        // notice which `preview` they are looking at.
+        let body_preview = preview(&String::from_utf8_lossy(&self.body));
+        format!("{what} returned HTTP {}: {body_preview}", self.status)
     }
 }
 
@@ -158,7 +162,7 @@ pub trait Transport {
     /// single bound would be whichever of theirs happened to be larger.
     // Reached in production only by the Windows updater; the Unix builds use it
     // from tests alone, so the declaration is unheld there outside `cfg(test)`.
-#[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn get(&self, url: &str, accept: &str, max_bytes: u64) -> Result<Response, String>;
 
     /// A POST with a raw body. Used by the REST transcription fallback, which

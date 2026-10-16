@@ -18,7 +18,6 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -144,6 +143,30 @@ fn set_state(app: &mut App, state: State) {
     SESSION_STATE.store(state.as_code(), Ordering::SeqCst);
 }
 
+/// Take the UI back to idle at the end of a session: the tray state, the orb
+/// timer, the cancel key, the orb window itself, and the tooltip.
+///
+/// Both session endings - the worker's outcome arriving on `WM_APP_WORKER` and
+/// the user pressing the cancel key - used to spell these five calls out
+/// separately, in different orders (`cancel` set the state before killing the
+/// timer, the outcome handler after), which was correct only because nothing
+/// here reads the timer. One owner fixes the order and makes the invariant
+/// visible: the state is idle BEFORE the tip is pushed, because `push_tip`
+/// renders the state.
+///
+/// Deliberately does not touch `cancelled`/`stop` or write a log line: those
+/// are what distinguishes a cancel from a completed session, and folding them
+/// in would make the shared part too big to reuse.
+fn end_session(app: &mut App) {
+    set_state(app, State::Idle);
+    let _ = unsafe { KillTimer(app.hwnd, TIMER_ORB) };
+    let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
+    if let Some(orb) = &mut app.orb {
+        orb.hide();
+    }
+    unsafe { push_tip(app.hwnd, app) };
+}
+
 struct App {
     hwnd: HWND,
     state: State,
@@ -203,11 +226,7 @@ pub(crate) fn log(msg: &str) {
         .append(true)
         .open(std::env::temp_dir().join("mnvoice.log"))
     {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{secs}] {msg}");
+        let _ = writeln!(f, "[{}] {msg}", update::now_secs());
     }
 }
 
@@ -901,13 +920,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let cancelled = app.cancelled.load(Ordering::SeqCst);
                 let outcome = lock_poisoned(&app.outcome).take();
                 if let Some((ok, message)) = outcome {
-                    let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
-                    let _ = KillTimer(hwnd, TIMER_ORB);
-                    if let Some(orb) = &mut app.orb {
-                        orb.hide();
-                    }
-                    set_state(app, State::Idle);
-                    push_tip(hwnd, app);
+                    end_session(app);
                     // A cancelled session was already closed by cancel(); whatever
                     // the worker scraped together afterwards is deliberately dropped
                     // and must not be reported as a transcription. On REST nothing
@@ -1116,13 +1129,7 @@ fn cancel(app: &mut App) {
     // Tell the worker and the streaming reader to stop typing further words.
     app.cancelled.store(true, Ordering::SeqCst);
     app.stop.store(true, Ordering::SeqCst);
-    set_state(app, State::Idle);
-    let _ = unsafe { KillTimer(app.hwnd, TIMER_ORB) };
-    let _ = unsafe { UnregisterHotKey(app.hwnd, HOTKEY_ESC) };
-    if let Some(orb) = &mut app.orb {
-        orb.hide();
-    }
-    unsafe { push_tip(app.hwnd, app) };
+    end_session(app);
     log("recording cancelled");
 }
 

@@ -126,14 +126,12 @@ fn listen_url(cfg: &Config) -> Result<String, String> {
     }
 
     let scheme = if secure { "wss" } else { "ws" };
-    // parse_base_url returns IPv6 literals unbracketed (WinHttpConnect wants
-    // them that way); a URL authority must bracket them again or the URI is
-    // invalid.
-    let authority = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host
-    };
+    // `rest::url_authority` owns the bracketing rule (parse_base_url hands back
+    // an unbracketed IPv6 literal because WinHttpConnect wants it that way, and
+    // a URL authority must bracket it again). This used to re-derive the
+    // decision from `host.contains(':')` at this call site - correct, but a
+    // second copy of a rule that can drift from the parser.
+    let authority = crate::rest::url_authority(&host);
     Ok(format!("{scheme}://{authority}:{port}{path}"))
 }
 

@@ -158,11 +158,17 @@ impl WinHttpTransport {
     ///
     /// `timeout_ms` is `(resolve, connect, send, receive)` in milliseconds,
     /// with 0 meaning no timeout.
+    ///
+    /// Returns the handle guard alone. It used to return `(handles, secure)`,
+    /// and all three callers destructured the flag straight into `_`: whether
+    /// the connection is TLS decides the `dwFlags` argument inside this
+    /// function and nothing downstream asks again, so the second half of the
+    /// tuple was a value no consumer could use.
     unsafe fn open(
         method: &str,
         url: &str,
         timeout_ms: (i32, i32, i32, i32),
-    ) -> Result<(RequestHandles, bool), String> {
+    ) -> Result<RequestHandles, String> {
         let (host, port, secure, path) = parse_base_url(url)?;
 
         let session = WinHttpOpen(
@@ -217,7 +223,7 @@ impl WinHttpTransport {
         }
         handles.request = Some(request);
 
-        Ok((handles, secure))
+        Ok(handles)
     }
 
     /// Pull the status code off an open response. Only readable while the
@@ -294,7 +300,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // The feed is small; 15s to connect and 45s to read is generous
             // without letting a wedged server hold the check forever.
-            let (handles, _) = Self::open("GET", url, HTTP_DOWNLOAD_TIMEOUTS)?;
+            let handles = Self::open("GET", url, HTTP_DOWNLOAD_TIMEOUTS)?;
             let request = handles.request();
 
             let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: {USER_AGENT}\r\n"));
@@ -331,7 +337,7 @@ impl Transport for WinHttpTransport {
         unsafe {
             // Uploads carry audio, so the read timeout is longer than the
             // feed's: a slow provider transcoding a long clip is not an error.
-            let (handles, _) = Self::open("POST", url, HTTP_REST_TIMEOUTS)?;
+            let handles = Self::open("POST", url, HTTP_REST_TIMEOUTS)?;
             let request = handles.request();
 
             let auth_line = auth
@@ -397,8 +403,7 @@ impl Transport for WinHttpTransport {
             // platform. The effective bound on a stalled peer is the Unix
             // backend's `WRITE_TIMEOUT`; that asymmetry is the reason this is
             // written down rather than left to the constant's name.
-            let (mut handles, _) =
-                Self::open("GET", url, WEBSOCKET_TIMEOUTS)?;
+            let mut handles = Self::open("GET", url, WEBSOCKET_TIMEOUTS)?;
             let request = handles.request();
 
             let opt_ok =
@@ -549,6 +554,20 @@ impl WinHttpSocket {
     }
 }
 
+/// The error for a `WinHttpWebSocketSend` that did not succeed.
+///
+/// One owner for both send paths, in the house pattern the Unix backend uses
+/// for the same job (`unix_http::socket_setup`): the wording is what a user
+/// reads and what a log grep matches, so two copies would be two places to
+/// keep in step. The phrasing deliberately matches the Unix backend's
+/// "websocket send failed (...)" - the two transports land in the same log
+/// line, and a reader should not have to know which one produced a failure.
+/// The WinHTTP error number is carried through because it is the only clue to
+/// a stalled-send diagnosis.
+fn send_failed(res: u32) -> String {
+    format!("websocket send failed (winhttp {res})")
+}
+
 impl WebSocket for WinHttpSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
         unsafe {
@@ -558,7 +577,7 @@ impl WebSocket for WinHttpSocket {
                 Some(data),
             );
             if res != 0 {
-                return Err(format!("ws send (error {res})"));
+                return Err(send_failed(res));
             }
             Ok(())
         }
@@ -572,7 +591,7 @@ impl WebSocket for WinHttpSocket {
                 Some(text.as_bytes()),
             );
             if res != 0 {
-                return Err(format!("ws send (error {res})"));
+                return Err(send_failed(res));
             }
             Ok(())
         }

@@ -42,7 +42,11 @@ pub struct Release {
 /// `0.saturating_sub(0)` is 0 - not more than a day - so the updater stays
 /// quiet until the clock is corrected rather than checking on every start.
 /// The two halves share that interpretation rather than each guessing at it.
-fn now_secs() -> u64 {
+///
+/// `pub(crate)` because `windows_app`'s log timestamp reads the clock through
+/// here too: two spellings of "seconds since the epoch, 0 on a broken clock"
+/// is two places to disagree about what a pre-1970 clock means.
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -148,6 +152,19 @@ fn asset_name_from_url(url: &str) -> Result<String, String> {
     Ok(name.trim().to_string())
 }
 
+/// A 64-character hex SHA-256 digest, normalised for comparison, or None if
+/// the string is not one. Two gates used to spell this predicate identically -
+/// `expected_hash` (the published sums file) and `verify_staged_digest` (the
+/// helper's command line) both trim, lowercase and check `len() == 64` with
+/// `all(is_ascii_hexdigit)`. The accepted spelling of a digest is one rule, so
+/// it is one function; the two callers keep their own messages because they
+/// name different evidence.
+fn normalized_sha256_hex(s: &str) -> Option<String> {
+    let hash = s.trim().to_ascii_lowercase();
+    let is_hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hex.then_some(hash)
+}
+
 /// The published sums line for `asset`.
 ///
 /// The format is what `sha256sum` writes: `<64 hex><whitespace><name>` per line,
@@ -171,19 +188,6 @@ fn asset_name_from_url(url: &str) -> Result<String, String> {
 /// against a file the action wrote - so a change to either side must find and
 /// re-justify the other. This comment is the pointer that makes that search
 /// possible.
-/// A 64-character hex SHA-256 digest, normalised for comparison, or None if
-/// the string is not one. Two gates used to spell this predicate identically -
-/// `expected_hash` (the published sums file) and `verify_staged_digest` (the
-/// helper's command line) both trim, lowercase and check `len() == 64` with
-/// `all(is_ascii_hexdigit)`. The accepted spelling of a digest is one rule, so
-/// it is one function; the two callers keep their own messages because they
-/// name different evidence.
-fn normalized_sha256_hex(s: &str) -> Option<String> {
-    let hash = s.trim().to_ascii_lowercase();
-    let is_hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
-    is_hex.then_some(hash)
-}
-
 fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
     let sums = sums.strip_prefix('\u{feff}').unwrap_or(sums);
     for line in sums.lines() {
@@ -447,19 +451,6 @@ pub const RESTART_ARG: &str = "--restart";
 /// recover would be left with no exe in it at all.
 const HELPER_IMAGE_PREFIX: &str = "mnvoice-updater-";
 
-/// Replace the running exe with the just-downloaded image.
-///
-/// Windows refuses to overwrite a running image but does allow renaming it, so
-/// the current exe is moved to `.old`, the new one is moved into its place, and
-/// the running process is relaunched. If the relaunch cannot be started the
-/// original is put back, so an interrupted update never leaves a broken install.
-///
-/// The two renames cannot be made into one operation, so the exe path is
-/// briefly absent between them and only a live process could put an image back
-/// there. A second, short-lived copy of this exe is therefore started before
-/// the swap, holding the read end of a pipe this process keeps open: if this
-/// process is killed between the two renames, that copy finishes the swap
-/// instead of leaving the install directory with no exe in it.
 /// Spawn this exe with the restart argument so a fresh instance takes over.
 ///
 /// The one spelling of the handoff. Three sites used to copy it - the
@@ -473,6 +464,19 @@ pub(crate) fn spawn_restarted(exe: &Path) -> std::io::Result<std::process::Child
     Command::new(exe).arg(RESTART_ARG).spawn()
 }
 
+/// Replace the running exe with the just-downloaded image.
+///
+/// Windows refuses to overwrite a running image but does allow renaming it, so
+/// the current exe is moved to `.old`, the new one is moved into its place, and
+/// the running process is relaunched. If the relaunch cannot be started the
+/// original is put back, so an interrupted update never leaves a broken install.
+///
+/// The two renames cannot be made into one operation, so the exe path is
+/// briefly absent between them and only a live process could put an image back
+/// there. A second, short-lived copy of this exe is therefore started before
+/// the swap, holding the read end of a pipe this process keeps open: if this
+/// process is killed between the two renames, that copy finishes the swap
+/// instead of leaving the install directory with no exe in it.
 pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<(), String> {
     let url = &rel.exe_url;
     let version = &rel.version;
@@ -1339,14 +1343,26 @@ mod tests {
             }
         }
 
-        /// Answers one request with `body`. `status` is the status line to answer
-        /// with, so a rejection can be driven the same way a success is.
+        /// Answers one request with `body` and the release-feed content type.
+        /// `status` is the status line to answer with, so a rejection can be
+        /// driven the same way a success is.
         fn once(body: &[u8], path: &str, status: &str) -> MockFeed {
+            Self::once_as(body, path, status, "application/atom+xml")
+        }
+
+        /// `once` with the response `content_type` named, for a test that serves
+        /// something that is not a feed. The fetch path ignores the response
+        /// content type today, so a wrong header here would change no behaviour -
+        /// which is exactly why the asset-download tests say `application/octet-stream`
+        /// instead of being handed a feed header they do not check: a fixture that
+        /// misrepresents what it serves is a fixture a later reader cannot trust.
+        fn once_as(body: &[u8], path: &str, status: &str, content_type: &str) -> MockFeed {
             let body = body.to_vec();
             let status = status.to_string();
+            let content_type = content_type.to_string();
             MockFeed::serve(path, move |stream| {
                 let head = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/atom+xml\r\nConnection: close\r\n"
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nConnection: close\r\n"
                 );
                 let _ = stream.write_all(
                     format!("{head}Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
@@ -1548,7 +1564,12 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let mut payload = vec![b'M'; len];
         payload[1] = b'Z';
 
-        let served = MockFeed::once(&payload, "releases/download/v0.1.17-win/mnvoice.exe", "200 OK");
+        let served = MockFeed::once_as(
+            &payload,
+            "releases/download/v0.1.17-win/mnvoice.exe",
+            "200 OK",
+            "application/octet-stream",
+        );
         let got = http_get(&served.url, "application/octet-stream")
             .expect("a valid asset download must succeed");
         assert_eq!(
@@ -1567,10 +1588,11 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let bytes = b"mnvoice fake exe payload";
         let sums =
             "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  mnvoice.exe\n";
-        let served = MockFeed::once(
+        let served = MockFeed::once_as(
             sums.as_bytes(),
             "mnsky-tyan/mnvoice/releases/download/v0.1.17-win/SHA256SUMS",
             "200 OK",
+            "text/plain",
         );
         super::verify_download(
             &format!("{}/mnvoice.exe", served.url.trim_end_matches("/SHA256SUMS")),
@@ -1668,15 +1690,17 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // standing between it and the exe path is the check that runs first.
         let mut substituted = exe_image(2);
         substituted[8192] = 0xff;
-        let asset = MockFeed::once(
+        let asset = MockFeed::once_as(
             &substituted,
             "mnsky-tyan/mnvoice/releases/download/v0.1.16-win/mnvoice.exe",
             "200 OK",
+            "application/octet-stream",
         );
-        let sums = MockFeed::once(
+        let sums = MockFeed::once_as(
             PUBLISHED_SUMS.as_bytes(),
             "mnsky-tyan/mnvoice/releases/download/v0.1.16-win/SHA256SUMS",
             "200 OK",
+            "text/plain",
         );
         let rel = Release {
             version: "0.1.16".into(),
@@ -1733,7 +1757,8 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let sums = "d227de818b4a898fc363f853d2946240b30965881941f53d1813104b66eee2b3  mnvoice-windows-x64.zip\n";
         let base = "mnsky-tyan/mnvoice/releases/download/v0.1.16-win";
 
-        let zip = MockFeed::once(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK");
+        let zip =
+            MockFeed::once_as(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK", "text/plain");
         super::verify_download(
             &format!(
                 "{}/mnvoice-windows-x64.zip",
@@ -1747,7 +1772,8 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         assert!(asked.contains("/SHA256SUMS"), "request was: {asked}");
 
         // The same file, asked for the exe it never lists.
-        let exe = MockFeed::once(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK");
+        let exe =
+            MockFeed::once_as(sums.as_bytes(), &format!("{base}/SHA256SUMS"), "200 OK", "text/plain");
         let err = super::verify_download(
             &format!("{}/mnvoice.exe", exe.url.trim_end_matches("/SHA256SUMS")),
             &exe.url,
@@ -1767,10 +1793,11 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // host the asset is actually served from, so a download only succeeds if
         // that redirect is followed. The asset endpoint is bound first, because
         // the redirect has to name its address.
-        let cdn = MockFeed::once(
+        let cdn = MockFeed::once_as(
             &downloaded_exe(),
             "release-assets/mnvoice.exe",
             "200 OK",
+            "application/octet-stream",
         );
         let asset = MockFeed::redirecting_to(
             &cdn.url,
@@ -1799,10 +1826,11 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // The whole install path short of the relaunch: read the release, follow
         // the asset URL it derives, stage what comes back, move it over the
         // running image - and leave the personal config beside the exe alone.
-        let asset = MockFeed::once(
+        let asset = MockFeed::once_as(
             &downloaded_exe(),
             "mnsky-tyan/mnvoice/releases/download/v0.1.11/mnvoice.exe",
             "200 OK",
+            "application/octet-stream",
         );
         let release = MockFeed::once(
             sample_feed().as_bytes(),
@@ -1856,6 +1884,16 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         exe_image(2)
     }
 
+    /// `bytes` with its final byte flipped: a rewrite of the SAME length, which
+    /// is what makes these three tests' tamper an honest one. A truncation would
+    /// be caught by the size check and would prove nothing about the digest.
+    fn tampered_copy(bytes: &[u8]) -> Vec<u8> {
+        let mut tampered = bytes.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        tampered
+    }
+
     /// A folder the way mnvoice's exe is really laid out: the running image plus
     /// the personal config files that live beside it.
     fn install_folder(name: &str) -> (PathBuf, PathBuf) {
@@ -1876,7 +1914,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
         assert_eq!(fs::read(&aside).unwrap(), installed_exe());
         // The staged file is consumed, not left lying around.
-        assert!(!dir.join("mnvoice.new").exists());
+        assert!(!staged_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1899,7 +1937,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let err = stage_and_swap(&downloaded_exe(), &exe, || {
             // It is read once the payload has landed, not before: the file it
             // decides the fate of is already on disk.
-            assert!(dir.join("mnvoice.new").exists(), "gate read too early");
+            assert!(staged_path(&exe).exists(), "gate read too early");
             // A session started while the bytes were in flight.
             true
         })
@@ -1912,8 +1950,8 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // moved out of the way, and the download it already paid for is not
         // left behind in the install folder.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
-        assert!(!dir.join("mnvoice.exe.old").exists());
-        assert!(!dir.join("mnvoice.new").exists());
+        assert!(!old_path(&exe).exists());
+        assert!(!staged_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1942,9 +1980,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
 
         // A file rewritten after the installer verified it, same length so this
         // is a rewrite rather than a truncation.
-        let mut tampered = good.clone();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0xFF;
+        let tampered = tampered_copy(&good);
         fs::write(&staged, &tampered).unwrap();
         let err = verify_staged_digest(&staged, Some(&digest)).expect_err("a rewrite is refused");
         assert!(
@@ -1989,9 +2025,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     fn a_helper_refusal_restores_the_previous_image_instead_of_bricking_the_install() {
         let good = downloaded_exe();
         let digest = sha256::hex_digest(&good);
-        let mut tampered = good.clone();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0xFF;
+        let tampered = tampered_copy(&good);
 
         // A tampered staged file with the matching-digest shape, then the two
         // unusable-digest shapes: every refusal the helper can reach.
@@ -2011,7 +2045,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
             let (dir, exe) = install_folder(name);
             // The interrupted state: the running image was moved aside and the
             // process died before the staged image landed.
-            fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+            fs::rename(&exe, old_path(&exe)).unwrap();
             fs::write(staged_path(&exe), on_disk).unwrap();
             assert!(
                 swap_interrupted(&exe),
@@ -2044,7 +2078,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     #[test]
     fn a_helper_that_accepts_the_staged_file_installs_it() {
         let (dir, exe) = install_folder("helper-accept");
-        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        fs::rename(&exe, old_path(&exe)).unwrap();
         let good = downloaded_exe();
         fs::write(staged_path(&exe), &good).unwrap();
 
@@ -2052,7 +2086,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         assert_eq!(fs::read(&exe).unwrap(), good);
         assert!(!staged_path(&exe).exists());
         // The swap-aside image survives for the just-updated handshake.
-        assert!(dir.join("mnvoice.exe.old").exists());
+        assert!(old_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2074,9 +2108,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let (dir, exe) = install_folder("swap-staged-changed");
         let staged = staged_path(&exe);
         fs::write(&staged, downloaded_exe()).unwrap();
-        let mut tampered = downloaded_exe();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0xFF;
+        let tampered = tampered_copy(&downloaded_exe());
         let err = verify_staged(&staged, &tampered).unwrap_err();
         assert!(
             err.contains("does not match the checksum the installer verified"),
@@ -2113,7 +2145,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
             );
         }
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
-        assert!(!dir.join("mnvoice.new").exists());
+        assert!(!staged_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2122,12 +2154,12 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let (dir, exe) = install_folder("swap-blocked-aside");
         // Something else already owns the .old slot, so the running image cannot
         // be moved aside.
-        fs::create_dir_all(dir.join("mnvoice.exe.old")).unwrap();
+        fs::create_dir_all(old_path(&exe)).unwrap();
         let err = stage_and_swap(&downloaded_exe(), &exe, || false).unwrap_err();
         assert!(err.contains("move current exe aside"), "unexpected error: {err}");
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         // The install did not land, so the download is not left on disk either.
-        assert!(!dir.join("mnvoice.new").exists());
+        assert!(!staged_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2137,11 +2169,11 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // belongs to the just-updated handshake, which consumes it as it reads
         // it (see a_leftover_swap_aside_image_means_the_update_installed).
         let (dir, exe) = install_folder("stale-leftovers");
-        fs::write(dir.join("mnvoice.exe.old"), installed_exe()).unwrap();
+        fs::write(old_path(&exe), installed_exe()).unwrap();
         fs::write(staged_path(&exe), downloaded_exe()).unwrap();
         clean_stale(&exe);
-        assert!(dir.join("mnvoice.exe.old").exists(), "the .old image is the handshake's, not clean_stale's");
-        assert!(!dir.join("mnvoice.new").exists());
+        assert!(old_path(&exe).exists(), "the .old image is the handshake's, not clean_stale's");
+        assert!(!staged_path(&exe).exists());
         // The running image and the personal config beside it are left alone.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         assert!(dir.join("mnvoice.env").exists());
@@ -2156,7 +2188,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // moved the old image to, and the helper copy itself. The next start is
         // what takes them, and it has to take all of them.
         let (dir, exe) = install_folder("swap-repaired-tidy");
-        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        fs::rename(&exe, old_path(&exe)).unwrap();
         fs::write(staged_path(&exe), downloaded_exe()).unwrap();
         let helper_copy = helper_copy_path();
         fs::write(&helper_copy, installed_exe()).unwrap();
@@ -2169,7 +2201,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         reap_helpers();
         // The .old image is left for the just-updated handshake to consume;
         // the staged image and the helper copy are what clean_stale reaps.
-        assert!(dir.join("mnvoice.exe.old").exists());
+        assert!(old_path(&exe).exists());
         assert!(!staged_path(&exe).exists());
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
 
@@ -2244,7 +2276,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     #[test]
     fn a_staged_path_that_cannot_be_written_aborts_the_install() {
         let (dir, exe) = install_folder("swap-blocked-stage");
-        fs::create_dir_all(dir.join("mnvoice.new")).unwrap();
+        fs::create_dir_all(staged_path(&exe)).unwrap();
         let err = stage_and_swap(&downloaded_exe(), &exe, || false).unwrap_err();
         assert!(err.contains("cannot write staged exe"), "unexpected error: {err}");
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
@@ -2256,12 +2288,15 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let (dir, exe) = install_folder("swap-rollback");
         // The running image moves aside fine, but the staged image is nowhere to
         // be found, so the install cannot land.
-        let staged = dir.join("not-a-dir").join("mnvoice.new");
+        // Deliberately NOT `staged_path`: what this test needs is a staged
+        // image whose parent directory does not exist, so the file name here
+        // is arbitrary and the unreachable path is the point.
+        let staged = dir.join("no-such-dir").join("mnvoice.new");
         let err = swap_in(&staged, &exe).unwrap_err();
         assert!(err.contains("cannot install new exe"), "unexpected error: {err}");
         // The original is back in place, not stranded as mnvoice.exe.old.
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
-        assert!(!dir.join("mnvoice.exe.old").exists());
+        assert!(!old_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2272,7 +2307,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // starts could have repaired it. Another process moving the staged image
         // in is the only repair, and it has to work from this state alone.
         let (dir, exe) = install_folder("swap-interrupted");
-        fs::rename(&exe, dir.join("mnvoice.exe.old")).unwrap();
+        fs::rename(&exe, old_path(&exe)).unwrap();
         fs::write(staged_path(&exe), downloaded_exe()).unwrap();
         assert!(swap_interrupted(&exe), "the interrupted state must be recognised");
 
@@ -2280,7 +2315,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
         // The image it was moving aside is still there to go back to, and the
         // staged file is consumed.
-        assert_eq!(fs::read(dir.join("mnvoice.exe.old")).unwrap(), installed_exe());
+        assert_eq!(fs::read(old_path(&exe)).unwrap(), installed_exe());
         assert!(!staged_path(&exe).exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2298,7 +2333,10 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
 
         let (dir, exe) = install_folder("swap-rolled-back");
         // The staged image cannot be moved in, so the original is put back.
-        let staged = dir.join("not-a-dir").join("mnvoice.new");
+        // Deliberately NOT `staged_path`: what this test needs is a staged
+        // image whose parent directory does not exist, so the file name here
+        // is arbitrary and the unreachable path is the point.
+        let staged = dir.join("no-such-dir").join("mnvoice.new");
         assert!(swap_in(&staged, &exe).is_err());
         assert!(!swap_interrupted(&exe), "a rolled-back install is not half-done");
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());

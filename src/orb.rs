@@ -22,6 +22,23 @@ const ORB_CY: f32 = ORB_HEIGHT as f32 / 2.0;
 /// radius (they used to be independent literals: `24.0`/`24.0`/`18.0`).
 const ORB_RADIUS: f32 = ORB_CX * 0.75;
 
+/// The fluid level the rendering is tuned around, and the denominator that
+/// makes the filament brightness scale with the user's setting.
+///
+/// This is `config::DEFAULT_ORB_FLUID_LEVEL` spelled by reference rather than
+/// re-typed: the render used to divide by a literal `0.75` while the config
+/// module owned the value of that default, so changing `ORB_FLUID_LEVEL`'s
+/// default would silently re-brighten every orb - a coupling no test caught,
+/// because both sides were correct on their own. Naming it here makes the
+/// dependency visible and one edit away from holding.
+const REFERENCE_FLUID_LEVEL: f32 = crate::config::DEFAULT_ORB_FLUID_LEVEL;
+
+/// The two ends of the filament brightness curve, declared together because
+/// they describe one look (see their use). Module-level so a change to one is
+/// visibly next to the other, rather than buried in a per-pixel loop body.
+const FILAMENT_GAIN: f32 = 1.45;
+const FILAMENT_FLOOR: f32 = 0.28;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OrbState {
     Recording,
@@ -469,10 +486,13 @@ fn render_gas_fluid(
                 add_light(&mut px, cr, cg, cb, body_int);
 
                 // Luminous filaments & tendrils
-                let filament =
-                    (gas_volume * 1.45 * (fluid_mult / crate::config::DEFAULT_ORB_FLUID_LEVEL)
-                        - 0.28)
-                        .clamp(0.0, 1.0);
+                // GAIN puts a default-level orb near the top of the range; FLOOR
+                // is the level below which no filaments show. They are one look,
+                // not two numbers: change the gain without the floor and
+                // filaments appear at levels the user would call empty.
+                let filament = (gas_volume * FILAMENT_GAIN * (fluid_mult / REFERENCE_FLUID_LEVEL)
+                    - FILAMENT_FLOOR)
+                    .clamp(0.0, 1.0);
                 let fil_r = (base_r + 0.3).min(1.0);
                 let fil_g = (base_g + 0.3).min(1.0);
                 let fil_b = (base_b + 0.3).min(1.0);
@@ -531,7 +551,7 @@ mod tests {
     /// test must assert opaque pixels too. A regressed alpha channel is exactly how
     /// an orb ships that is present but invisible.
     #[test]
-    fn test_render_surfaces_are_opaque_and_coloured() {
+    fn a_rendered_frame_is_opaque_and_coloured() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
         render_gas_fluid(
             10,
@@ -558,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_recording_non_empty() {
+    fn a_recording_frame_renders_visible_pixels() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
         render_gas_fluid(
             10,
@@ -572,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_loading_non_empty() {
+    fn a_transcribing_frame_renders_visible_pixels() {
         let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
         render_gas_fluid(
             10,

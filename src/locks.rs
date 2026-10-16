@@ -1,12 +1,17 @@
 // One owner for the process's poison-recovery rule.
 //
-// Nineteen places in this crate take a `Mutex` and refuse to treat a poisoned
+// Every place in this crate that takes a `Mutex` refuses to treat a poisoned
 // lock as an error: a thread that panicked while holding it has already
 // released the data's only other user, and the surviving thread's choice is
 // between wedging the app forever and reading data that may be mid-update. For
 // every lock here the answer is the same - take it and carry on - because each
 // one guards a transcript string, an error slot, an instant, or a flag, and a
 // wrong value is recoverable while a frozen tray is not.
+//
+// The count is deliberately not stated: this paragraph used to say "nineteen
+// places" and was wrong the day it was written (there were twenty), because a
+// number in a comment rots at the next call site and nothing checks it. The
+// rule it describes is what matters, and `lock_poisoned` is its only spelling.
 //
 // The rule was spelled inline at every site as
 // `.lock().unwrap_or_else(|e| e.into_inner())`, which meant the decision itself
@@ -17,6 +22,17 @@
 // their own comments for whatever is specific to them - which of two choices a
 // poisoned value means, for instance, in `unix_audio`'s error slot, where
 // recovering is the point precisely because "no error" would be a lie.
+//
+// Four sites deliberately do NOT come here, and they are the exceptions that
+// prove the rule rather than oversights: `platform/linux_impl.rs`'s injector
+// lock and `platform/unix_http.rs`'s three websocket socket locks each turn a
+// poison into an `Err`. Their data is not a string or a flag but a live
+// external handle - an X11 connection or a TCP socket - so a value written
+// under a panicked owner cannot be trusted to be a usable handle at all, and
+// the honest answer to the caller is "this send/type failed", not "carry on".
+// `stream.rs`'s captured-text slot uses `if let Ok(..)` for the third shape:
+// it is a best-effort diagnostic write whose failure must not end a session.
+// A fifth pattern would be a bug; these three are the whole menu.
 //
 // Deliberately NOT a `RwLock`/`Condvar` generalisation, and not a wrapper type:
 // the callers want the ordinary `MutexGuard` and its `Deref`, unchanged.

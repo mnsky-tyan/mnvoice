@@ -160,8 +160,13 @@ fn download_agent() -> Result<&'static ureq::Agent, String> {
 /// a JSON transcript or a release executable, and the two want different
 /// ceilings. See [`MAX_TRANSCRIPT_BYTES`] and
 /// [`MAX_ASSET_BYTES`](crate::platform::http::MAX_ASSET_BYTES).
+/// GET with an `Accept` header and a bounded body.
+///
+/// Module-private: `UnixTransport::get` is its only production caller (tests
+/// call it directly). Narrowing these three keeps this module's reachable
+/// surface to the trait the rest of the crate actually consumes.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
+fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
     ensure_tls_ready();
     match download_agent()?
         .get(url)
@@ -177,7 +182,7 @@ pub fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> 
 
 /// A POST with a raw body. `auth` is the full `Authorization` header value;
 /// the caller owns the scheme prefix.
-pub fn post(
+fn post(
     url: &str,
     auth: Option<&str>,
     content_type: &str,
@@ -203,7 +208,10 @@ pub fn post(
 /// only serializes the library calls, and neither call holds it across a
 /// network wait that the other side did not ask for - the socket carries a
 /// short read timeout, so a quiet provider releases the lock between polls.
-pub struct UnixSocket {
+///
+/// Private to this module: it leaves only as `Box<dyn WebSocket>` through
+/// `UnixTransport::websocket`, so no caller outside needs the concrete type.
+struct UnixSocket {
     socket: Arc<Mutex<WsRaw<MaybeTlsStream<TcpStream>>>>,
     /// The handle `close` terminates the connection through. The stream itself
     /// moves into the TLS wrapper, so shutting the socket down needs a second
@@ -220,12 +228,15 @@ pub struct UnixSocket {
 /// means "block forever" to the socket, not "return immediately".
 const READ_POLL_MS: u64 = 1;
 
-/// Open a WebSocket to `url`, sending `headers` on the handshake.
+/// Error text for a websocket mutex whose owner panicked mid-call.
 ///
-/// The TCP connection is made here rather than by `tungstenite::connect` so
-/// that timeouts can be put on the socket: `connect` leaves the connect and
-/// the handshake unbounded, and a host that resolves but never answers would
-/// hold the CLI forever.
+/// The one place in this module that treats a poison as a failure instead of
+/// recovering it (the reason is recorded in `locks.rs`), spelled once for its
+/// three send/read sites.
+fn socket_lock_poisoned() -> String {
+    "websocket lock poisoned".to_string()
+}
+
 /// Error text for the handful of socket options that must succeed before a
 /// WebSocket handshake can even start. They used to each spell an identical
 /// `format!("websocket socket setup failed ({e})")` closure - six copies that
@@ -235,7 +246,13 @@ fn socket_setup(e: std::io::Error) -> String {
     format!("websocket socket setup failed ({e})")
 }
 
-pub fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> {
+/// Open a WebSocket to `url`, sending `headers` on the handshake.
+///
+/// The TCP connection is made here rather than by `tungstenite::connect` so
+/// that timeouts can be put on the socket: `connect` leaves the connect and
+/// the handshake unbounded, and a host that resolves but never answers would
+/// hold the CLI forever.
+fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> {
     use tungstenite::client::IntoClientRequest;
 
     ensure_tls_ready();
@@ -407,7 +424,7 @@ impl WebSocket for UnixSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
         self.socket
             .lock()
-            .map_err(|_| "websocket lock poisoned".to_string())?
+            .map_err(|_| socket_lock_poisoned())?
             .send(Message::Binary(data.to_vec().into()))
             .map_err(|e| format!("websocket send failed ({e})"))
     }
@@ -415,7 +432,7 @@ impl WebSocket for UnixSocket {
     fn send_text(&self, text: &str) -> Result<(), String> {
         self.socket
             .lock()
-            .map_err(|_| "websocket lock poisoned".to_string())?
+            .map_err(|_| socket_lock_poisoned())?
             .send(Message::Text(text.to_owned().into()))
             .map_err(|e| format!("websocket send failed ({e})"))
     }
@@ -447,10 +464,7 @@ impl WebSocket for UnixSocket {
 
     fn read(&self) -> Result<Option<Vec<u8>>, String> {
         loop {
-            let mut ws = self
-                .socket
-                .lock()
-                .map_err(|_| "websocket lock poisoned".to_string())?;
+            let mut ws = self.socket.lock().map_err(|_| socket_lock_poisoned())?;
             match ws.read() {
                 Ok(Message::Binary(data)) => return Ok(Some(data.to_vec())),
                 Ok(Message::Text(text)) => return Ok(Some(text.as_str().as_bytes().to_vec())),
