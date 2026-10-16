@@ -3,6 +3,7 @@
 // auto-stops when silence is detected (or Esc stops).
 // A compact translucent glass orb with flowing fluid inside indicates status at the screen bottom.
 
+use crate::locks::lock_poisoned;
 use crate::audio;
 use crate::config;
 use crate::orb;
@@ -196,7 +197,7 @@ struct App {
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn log(msg: &str) {
-    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_poisoned(&LOG_LOCK);
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -898,7 +899,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     return LRESULT(0);
                 }
                 let cancelled = app.cancelled.load(Ordering::SeqCst);
-                let outcome = app.outcome.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let outcome = lock_poisoned(&app.outcome).take();
                 if let Some((ok, message)) = outcome {
                     let _ = UnregisterHotKey(hwnd, HOTKEY_ESC);
                     let _ = KillTimer(hwnd, TIMER_ORB);
@@ -1253,7 +1254,7 @@ fn worker(
         }
     };
 
-    *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+    *lock_poisoned(&outcome) = Some(result);
     let _ = unsafe { PostMessageW(hwnd, WM_APP_WORKER, WPARAM(session_id), LPARAM(0)) };
 }
 
@@ -1635,7 +1636,7 @@ fn quoted_exe(exe: &str) -> String {
 static AUTOSTART_LOCK: Mutex<()> = Mutex::new(());
 
 fn autostart_lock() -> MutexGuard<'static, ()> {
-    AUTOSTART_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_poisoned(&AUTOSTART_LOCK)
 }
 
 /// Move an older Run-key install onto the Task Scheduler, once, silently.
@@ -1775,6 +1776,22 @@ fn toggle_autostart() -> Result<(), String> {
     set_autostart_guarded(mutation, enable)
 }
 
+/// The delete half of the task's lifecycle arguments.
+///
+/// Third of three (`schtasks_query_args`, `schtasks_create_args`, this). The
+/// query and create lists are helpers with tests because their flags are
+/// behaviour-critical; the delete list was spelled inline, which made it the
+/// only one of the three that could lose its `/f` or mistype the task name
+/// without anything noticing. `/f` is load-bearing: without it the scheduler
+/// prompts for confirmation, and a prompt nobody answers is a toggle that
+/// never completes.
+fn schtasks_delete_args() -> Vec<String> {
+    ["delete", "/tn", AUTOSTART_TASK, "/f"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Result<(), String> {
     let _mutation = mutation;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -1783,7 +1800,7 @@ fn set_autostart_guarded(mutation: MutexGuard<'static, ()>, enable: bool) -> Res
     if enable {
         cmd.args(schtasks_create_args(&exe));
     } else {
-        cmd.args(["delete", "/tn", AUTOSTART_TASK, "/f"]);
+        cmd.args(schtasks_delete_args());
     }
     let status = cmd.status().map_err(|e| e.to_string())?;
     let in_place = if enable {
@@ -1973,7 +1990,11 @@ fn session_state() -> State {
 /// advisory, so the tip is dismissed on the next interaction either way.
 fn balloon(title: &str, body: &str) {
     unsafe {
-        let Ok(hwnd) = FindWindowW(w!("mnvoiceTrayClass"), w!("mnvoice")) else {
+        // The one pair of names every window on this app shares: a rename of
+        // either used to leave this call compiling and finding nothing, which
+        // silently stops every update balloon. The class name is also the
+        // documented external contract for driving the tray (see AGENTS.md).
+        let Ok(hwnd) = FindWindowW(CLASS_NAME, WINDOW_NAME) else {
             return;
         };
         let mut nid = tray_nid(hwnd, NIF_INFO | NIF_GUID);
@@ -1987,10 +2008,13 @@ fn balloon(title: &str, body: &str) {
 /// Relaunch this exe with the restart argument so a fresh instance takes over,
 /// then exit.
 fn relaunch_for_restart() {
+    // `update::spawn_restarted` is the one spelling of the handoff - the
+    // installer and the recovery helper use the same function, and this is the
+    // third site that used to copy the command out by hand. The tray ignores
+    // a failure here because it is quitting in the same breath; whatever the
+    // spawn reported, this process has already decided to leave.
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(&exe)
-            .arg(update::RESTART_ARG)
-            .spawn();
+        let _ = update::spawn_restarted(&exe);
     }
     unsafe { PostQuitMessage(0) };
 }
@@ -2097,6 +2121,22 @@ mod tests {
                 .and_then(|i| already.get(i + 1)),
             Some(&format!("\"{spaced}\"")),
             "an already-quoted path is not quoted twice"
+        );
+    }
+
+    #[test]
+    fn the_delete_arguments_are_the_task_and_a_forced_removal() {
+        // The third of the three lifecycle arg lists, and until now the only
+        // one with no test. `/f` matters: without it schtasks prompts for
+        // confirmation, and a prompt nobody answers hangs the toggle.
+        assert_eq!(
+            schtasks_delete_args(),
+            vec![
+                "delete".to_string(),
+                "/tn".to_string(),
+                AUTOSTART_TASK.to_string(),
+                "/f".to_string()
+            ]
         );
     }
 

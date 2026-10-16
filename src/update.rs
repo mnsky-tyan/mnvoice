@@ -171,17 +171,28 @@ fn asset_name_from_url(url: &str) -> Result<String, String> {
 /// against a file the action wrote - so a change to either side must find and
 /// re-justify the other. This comment is the pointer that makes that search
 /// possible.
+/// A 64-character hex SHA-256 digest, normalised for comparison, or None if
+/// the string is not one. Two gates used to spell this predicate identically -
+/// `expected_hash` (the published sums file) and `verify_staged_digest` (the
+/// helper's command line) both trim, lowercase and check `len() == 64` with
+/// `all(is_ascii_hexdigit)`. The accepted spelling of a digest is one rule, so
+/// it is one function; the two callers keep their own messages because they
+/// name different evidence.
+fn normalized_sha256_hex(s: &str) -> Option<String> {
+    let hash = s.trim().to_ascii_lowercase();
+    let is_hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hex.then_some(hash)
+}
+
 fn expected_hash(sums: &str, asset: &str) -> Result<String, String> {
     let sums = sums.strip_prefix('\u{feff}').unwrap_or(sums);
     for line in sums.lines() {
         let Some((hash, rest)) = line.trim().split_once(char::is_whitespace) else {
             continue;
         };
-        let hash = hash.trim().to_ascii_lowercase();
-        let is_hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
-        if !is_hex {
+        let Some(hash) = normalized_sha256_hex(hash) else {
             continue;
-        }
+        };
         let name = rest.trim().trim_start_matches('*').trim();
         if name == asset {
             return Ok(hash);
@@ -316,14 +327,13 @@ fn feed_tags(feed: &str) -> Vec<String> {
 
 /// The suffix this platform's release tags carry.
 ///
-/// Windows-only, because this whole module is `#[cfg(windows)]` (see `main.rs`).
-/// The Linux and macOS builds have no updater at all: nothing outside this
-/// module reads a release feed or replaces a binary, so a
-/// `#[cfg(target_os = "linux")]` definition here would never be built - the
-/// earlier pair of them were dead code kept "for symmetry" and removed.
-/// `platform::tag_parts` is the one place the three-way split actually lives,
-/// so a new platform is added there, not here.
-#[cfg(windows)]
+/// Not `#[cfg(windows)]`-gated even though this whole module is (see
+/// `main.rs`): the gate was inert (a function inside a Windows-only module
+/// cannot be built on another platform) and it disagreed with its only caller,
+/// `tag_is_ours`, which is ungated and reads `cfg!(windows)` to decide the
+/// bare-tag rule. One of the two gates had to go; this is the one that was
+/// doing nothing. `platform::tag_parts` remains the one place the three-way
+/// split actually lives, so a new platform is added there, not here.
 const fn platform_release_suffix() -> &'static str {
     "win"
 }
@@ -450,6 +460,19 @@ const HELPER_IMAGE_PREFIX: &str = "mnvoice-updater-";
 /// the swap, holding the read end of a pipe this process keeps open: if this
 /// process is killed between the two renames, that copy finishes the swap
 /// instead of leaving the install directory with no exe in it.
+/// Spawn this exe with the restart argument so a fresh instance takes over.
+///
+/// The one spelling of the handoff. Three sites used to copy it - the
+/// installer, the recovery helper, and the tray's own restart - differing only
+/// in what they do when the spawn fails (roll back, log and return, ignore).
+/// If the relaunch ever needs creation flags, an environment, or a different
+/// argument, all three must change together; `RESTART_ARG` is a shared const
+/// precisely because the two sides of this boundary are known to drift, and
+/// that const alone was not enough - the command shape was still copied.
+pub(crate) fn spawn_restarted(exe: &Path) -> std::io::Result<std::process::Child> {
+    Command::new(exe).arg(RESTART_ARG).spawn()
+}
+
 pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<(), String> {
     let url = &rel.exe_url;
     let version = &rel.version;
@@ -474,7 +497,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // this process has resolved the install either way.
     let mut helper = spawn_helper(&exe, &digest)?;
 
-    let old = match stage_and_swap(&bytes, &exe, &busy) {
+    let old = match stage_and_swap(&bytes, &exe, busy) {
         Ok(old) => old,
         Err(e) => {
             stop_helper(&mut helper);
@@ -485,7 +508,7 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     // --restart hands the hotkey and the single-instance mutex over cleanly, and
     // exiting here releases them from this side too - the new image takes this
     // exe's path, so the old process must not keep running the renamed one.
-    if let Err(e) = Command::new(&exe).arg(RESTART_ARG).spawn() {
+    if let Err(e) = spawn_restarted(&exe) {
         let _ = fs::rename(&old, &exe);
         stop_helper(&mut helper);
         return Err(format!("cannot start the new exe ({e})"));
@@ -608,7 +631,7 @@ pub fn finish_install(install: Option<&Path>, expected_digest: Option<&str>) {
     }
 
     // --restart hands the hotkey and the single-instance mutex over cleanly.
-    if let Err(e) = Command::new(exe).arg(RESTART_ARG).spawn() {
+    if let Err(e) = spawn_restarted(exe) {
         crate::windows_app::log(&format!("update helper: cannot start the new exe ({e})"));
         return;
     }
@@ -699,12 +722,13 @@ fn verify_staged(staged: &Path, expected: &[u8]) -> Result<(), String> {
 /// tampered or torn write cannot be left beside the exe for the next attempt -
 /// reached from a process that can be told the bytes' hash but not the bytes.
 fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<(), String> {
-    let expected = expected_digest
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let is_hex = expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit());
-    if !is_hex {
+    // The helper's digest arrives as text on a command line and may be absent,
+    // blank, wrong length or not hex; all of those are one question - "is this
+    // a usable digest?" - and `normalized_sha256_hex` is the single definition
+    // of the answer. The `else` branch keeps the caller's own evidence
+    // (`{expected_digest:?}`, untrimmed) because the message must show what the
+    // helper was actually handed, not what it was normalised to.
+    let Some(expected) = expected_digest.and_then(normalized_sha256_hex) else {
         // Taken away on this path too, not just on a digest mismatch: either way
         // the helper is refusing to install, and a staged file it refuses is one
         // the next attempt would trip over.
@@ -712,7 +736,7 @@ fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<
         return Err(format!(
             "the update helper was given no usable checksum for the staged exe ({expected_digest:?}); refusing to install"
         ));
-    }
+    };
     let on_disk = fs::read(staged).map_err(|e| format!("cannot re-read staged exe ({e})"))?;
     // Hashed once and reused for both the comparison and the message. This
     // function only re-hashes on the paths where the installer is being
@@ -731,7 +755,7 @@ fn verify_staged_digest(staged: &Path, expected_digest: Option<&str>) -> Result<
 
 /// Write the new image beside the running one, then move it over, but only if
 /// nothing started recording while the bytes were in flight.
-fn stage_and_swap(bytes: &[u8], exe: &Path, busy: &dyn Fn() -> bool) -> Result<PathBuf, String> {
+fn stage_and_swap(bytes: &[u8], exe: &Path, busy: impl Fn() -> bool) -> Result<PathBuf, String> {
     check_exe_payload(bytes)?;
     let staged = staged_path(exe);
     fs::write(&staged, bytes).map_err(|e| format!("cannot write staged exe ({e})"))?;
@@ -1798,7 +1822,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let env_before = fs::read(dir.join("mnvoice.env")).unwrap();
         let kw_before = fs::read(dir.join("keywords.txt")).unwrap();
         let bytes = http_get(&asset.url, "application/octet-stream").unwrap();
-        let aside = stage_and_swap(&bytes, &exe, &|| false).unwrap();
+        let aside = stage_and_swap(&bytes, &exe, || false).unwrap();
 
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
         assert_eq!(fs::read(&aside).unwrap(), installed_exe());
@@ -1848,7 +1872,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     #[test]
     fn the_new_image_takes_the_exe_path_and_the_running_one_moves_aside() {
         let (dir, exe) = install_folder("swap-ok");
-        let aside = stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap();
+        let aside = stage_and_swap(&downloaded_exe(), &exe, || false).unwrap();
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
         assert_eq!(fs::read(&aside).unwrap(), installed_exe());
         // The staged file is consumed, not left lying around.
@@ -1861,7 +1885,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         let (dir, exe) = install_folder("swap-config");
         let env_before = fs::read(dir.join("mnvoice.env")).unwrap();
         let kw_before = fs::read(dir.join("keywords.txt")).unwrap();
-        stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap();
+        stage_and_swap(&downloaded_exe(), &exe, || false).unwrap();
         assert_eq!(fs::read(dir.join("mnvoice.env")).unwrap(), env_before);
         assert_eq!(fs::read(dir.join("keywords.txt")).unwrap(), kw_before);
         let _ = fs::remove_dir_all(&dir);
@@ -1872,7 +1896,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // The gate read before the download started said Idle, so the only thing
         // protecting a transcript that begins mid-download is this second read.
         let (dir, exe) = install_folder("swap-busy");
-        let err = stage_and_swap(&downloaded_exe(), &exe, &|| {
+        let err = stage_and_swap(&downloaded_exe(), &exe, || {
             // It is read once the payload has landed, not before: the file it
             // decides the fate of is already on disk.
             assert!(dir.join("mnvoice.new").exists(), "gate read too early");
@@ -2082,7 +2106,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     fn a_payload_that_is_not_a_windows_exe_is_rejected_before_anything_is_written() {
         let (dir, exe) = install_folder("swap-not-exe");
         for bad in [vec![0u8; 16 * 1024], b"MZ".to_vec(), vec![b'P'; 16 * 1024]] {
-            let err = stage_and_swap(&bad, &exe, &|| false).unwrap_err();
+            let err = stage_and_swap(&bad, &exe, || false).unwrap_err();
             assert!(
                 err.contains("executable") || err.contains("implausibly small"),
                 "unexpected error: {err}"
@@ -2099,7 +2123,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // Something else already owns the .old slot, so the running image cannot
         // be moved aside.
         fs::create_dir_all(dir.join("mnvoice.exe.old")).unwrap();
-        let err = stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap_err();
+        let err = stage_and_swap(&downloaded_exe(), &exe, || false).unwrap_err();
         assert!(err.contains("move current exe aside"), "unexpected error: {err}");
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         // The install did not land, so the download is not left on disk either.
@@ -2221,7 +2245,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     fn a_staged_path_that_cannot_be_written_aborts_the_install() {
         let (dir, exe) = install_folder("swap-blocked-stage");
         fs::create_dir_all(dir.join("mnvoice.new")).unwrap();
-        let err = stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap_err();
+        let err = stage_and_swap(&downloaded_exe(), &exe, || false).unwrap_err();
         assert!(err.contains("cannot write staged exe"), "unexpected error: {err}");
         assert_eq!(fs::read(&exe).unwrap(), installed_exe());
         let _ = fs::remove_dir_all(&dir);
@@ -2267,7 +2291,7 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // populated, so there is nothing to finish: taking over an install its
         // parent already resolved is never the finisher's business.
         let (dir, exe) = install_folder("swap-landed");
-        stage_and_swap(&downloaded_exe(), &exe, &|| false).unwrap();
+        stage_and_swap(&downloaded_exe(), &exe, || false).unwrap();
         assert!(!swap_interrupted(&exe), "a completed install is not half-done");
         assert_eq!(fs::read(&exe).unwrap(), downloaded_exe());
         let _ = fs::remove_dir_all(&dir);
@@ -2290,11 +2314,13 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
     }
 
     fn write_stamp(path: &Path, secs_ago: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        fs::write(path, (now - secs_ago).to_string()).unwrap();
+        // `now_secs`, not a copy of the clock read: the production side stamps
+        // with that function's degenerate-clock semantics (0 for a pre-1970
+        // clock), and the plain `now - secs_ago` subtraction used here would
+        // have underflow-panicked a debug test build on exactly the clock the
+        // `a_pre_1970_clock_never_makes_the_updater_due` test exists to cover.
+        // `saturating_sub` matches `check_due`'s own arithmetic.
+        fs::write(path, now_secs().saturating_sub(secs_ago).to_string()).unwrap();
     }
 
     #[test]

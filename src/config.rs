@@ -1273,6 +1273,17 @@ mod tests {
     }
 
     #[test]
+    fn auth_value_passes_a_prefixed_scheme_through() {
+        // The rule lives here now that both call sites use `config::auth_value`
+        // directly: a key that already carries a scheme is passed through, so a
+        // user who pasted `Bearer sk-...` is not sent `Token Bearer sk-...`.
+        assert_eq!(auth_value("Bearer sk-x", "Token"), "Bearer sk-x");
+        assert_eq!(auth_value("Token xyz", "Bearer"), "Token xyz");
+        assert_eq!(auth_value("raw-key", "Token"), "Token raw-key");
+        assert_eq!(auth_value("raw-key", "Bearer"), "Bearer raw-key");
+    }
+
+    #[test]
     fn a_bad_number_is_an_error_naming_its_key() {
         // These used to be `if let Ok(n) = v.parse()` inside `set`: a typo kept
         // the default silently, so `MAX_SECONDS=12o` recorded 120 and nothing

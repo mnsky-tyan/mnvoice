@@ -21,6 +21,7 @@
 // Like the Windows transport, every call is stateless: open, complete, close.
 // A failed request cannot poison the next one.
 
+use crate::locks::lock_poisoned;
 use crate::platform::http::{Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, USER_AGENT};
 use std::io::Read as _;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
@@ -433,7 +434,7 @@ impl WebSocket for UnixSocket {
         // what every caller of this method needs. `stream.rs` uses the same
         // recovery for the state it must always be able to publish.
         {
-            let mut ws = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ws = lock_poisoned(&self.socket);
             let _ = ws.send(Message::Close(None));
             let _ = ws.flush();
         }
@@ -574,6 +575,56 @@ mod tests {
         final_thread.join().unwrap();
     }
 
+    /// Answer one WebSocket client's handshake on an accepted connection and
+    /// return the request head that was received.
+    ///
+    /// Three tests here each spelled out the same eighteen lines - read the
+    /// request, find `Sec-WebSocket-Key: `, derive the accept hash through the real
+    /// tungstenite function, write the 101 block - and `stalled_peer` had already
+    /// established the extract-the-server pattern this repo prefers. What is left
+    /// per test is only the behaviour AFTER the 101, which is the part each test
+    /// is actually about: going silent, stopping reading, or checking the
+    /// bracketed authority in the request head.
+    ///
+    /// Panics rather than returns on a malformed request: every caller is a test
+    /// whose client is `websocket()` itself, so a request without a key is a
+    /// regression in the code under test, not a condition to branch on.
+    fn answer_websocket_handshake(conn: &mut std::net::TcpStream) -> String {
+        let mut buf = [0u8; 4096];
+        let len = conn.read(&mut buf).unwrap();
+        let head = String::from_utf8_lossy(&buf[..len]).to_string();
+        let key = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+            .unwrap()
+            .trim()
+            .to_string();
+        let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+        conn.write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        head
+    }
+
+    /// Read from `conn` until the peer closes it, discarding everything. The two
+    /// tests whose clients send nothing further use this to keep the socket alive
+    /// without needing to look at bytes.
+    fn drain_until_closed(conn: &mut std::net::TcpStream) {
+        let mut sink = [0u8; 512];
+        while let Ok(n) = conn.read(&mut sink) {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
     /// `close` is the last thing the streaming loop does before it joins its
     /// reader thread, and the trait promises it shuts the connection down. A
     /// peer that completes the handshake and then goes silent leaves that
@@ -585,33 +636,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let len = conn.read(&mut buf).unwrap();
-            let key = String::from_utf8_lossy(&buf[..len])
-                .lines()
-                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
-                .unwrap()
-                .trim()
-                .to_string();
-            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-            conn.write_all(
-                format!(
-                    "HTTP/1.1 101 Switching Protocols\r\n\
-                     Upgrade: websocket\r\n\
-                     Connection: Upgrade\r\n\
-                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .unwrap();
+            answer_websocket_handshake(&mut conn);
             // The provider has answered the handshake and now says nothing
             // more: the connection stays open until the client goes away.
-            let mut sink = [0u8; 512];
-            while let Ok(n) = conn.read(&mut sink) {
-                if n == 0 {
-                    break;
-                }
-            }
+            drain_until_closed(&mut conn);
         });
 
         let socket = Arc::new(websocket(&format!("ws://{addr}/"), &[]).unwrap());
@@ -653,25 +681,7 @@ mod tests {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let len = conn.read(&mut buf).unwrap();
-            let key = String::from_utf8_lossy(&buf[..len])
-                .lines()
-                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
-                .unwrap()
-                .trim()
-                .to_string();
-            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-            conn.write_all(
-                format!(
-                    "HTTP/1.1 101 Switching Protocols\r\n\
-                     Upgrade: websocket\r\n\
-                     Connection: Upgrade\r\n\
-                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .unwrap();
+            answer_websocket_handshake(&mut conn);
             let _ = stop_rx.recv();
         });
         (format!("ws://{addr}/"), stop_tx, server)
@@ -779,15 +789,7 @@ mod tests {
         let port = addr.port();
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let len = conn.read(&mut buf).unwrap();
-            let head = String::from_utf8_lossy(&buf[..len]).to_string();
-            let key = head
-                .lines()
-                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
-                .unwrap()
-                .trim()
-                .to_string();
+            let head = answer_websocket_handshake(&mut conn);
             // The request line must carry the bracketed authority, because
             // that is what a URI requires; the connector is what has to strip.
             assert!(
@@ -798,23 +800,7 @@ mod tests {
                 head.contains(&format!("Host: [::1]:{port}")),
                 "the Host header lost its brackets: {head}"
             );
-            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-            conn.write_all(
-                format!(
-                    "HTTP/1.1 101 Switching Protocols\r\n\
-                     Upgrade: websocket\r\n\
-                     Connection: Upgrade\r\n\
-                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-            let mut sink = [0u8; 512];
-            while let Ok(n) = conn.read(&mut sink) {
-                if n == 0 {
-                    break;
-                }
-            }
+            drain_until_closed(&mut conn);
         });
 
         let socket = websocket(&format!("ws://[::1]:{port}/"), &[]);

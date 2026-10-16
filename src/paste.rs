@@ -16,32 +16,31 @@ pub fn type_text(text: &str) -> Result<(), String> {
 
     unsafe {
         for &ch in &utf16 {
-            let inputs = [
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: ch,
-                            dwFlags: KEYEVENTF_UNICODE,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
+            // One INPUT built per role, two events per character. The key-up
+            // entry used to be spelled out in full beside the key-down one -
+            // identical in every field except `dwFlags`, so the layout was
+            // written twice per iteration and a change to wVk or time had to
+            // land in both copies to keep the pair honest.
+            let down = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: ch,
+                        dwFlags: KEYEVENTF_UNICODE,
+                        time: 0,
+                        dwExtraInfo: 0,
                     },
                 },
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: ch,
-                            dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-            ];
+            };
+            // `INPUT` is `Copy`/`Clone` (windows-rs derives both); this copies
+            // the key-down event and flips the one field that differs. The
+            // field write happens inside this function's `unsafe` block: the
+            // anonymous union member is only valid to touch because `down` was
+            // built through the same `ki` variant.
+            let mut up = down.clone();
+            up.Anonymous.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+            let inputs = [down, up];
             let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
             if sent != inputs.len() as u32 {
                 return Err(format!(

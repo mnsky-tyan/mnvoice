@@ -15,9 +15,12 @@ const ORB_WIDTH: i32 = 48;
 const ORB_HEIGHT: i32 = 48;
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
 
-const ORB_CX: f32 = 24.0;
-const ORB_CY: f32 = 24.0;
-const ORB_RADIUS: f32 = 18.0;
+const ORB_CX: f32 = ORB_WIDTH as f32 / 2.0;
+const ORB_CY: f32 = ORB_HEIGHT as f32 / 2.0;
+/// The sphere's radius as three quarters of the half-extent, so resizing the
+/// window scales the sphere instead of leaving it floating at a stale pixel
+/// radius (they used to be independent literals: `24.0`/`24.0`/`18.0`).
+const ORB_RADIUS: f32 = ORB_CX * 0.75;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OrbState {
@@ -40,7 +43,18 @@ pub struct Orb {
     pos: (i32, i32),
 }
 
-unsafe extern "system" fn orb_wndproc(
+/// The orb's window class needs no message handling of its own - every
+/// message goes straight to `DefWindowProcW` - but the registration demands a
+/// procedure, so this is a one-call forwarder.
+///
+/// Bare `extern "system" fn` with an `unsafe` block at the call, the same shape
+/// `windows_app.rs`'s `wndproc` uses. Both can be that shape because `WNDPROC`
+/// is `Option<unsafe extern "system" fn(..)>` and a safe `fn` coerces into it -
+/// the windows crate does not require `unsafe` on the declaration. The two
+/// procedures used to be declared differently (`unsafe extern` here, bare
+/// there), which told a reader nothing about which form the crate demands, so
+/// they match now.
+extern "system" fn orb_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -226,10 +240,9 @@ impl Orb {
         let total_pixels = (ORB_WIDTH * ORB_HEIGHT) as usize;
         let buf = unsafe { std::slice::from_raw_parts_mut(self.bits, total_pixels) };
 
-        match self.state {
-            OrbState::Recording => render_gas_fluid(self.frame, buf, false, self.color, self.fluid_level),
-            OrbState::Transcribing => render_gas_fluid(self.frame, buf, true, self.color, self.fluid_level),
-        }
+        // Both states render; which one differs only in the drift speed, and
+        // `render_gas_fluid` decides that from the state itself.
+        render_gas_fluid(self.frame, buf, self.state, self.color, self.fluid_level);
 
         unsafe {
             let (pos_x, pos_y) = self.pos;
@@ -338,7 +351,7 @@ struct Rgba {
 
 #[inline]
 fn add_light(acc: &mut Rgba, r: f32, g: f32, b: f32, intensity: f32) {
-    if intensity <= 0.002 {
+    if intensity <= LIGHT_EPSILON {
         return;
     }
     let int_c = intensity.clamp(0.0, 1.0);
@@ -351,7 +364,7 @@ fn add_light(acc: &mut Rgba, r: f32, g: f32, b: f32, intensity: f32) {
 #[inline]
 fn pack_premul(c: Rgba) -> u32 {
     let a_c = c.a.clamp(0.0, 1.0);
-    if a_c <= 0.002 {
+    if a_c <= LIGHT_EPSILON {
         return 0;
     }
     let a_byte = (a_c * 255.0 + 0.5) as u32;
@@ -361,17 +374,36 @@ fn pack_premul(c: Rgba) -> u32 {
     (a_byte << 24) | (r_byte << 16) | (g_byte << 8) | b_byte
 }
 
+/// Below this a light contributes nothing, in either of the two places the
+/// renderer asks that question: `add_light`'s early-out on the requested
+/// intensity, and `pack_premul`'s early-out on the accumulated alpha. The rule
+/// is one, so the number is one constant - bumping it in only one of the two
+/// sites would silently discard contributions after accumulation instead of
+/// before it, with no compile signal either way.
+const LIGHT_EPSILON: f32 = 0.002;
+
+/// Which way the nebula drifts. Recording breathes slowly; the post-stop
+/// "thinking" state breathes faster, which is the only visual difference
+/// between the two states. Passed as the state rather than a flattened bool so
+/// neither end of the call has to remember which way `true` pointed.
+fn fluid_speed(state: OrbState) -> f32 {
+    match state {
+        OrbState::Recording => 0.038,
+        OrbState::Transcribing => 0.065,
+    }
+}
+
 /// Render the 48px translucent glass sphere with its floating zero-gravity gas-fluid nebula inside.
 fn render_gas_fluid(
     frame: u32,
     buf: &mut [u32],
-    is_loading: bool,
+    state: OrbState,
     color: (f32, f32, f32),
     fluid_level: f32,
 ) {
     let (base_r, base_g, base_b) = color;
     let fluid_mult = fluid_level.clamp(0.05, 1.0);
-    let speed = if is_loading { 0.065 } else { 0.038 };
+    let speed = fluid_speed(state);
     let t = frame as f32 * speed;
     let cx = ORB_CX;
     let cy = ORB_CY;
@@ -504,7 +536,7 @@ mod tests {
         render_gas_fluid(
             10,
             &mut buf,
-            false,
+            OrbState::Recording,
             crate::config::DEFAULT_ORB_COLOR,
             crate::config::DEFAULT_ORB_FLUID_LEVEL,
         );
@@ -531,7 +563,7 @@ mod tests {
         render_gas_fluid(
             10,
             &mut buf,
-            false,
+            OrbState::Recording,
             crate::config::DEFAULT_ORB_COLOR,
             crate::config::DEFAULT_ORB_FLUID_LEVEL,
         );
@@ -545,7 +577,7 @@ mod tests {
         render_gas_fluid(
             10,
             &mut buf,
-            true,
+            OrbState::Transcribing,
             crate::config::DEFAULT_ORB_COLOR,
             crate::config::DEFAULT_ORB_FLUID_LEVEL,
         );

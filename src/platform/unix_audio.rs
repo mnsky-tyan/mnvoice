@@ -24,6 +24,7 @@
 //     provider rate, run the silence detector, feed the transcriber. A slow
 //     transcriber consumer can never make the callback overrun.
 
+use crate::locks::lock_poisoned;
 use crate::platform::audio::{
     resample_linear, resample_step, rms_of, Audio, SilenceWindows, I16_SCALE,
 };
@@ -109,7 +110,7 @@ fn run_session(
         // Poisoning is recovered, not treated as "no error": dropping the
         // message here is what made a mid-session unplug look like a clean
         // stop, which is the exact failure this slot exists to prevent.
-        let mut slot = err_slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = lock_poisoned(&err_slot);
         // First error wins: the first is the cause, later ones are noise.
         if slot.is_none() {
             *slot = Some(format!("audio stream error: {e}"));
@@ -119,7 +120,7 @@ fn run_session(
     let push = move |data: &[f32]| {
         // Recovered rather than skipped: silently dropping frames here ends the
         // session as "no speech detected" when the device is what stopped.
-        let mut buf = cb_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = lock_poisoned(&cb_buffer);
         buf.extend_from_slice(data);
     };
 
@@ -171,7 +172,7 @@ fn run_session(
         // A device that failed mid-session stops delivering frames; report it
         // as the error it is rather than as a silent, successful timeout.
         {
-            let slot = stream_error.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = lock_poisoned(&stream_error);
             if let Some(e) = slot.as_ref() {
                 return Err(e.clone());
             }
@@ -226,7 +227,7 @@ fn run_session(
     // the drop left a residual window where a failure that landed exactly
     // here was swallowed and a clean Ok returned.
     drop(stream);
-    let slot = stream_error.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = lock_poisoned(&stream_error);
     if let Some(e) = slot.as_ref() {
         return Err(e.clone());
     }
@@ -243,7 +244,7 @@ fn run_session(
 /// `GetBuffer` reports a whole number of frames: the two agree that a partial
 /// frame must not be dropped, and only this side can actually produce one.
 fn take_frames(buffer: &Arc<Mutex<Vec<f32>>>, channels: usize) -> Vec<f32> {
-    let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut buf = lock_poisoned(&buffer);
     // Only whole frames leave the buffer, so what stays is by construction a
     // partial one.
     let whole = buf.len() / channels * channels;
@@ -283,7 +284,7 @@ mod tests {
             "two whole frames should have been mixed down"
         );
         assert_eq!(
-            buffer.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
+            lock_poisoned(&buffer).as_slice(),
             [0.25],
             "the leftover sample must stay for the next tick"
         );
