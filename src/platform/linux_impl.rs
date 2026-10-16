@@ -13,9 +13,6 @@
 use crate::platform::input::Injector;
 use enigo::{Enigo, Keyboard, Settings};
 use std::sync::Mutex;
-use std::thread;
-
-use crate::platform::input::KEY_GAP;
 
 /// Text injection through XTest. X11 and XWayland windows receive the keys; a
 /// native Wayland window receives nothing, and nothing here can detect that.
@@ -51,21 +48,21 @@ impl Injector for X11Injector {
         }
         // enigo already posts one event per character here: its x11rb backend
         // has no fast text entry, so `text` falls back to one key event per
-        // character. What it cannot be asked for is the gap, so the characters
-        // are handed to it one at a time to add the pacing the injector
-        // contract in `crate::platform::input` requires - the 2 ms the Windows
-        // engine sleeps in `crate::paste` is the reference value.
-        for c in text.chars() {
+        // character. What it cannot be asked for is the gap, so the pacing
+        // (one character per event, `KEY_GAP` after each) comes from
+        // `input::type_paced`, the contract's single owner - the 2 ms the
+        // Windows engine sleeps in `crate::paste` is the reference value.
+        // On failure the connection is no longer usable, so it is dropped and
+        // the next commit opens a fresh one instead of failing for the rest of
+        // the session; the pacer stops at the first error either way.
+        crate::platform::input::type_paced(text, |c| {
             let outcome = slot.as_mut().expect("populated above").text(&c.to_string());
             if let Err(e) = outcome {
-                // The connection is no longer usable, so it is dropped and the
-                // next commit opens a fresh one instead of failing for the rest
-                // of the session.
+                // The borrow above has ended by here, so the slot can be cleared.
                 *slot = None;
                 return Err(format!("text injection failed ({e})"));
             }
-            thread::sleep(KEY_GAP);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }

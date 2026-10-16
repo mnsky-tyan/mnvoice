@@ -42,12 +42,6 @@ pub struct CpalAudio;
 /// the loop actually waited.
 const TICK_MS: u64 = 20;
 
-impl CpalAudio {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self)
-    }
-}
-
 impl Audio for CpalAudio {
     fn capture_to_channel(
         &self,
@@ -92,7 +86,14 @@ fn run_session(
     // built-in input's nominal rate, is not) has to be resampled rather than
     // decimated, or the provider is told 16 kHz and handed audio running at
     // some other rate entirely.
-    let resample_step = resample_step(in_rate as u32);
+    //
+    // Named `step`, not `resample_step`: the old binding shadowed the imported
+    // function of the same name for the rest of the scope, so `resample_step`
+    // below the initializer meant the local and above it meant the function -
+    // legal, but a reader cannot tell which without counting lines. The rate
+    // needs no cast: `sample_rate().0` is already a `u32`, the argument
+    // `resample_step` takes, and the old `in_rate as u32` did nothing.
+    let step = resample_step(in_rate);
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -193,7 +194,7 @@ fn run_session(
             break;
         }
 
-        let chunk = resample_linear(&mono, resample_step);
+        let chunk = resample_linear(&mono, step);
 
         // The silence detector reads the same window that goes downstream,
         // so it runs before the hand-off (sending moves the chunk).

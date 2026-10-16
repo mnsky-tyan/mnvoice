@@ -14,7 +14,6 @@
 use crate::platform::input::Injector;
 use enigo::{Enigo, Keyboard, Settings};
 use std::cell::RefCell;
-use std::thread;
 
 // Whether this process may post synthetic keyboard events at all.
 //
@@ -39,8 +38,6 @@ thread_local! {
     static ENIGO: RefCell<Option<Enigo>> = RefCell::new(None);
 }
 
-use crate::platform::input::KEY_GAP;
-
 /// Text injection through CoreGraphics events, gated by the Accessibility
 /// permission.
 pub fn default_injector() -> &'static dyn Injector {
@@ -63,8 +60,12 @@ impl Injector for CgInjector {
         // One event per character, the contract every backend keeps: the
         // Windows engine sends a KEYEVENTF_UNICODE pair per character with a
         // 2 ms gap, while enigo's `text` batches up to twenty characters into
-        // a single CGEvent, so each character is handed to it on its own.
-        for c in text.chars() {
+        // a single CGEvent. The pacing (one character per event, `KEY_GAP`
+        // after each) comes from `input::type_paced`, the contract's single
+        // owner, so this and the Linux backend cannot drift on the gap.
+        // On failure the event source is dropped so the next commit rebuilds
+        // it; the pacer stops at the first error either way.
+        crate::platform::input::type_paced(text, |c| {
             let outcome = ENIGO.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 if slot.is_none() {
@@ -79,14 +80,10 @@ impl Injector for CgInjector {
                     .map_err(|e| format!("text injection failed ({e})"))
             });
             if let Err(e) = outcome {
-                // The event source is no longer usable, so it is dropped and
-                // the next commit opens a fresh one instead of failing for the
-                // rest of the session.
                 ENIGO.with(|slot| *slot.borrow_mut() = None);
                 return Err(e);
             }
-            thread::sleep(KEY_GAP);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }

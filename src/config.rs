@@ -116,6 +116,13 @@ fn derive(raw: RawFields) -> Result<Config, String> {
     if raw.api_key.trim().is_empty() {
         return Err("No API key configured. Set API_KEY in mnvoice.env next to the mnvoice binary.".into());
     }
+    // Stored trimmed, like the model, base URL and language below. `auth_value`
+    // interpolates this string into the Authorization header verbatim, so an
+    // environment value like `API_KEY='tok '` used to go out as `Token tok `
+    // and the provider rejected it with no local hint about the space. The
+    // empty check above already trimmed; keeping the trimmed value is what
+    // makes the check and the wire agree.
+    let api_key = raw.api_key.trim().to_string();
 
     let mut model = raw.model.trim().to_string();
     if model.is_empty() {
@@ -180,13 +187,26 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         "1" | "true" | "on" | "yes" | "keep"
     );
 
+    // The three numeric fields, parsed here rather than in `set` so one bad
+    // spelling is a config error naming its own key instead of a silent
+    // default. Ranges: a zero MAX_SECONDS is refused because its only effect
+    // is a deadline that already passed - the session returns Ok(()) with no
+    // audio and no transcript, which no reading of "120" could intend. The two
+    // VAD bounds keep zero deliberately: `silence_expired` documents 0 as
+    // "stop on the first silent tick", and an RMS threshold of 0 makes every
+    // tick count as speech, i.e. never stop for silence - both are coherent
+    // requests, not typos.
+    let max_seconds = parse_positive_num("MAX_SECONDS", &raw.max_seconds)?;
+    let vad_silence_ms = parse_u32_num("VAD_SILENCE_MS", &raw.vad_silence_ms)?;
+    let vad_rms_threshold = parse_num("VAD_RMS_THRESHOLD", &raw.vad_rms_threshold)?;
+
     Ok(Config {
         protocol,
-        api_key: raw.api_key,
+        api_key,
         model,
         language,
         base_url,
-        max_seconds: raw.max_seconds,
+        max_seconds,
         trailing_space: raw.trailing_space,
         keywords: raw.keywords,
         orb_color,
@@ -195,8 +215,8 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         hotkey_str: hotkey_actual_str,
         cancel_key,
         cancel_key_str: cancel_actual_str,
-        vad_silence_ms: raw.vad_silence_ms,
-        vad_rms_threshold: raw.vad_rms_threshold,
+        vad_silence_ms,
+        vad_rms_threshold,
         strip_fillers,
     })
 }
@@ -288,14 +308,66 @@ pub fn parse_auto_update(s: &str) -> bool {
     matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
 
+/// One numeric config value, or an error naming the key and the bad text.
+fn parse_num(key: &str, v: &str) -> Result<f64, String> {
+    v.trim().parse::<f64>().map_err(|_| {
+        format!("{key} is not a number: {v:?}")
+    })
+}
+
+/// A non-negative integer field (`VAD_SILENCE_MS`); `f64` first so "3000.5"
+/// and "3000x" both fail loudly rather than half-parsing.
+fn parse_u32_num(key: &str, v: &str) -> Result<u32, String> {
+    let f = parse_num(key, v)?;
+    if f < 0.0 || f != f.trunc() || f > u32::MAX as f64 {
+        return Err(format!("{key} must be a whole number >= 0: {v:?}"));
+    }
+    Ok(f as u32)
+}
+
+/// `MAX_SECONDS`, which additionally may not be 0 (see `derive`).
+fn parse_positive_num(key: &str, v: &str) -> Result<u32, String> {
+    let n = parse_u32_num(key, v)?;
+    if n == 0 {
+        return Err(format!("{key} must be at least 1 second (0 would end every session before it captured anything): {v:?}"));
+    }
+    Ok(n)
+}
+
+/// The line prelude both file formats share: a UTF-8 BOM has to come off
+/// before the first line is parsed, not after - `lines()` does not treat it as
+/// whitespace, so `trim()` leaves it attached and the first key becomes
+/// `\u{feff}API_KEY` instead of `API_KEY`, or the first keyword becomes
+/// `\u{feff}kubernetes` and goes on the wire as `%EF%BB%BFkubernetes` boosting
+/// nothing. That key then misses the field it would have filled and is reported
+/// as missing, so a file edited in Windows Notepad looks corrupted when it is
+/// not. The checksum-file parser in `update.rs` strips it for the same reason: a
+/// file format has to be total with respect to what an editor on this platform
+/// actually writes. Lines are then trimmed, and blank or `#`-comment lines are
+/// dropped.
+///
+/// `load` feeds three keyword files and the env file through the same two
+/// shapes, so the BOM rule lives in one function instead of two copy-pasted
+/// preludes that a third caller would have to re-derive.
+fn config_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// One matched quote pair, if `v` is wholly wrapped in one. Returns the content
+/// between the quotes; an unmatched or absent pair returns None so the caller
+/// treats the text as data (the rule `only_one_matched_quote_pair_is_stripped`
+/// pins: never every leading and trailing quote character, just the one pair).
+fn strip_quote_pair(v: &str) -> Option<&str> {
+    v.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+}
+
 pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
-    // The same BOM that `parse` strips: `load` feeds keywords.txt,
-    // vocabulary.txt and words.txt straight through here, so a file saved by
-    // Windows Notepad would otherwise read its first keyword as
-    // `\u{feff}kubernetes`. That keyword is kept as a distinct word and goes on
-    // the wire as `%EF%BB%BFkubernetes`, boosting nothing and reporting no
-    // error anywhere.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     // A lowercase index beside the vector, so de-duplication does not have to
     // re-scan every word already collected for every new one. The dedup is
     // case-insensitive by contract, so the key is the lowercase form and the
@@ -307,9 +379,7 @@ pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
         .iter()
         .map(|k| k.to_lowercase())
         .collect();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+    for line in config_lines(text) {
         for part in line.split(',') {
             let word = part.trim();
             if word.is_empty() {
@@ -323,38 +393,32 @@ pub fn parse_keywords_text(text: &str, keywords: &mut Vec<String>) {
 }
 
 fn parse<F: FnMut(&str, &str)>(text: &str, mut f: F) {
-    // A UTF-8 BOM has to come off before the first line is parsed, not after:
-    // `lines()` does not treat it as whitespace, so `trim()` leaves it attached
-    // and the first key becomes `\u{feff}API_KEY` instead of `API_KEY`. That key
-    // then misses the field it would have filled and is reported as missing, so
-    // a file edited in Windows Notepad looks corrupted when it is not. The
-    // checksum-file parser in `update.rs` strips it for the same reason: a file
-    // format has to be total with respect to what an editor on this platform
-    // actually writes.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+    for line in config_lines(text) {
         if let Some((k, v)) = line.split_once('=') {
-            // A trailing comment is only a comment when whitespace separates it
-            // from the value: `MODEL=nova-3  # my model` used to yield the
-            // literal string `nova-3  # my model`, which then went onto the
-            // wire verbatim. A `#` inside a value with no space before it
-            // (a fragment in a URL) is left alone.
-            let v = match v.find(" #").or_else(|| v.find("\t#")) {
-                Some(i) => &v[..i],
-                None => v,
-            };
-            // Strip one matched quote pair rather than every leading and
-            // trailing quote character: `trim_matches('"')` also rewrites a
-            // value that legitimately begins or ends with one.
-            let v = v.trim();
-            let v = v
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(v);
             let k = k.trim();
+            // Quote first, comment second, but only for values that are NOT
+            // wholly quoted. The previous order (comment scan before quote
+            // strip) let the comment rule reach inside a quoted value:
+            // `KEYWORDS="k8s #cluster"` was cut at the ` #` and then failed the
+            // quote match, so the user got a lone leading quote plus a missing
+            // word. Quoting a value is exactly the request that its content not
+            // be reinterpreted, so a wrapped value is now taken verbatim.
+            // An unquoted value keeps every previous rule: the comment must be
+            // whitespace-separated (`MODEL=nova-3  # my model` drops the
+            // comment; a `#` in a URL fragment stays), and quotes are stripped
+            // after the comment is removed so `KEY="a" # c` still yields `a`.
+            let v = v.trim();
+            let v = match strip_quote_pair(v) {
+                Some(inner) => inner,
+                None => {
+                    let v = match v.find(" #").or_else(|| v.find("\t#")) {
+                        Some(i) => &v[..i],
+                        None => v,
+                    };
+                    let v = v.trim();
+                    strip_quote_pair(v).unwrap_or(v)
+                }
+            };
             // An empty key names no field; `f` filters on the FIELDS list so
             // this is inert today, but rejecting it here means a malformed line
             // is a parse decision rather than an accident of a later filter.
@@ -438,15 +502,22 @@ struct RawFields {
     model: String,
     language: String,
     base_url: String,
-    max_seconds: u32,
+    // The numeric fields are kept as the text the user wrote, not parsed on
+    // arrival. `set` cannot return an error - the file pass and the env pass
+    // both feed it, and an error there would mean abandoning the ordering the
+    // module depends on - so the parse and its range checks happen once, in
+    // `derive`, which is already the function that reports a bad config. They
+    // used to parse in the arm with `if let Ok(n)`, which made a typo silently
+    // keep the default: `MAX_SECONDS=12o` read as 120 and nothing ever said so.
+    max_seconds: String,
     trailing_space: bool,
     keywords: Vec<String>,
     orb_color_str: String,
     orb_fluid_str: String,
     hotkey_str: String,
     cancel_key_str: String,
-    vad_silence_ms: u32,
-    vad_rms_threshold: f64,
+    vad_silence_ms: String,
+    vad_rms_threshold: String,
     filler_words_str: String,
 }
 
@@ -458,15 +529,15 @@ impl RawFields {
             model: String::new(),
             language: String::new(),
             base_url: String::new(),
-            max_seconds: DEFAULT_MAX_SECONDS,
+            max_seconds: DEFAULT_MAX_SECONDS.to_string(),
             trailing_space: true,
             keywords: Vec::new(),
             orb_color_str: String::new(),
             orb_fluid_str: String::new(),
             hotkey_str: String::new(),
             cancel_key_str: String::new(),
-            vad_silence_ms: DEFAULT_VAD_SILENCE_MS,
-            vad_rms_threshold: DEFAULT_VAD_RMS_THRESHOLD,
+            vad_silence_ms: DEFAULT_VAD_SILENCE_MS.to_string(),
+            vad_rms_threshold: DEFAULT_VAD_RMS_THRESHOLD.to_string(),
             filler_words_str: String::new(),
         }
     }
@@ -514,11 +585,7 @@ impl RawFields {
             Field::Hotkey => self.hotkey_str = v.to_string(),
             Field::CancelKey => self.cancel_key_str = v.to_string(),
             Field::FillerWords => self.filler_words_str = v.to_string(),
-            Field::MaxSeconds => {
-                if let Ok(n) = v.parse() {
-                    self.max_seconds = n;
-                }
-            }
+            Field::MaxSeconds => self.max_seconds = v.to_string(),
             // Deliberately the one key where an unknown spelling keeps the
             // default on: TRAILING_SPACE defaults to enabled, and treating a
             // typo as "off" would let `TRAILING_SPACE=flase` silently strip
@@ -531,16 +598,8 @@ impl RawFields {
             // other fields already refuse to treat as off.
             Field::TrailingSpace => self.trailing_space = v.trim() != "0",
             Field::Keywords => parse_keywords_text(v, &mut self.keywords),
-            Field::VadSilenceMs => {
-                if let Ok(n) = v.parse() {
-                    self.vad_silence_ms = n;
-                }
-            }
-            Field::VadRmsThreshold => {
-                if let Ok(n) = v.parse() {
-                    self.vad_rms_threshold = n;
-                }
-            }
+            Field::VadSilenceMs => self.vad_silence_ms = v.to_string(),
+            Field::VadRmsThreshold => self.vad_rms_threshold = v.to_string(),
         }
     }
 }
@@ -693,6 +752,30 @@ pub const DEFAULT_HOTKEY_MOD: u32 = 0x0001 | 0x4000; // MOD_ALT | MOD_NOREPEAT
 pub const DEFAULT_HOTKEY_VK: u32 = 0x20; // VK_SPACE
 pub const DEFAULT_HOTKEY_STR: &str = "Alt+Space";
 
+/// The virtual key for the two parts `parse_hotkey`'s table cannot name
+/// directly: an F-number (`f13`, 1..=24) or a single alphanumeric character
+/// (`d` -> `D`). These used to be nested inline in the match arm, four and five
+/// levels deep, which made the arm's `other =>` read like a maze; as a function
+/// each rule is one flat branch.
+///
+/// Anything else returns None, and the caller leaves `vk` at whatever an
+/// earlier part set - the same behaviour as before the extraction.
+fn key_vk(part: &str) -> Option<u32> {
+    if let Some(f_num) = part.strip_prefix('f') {
+        let num = f_num.parse::<u32>().ok()?;
+        if (1..=24).contains(&num) {
+            return Some(0x70 + (num - 1)); // VK_F1 = 0x70
+        }
+        return None;
+    }
+    let mut chars = part.chars();
+    let ch = chars.next()?.to_ascii_uppercase();
+    if chars.next().is_none() && ch.is_ascii_alphanumeric() {
+        return Some(ch as u32);
+    }
+    None
+}
+
 /// Parses a hotkey string like "Alt+Space", "Ctrl+Shift+D", "Win+Space", "F8", "Escape" into (modifiers, vk).
 pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     let s = s.trim();
@@ -723,17 +806,8 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
             "pageup" | "pgup" => vk = 0x21,
             "pagedown" | "pgdn" => vk = 0x22,
             other => {
-                if let Some(f_num) = other.strip_prefix('f') {
-                    if let Ok(num) = f_num.parse::<u32>() {
-                        if (1..=24).contains(&num) {
-                            vk = 0x70 + (num - 1); // VK_F1 = 0x70
-                        }
-                    }
-                } else if other.len() == 1 {
-                    let ch = other.chars().next().unwrap().to_ascii_uppercase();
-                    if ch.is_ascii_alphanumeric() {
-                        vk = ch as u32;
-                    }
+                if let Some(v) = key_vk(other) {
+                    vk = v;
                 }
             }
         }
@@ -1180,5 +1254,71 @@ mod tests {
             !cfg.trailing_space,
             "a whitespace-padded 0 is the 0 the user typed"
         );
+    }
+
+    #[test]
+    fn the_stored_api_key_is_trimmed() {
+        // The empty check trims, and `auth_value` interpolates the stored value
+        // straight into the Authorization header. The two used to disagree: an
+        // env-style padded key passed the check and went out as `Token tok `.
+        let mut raw = RawFields::new();
+        raw.set(Field::ApiKey, "", " padded-key ", false);
+        let cfg = derive(raw).expect("a padded key is a key");
+        assert_eq!(cfg.api_key, "padded-key");
+        assert_eq!(
+            super::auth_value(&cfg.api_key, "Token"),
+            "Token padded-key",
+            "the header value carries no stray space"
+        );
+    }
+
+    #[test]
+    fn a_bad_number_is_an_error_naming_its_key() {
+        // These used to be `if let Ok(n) = v.parse()` inside `set`: a typo kept
+        // the default silently, so `MAX_SECONDS=12o` recorded 120 and nothing
+        // ever reported it.
+        let err = |text: &str| {
+            let mut raw = RawFields::new();
+            parse(text, |k, v| {
+                if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
+                    raw.set(*field, k, v, true);
+                }
+            });
+            derive(raw).err().unwrap_or_else(|| "no error raised".into())
+        };
+        assert!(err("API_KEY=k\nMAX_SECONDS=12o").contains("MAX_SECONDS"));
+        assert!(err("API_KEY=k\nVAD_SILENCE_MS=abc").contains("VAD_SILENCE_MS"));
+        assert!(err("API_KEY=k\nVAD_RMS_THRESHOLD=4OO").contains("VAD_RMS_THRESHOLD"));
+        // 0 ends the session before it captures anything: refused.
+        assert!(err("API_KEY=k\nMAX_SECONDS=0").contains("MAX_SECONDS"));
+        // A non-whole VAD_SILENCE_MS is as loud as a non-number.
+        assert!(err("API_KEY=k\nVAD_SILENCE_MS=3000.5").contains("VAD_SILENCE_MS"));
+        // The two VAD zeroes stay legal (documented "always"/"first tick" meanings).
+        let cfg = load_from("API_KEY=k\nVAD_SILENCE_MS=0\nVAD_RMS_THRESHOLD=0");
+        assert_eq!(cfg.vad_silence_ms, 0);
+        assert_eq!(cfg.vad_rms_threshold, 0.0);
+        // Clean numbers still land, and blank still means default.
+        let cfg = load_from("API_KEY=k\nMAX_SECONDS=45\nVAD_RMS_THRESHOLD=250.5");
+        assert_eq!(cfg.max_seconds, 45);
+        assert_eq!(cfg.vad_rms_threshold, 250.5);
+        let cfg = load_from("API_KEY=k");
+        assert_eq!(cfg.max_seconds, DEFAULT_MAX_SECONDS);
+    }
+
+    #[test]
+    fn a_quoted_value_keeps_a_spaced_hash() {
+        // The comment scan ran before the quote strip, so `KEYWORDS="k8s #cluster"`
+        // lost ` #cluster` to the comment rule and then failed the quote match,
+        // leaving a lone leading quote in the value. A quoted value is quoted
+        // precisely so its content is not reinterpreted.
+        let cfg = load_from("API_KEY=k\nKEYWORDS=\"k8s #cluster\"");
+        assert_eq!(
+            cfg.keywords,
+            vec!["k8s #cluster"],
+            "a # inside quotes is data, and both quotes are gone"
+        );
+        // Unquoted behaviour is unchanged.
+        let cfg = load_from("API_KEY=k\nMODEL=nova-3  # my model");
+        assert_eq!(cfg.model, "nova-3", "an unquoted spaced # is still a comment");
     }
 }

@@ -22,7 +22,12 @@ pub fn run() -> Result<(), String> {
         )
     })?;
 
-    let engine = unix_audio::CpalAudio::new()?;
+    // A unit value, like both transports: constructing it cannot fail, so it
+    // used to have a `new() -> Result<Self, String>` that always returned Ok
+    // and a `?` at the one call site pretending a failure was possible. The
+    // device the session needs is opened per capture, and that is where the
+    // real fallible work lives.
+    let engine = unix_audio::CpalAudio;
 
     println!("mnvoice v{}", crate::platform::version());
     println!(
