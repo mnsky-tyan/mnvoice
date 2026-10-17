@@ -267,8 +267,17 @@ pub fn run_stream(
                     break;
                 }
             };
+            // An empty message is a frame with nothing in it, not a hangup.
+            // Both backends report a real close as `Ok(None)` above (WinHTTP
+            // via the close buffer type, tungstenite via its own close
+            // handling), so reaching here with zero bytes means the provider
+            // sent a legal empty data message - which the guard used to treat
+            // as the end of the stream, exiting the reader without a fault
+            // marker and handing the caller a truncated transcript presented
+            // as complete. The break predates the transport seam, when an
+            // empty buffer was the only "nothing" signal `read` had.
             if frame.is_empty() {
-                break;
+                continue;
             }
             let msg = String::from_utf8_lossy(&frame);
             if let Some(res) = parse_stream_json(&msg) {
@@ -306,8 +315,6 @@ pub fn run_stream(
                     if res.is_final {
                         // Sentence/clause finalized: type all remaining words to the end
                         commit_words(&words, typed_word_count, words.len(), &mut has_typed_any, &full_transcript_clone);
-                        typed_word_count = 0; // reset for next clause
-                        latest_uncommitted.clear();
                     } else {
                         // Interim results: type completed words (all except the trailing partial word)
                         if words.len() > 1 && words.len() - 1 > typed_word_count {
@@ -315,6 +322,23 @@ pub fn run_stream(
                             typed_word_count = words.len() - 1;
                         }
                     }
+                }
+                // The clause boundary itself is outside the data guard, for the
+                // same reason `speech_final` is: a final frame that carries no
+                // transcript still ends the clause. Left inside, an empty final
+                // frame kept `typed_word_count` pointing into the clause that
+                // had just closed, so the NEXT clause's interims compared
+                // against a stale index - `words.len() - 1 > typed_word_count`
+                // failed and its leading words were never typed, and its final
+                // frame then committed from the wrong offset. Resetting both
+                // halves together is what keeps them describing one clause:
+                // `latest_uncommitted` is the current clause's text and
+                // `typed_word_count` is how much of it has gone out, so moving
+                // one without the other would have the end-of-stream flush
+                // re-type words that were already sent.
+                if res.is_final {
+                    typed_word_count = 0; // reset for next clause
+                    latest_uncommitted.clear();
                 }
             }
         }
@@ -1047,6 +1071,90 @@ mod tests {
             "the refusal must name the bound that fired, got: {read}"
         );
         let _ = server.join();
+    }
+
+    /// A final frame that carries no words still ends the clause.
+    ///
+    /// Deepgram sends `is_final` frames with an empty transcript (a clause that
+    /// resolved to nothing, or a channel-metadata close-out), and the word
+    /// cursor must follow the clause boundary rather than the data. Left inside
+    /// the non-empty guard, the cursor kept pointing into the clause that had
+    /// just closed: the next clause's interims failed
+    /// `words.len() - 1 > typed_word_count` and typed nothing, and its final
+    /// frame committed from the wrong offset, so the leading words of every
+    /// clause after an empty final were lost.
+    #[test]
+    fn an_empty_final_frame_resets_the_clause_cursor() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // Clause one: interims type "one two", the final types "three".
+            let _ = stream.write_all(&live_provider::result_frame("one two three", false, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = stream.write_all(&live_provider::result_frame("one two three", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            // The frame the bug tripped on: final, and empty.
+            let _ = stream.write_all(&live_provider::result_frame("", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            // Clause two: with a stale cursor of 2, "four" is never typed and
+            // the final commits only "six".
+            let _ = stream.write_all(&live_provider::result_frame("four five", false, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = stream.write_all(&live_provider::result_frame("four five six", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = stream.write_all(&live_provider::result_frame("", false, true));
+            let _ = stream.flush();
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 60);
+        let _ = server.join();
+        let text = out.expect("the session must not error");
+        assert!(
+            text.contains("one two three"),
+            "clause one must be typed whole: {text}"
+        );
+        assert!(
+            text.contains("four") && text.contains("five") && text.contains("six"),
+            "clause two must be typed whole after an empty final frame: {text}"
+        );
+    }
+
+    /// A legal empty data message must not be read as a hangup.
+    ///
+    /// Both backends report a real close as `Ok(None)`, so an empty buffer can
+    /// only be an empty message - which the reader used to treat as the end of
+    /// the stream, exiting without a fault marker and returning a truncated
+    /// transcript as if it were complete.
+    #[test]
+    fn an_empty_data_message_does_not_end_the_stream() {
+        use std::io::Write as _;
+        let (port, server) = live_provider::serve(|stream| {
+            let _ = stream.write_all(&live_provider::result_frame("first words", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            // A zero-length text frame: legal, carries nothing, ends nothing.
+            let _ = stream.write_all(&live_provider::frame(0x1, b""));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            // Words that only arrive if the reader survived the empty frame.
+            let _ = stream.write_all(&live_provider::result_frame("later words", true, false));
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = stream.write_all(&live_provider::result_frame("", false, true));
+            let _ = stream.flush();
+        });
+        let cfg = live_provider::cfg_for(port);
+        let out = live_provider::drive(&cfg, 60);
+        let _ = server.join();
+        let text = out.expect("an empty message is not an error");
+        assert!(
+            text.contains("later words"),
+            "the reader must survive an empty data message: {text}"
+        );
     }
 
     /// The wire-level counterpart of `a_model_or_language_cannot_inject_query_parameters`:

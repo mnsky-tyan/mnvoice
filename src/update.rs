@@ -513,10 +513,38 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
             // into an uninstalled one; the staged file is kept for the same
             // reason (see `stage_and_swap`). The test is `swap_interrupted`, the
             // same predicate the helper wakes on, so installer and helper agree
-            // by construction about which state is worth a watcher. The repair
-            // then lands when this instance exits, which is later than the user
-            // would like but is not a brick.
-            if !swap_interrupted(&exe) {
+            // by construction about which state is worth a watcher.
+            if swap_interrupted(&exe) {
+                // Hand the watcher's lifetime to the OS: the helper waits on
+                // this pipe, and the write end lives in `helper`'s stdin
+                // handle, so the repair lands exactly when THIS process lets go
+                // of it. Letting `helper` drop at the `return` below would close
+                // the pipe while the instance is still running: measured, a
+                // dropped `Child` sends its child EOF immediately. The helper
+                // would then finish the install and call `spawn_restarted`,
+                // whose `--restart` force-kills this instance - interrupting a
+                // dictation the user may have started in the meantime, behind a
+                // balloon that says the update failed. Keeping the handle means
+                // the user's session is never cut short: the app keeps running
+                // its loaded image, and the repair (plus the relaunch into the
+                // new version) happens when it exits, which is the timing this
+                // branch was written to give.
+                //
+                // `forget` leaks one `Child` per install that reached this
+                // state, which is the point: the handle must outlive the
+                // function, and the process is a tray app that ends within a
+                // session. The exe path staying empty until then costs nothing
+                // the user can see - the single-instance mutex means no second
+                // copy could start here anyway.
+                //
+                // The visible cost of deferring is that the repair's relaunch
+                // rides on the user's own Exit: they close the tray app and a
+                // fresh mnvoice window appears a moment later. That is odd but
+                // bounded (only a helper that actually found the half-done state
+                // restarts anything, and it exits afterwards), and it is the
+                // lesser harm against cutting a live dictation short.
+                std::mem::forget(helper);
+            } else {
                 stop_helper(&mut helper);
             }
             return Err(e);
@@ -1168,16 +1196,19 @@ mod tests {
         ] {
             let (version, suffix) = platform_tag_parts(tag);
             assert_eq!(version, version_of_tag(tag), "{tag}: parser disagrees");
-            // What the classifier keys on is the suffix, and what the parser
-            // drops is the same text, so a bare tag has nothing for it to match.
-            let expected = if tag.starts_with('v') {
-                tag.trim_start_matches('v')
-            } else {
-                tag
+            // The expected halves are written out per tag instead of being
+            // recomputed here. The old body re-spelled the rule under test
+            // (`trim_start_matches('v')` then `split_once('-')`), so any change
+            // to the shared splitter that kept that spelling simply moved the
+            // bug into the test and still passed. Data cannot agree with a bug.
+            let (want_version, want_suffix) = match tag {
+                "v0.1.25-win" => ("0.1.25", Some("win")),
+                "v0.1.25-linux" => ("0.1.25", Some("linux")),
+                "v0.1.25-macos" => ("0.1.25", Some("macos")),
+                "v0.1.25" => ("0.1.25", None),
+                "0.1.25-linux" => ("0.1.25", Some("linux")),
+                other => unreachable!("fixture tag {other} is not in the table"),
             };
-            let (want_version, want_suffix) = expected
-                .split_once('-')
-                .map_or((expected, None), |(v, s)| (v, Some(s)));
             assert_eq!(version, want_version, "{tag}: version part");
             assert_eq!(suffix, want_suffix, "{tag}: suffix part");
         }
@@ -1538,12 +1569,21 @@ mod tests {
     fn the_sums_line_of_the_asset_that_was_asked_for_is_the_one_read() {
         // Real sums files list every released file, in the GNU two-space
         // spelling, and sha256sum -b writes one space and an asterisk instead.
+        // The two lines deliberately carry DIFFERENT digests. They used to
+        // carry the same value (upper-cased on the second line), which made
+        // this assert nothing about which line was chosen: a reader that
+        // returned the FIRST line's hash unconditionally passed it, and that is
+        // the exact bug the asset-name match exists to prevent - installing
+        // file A's bytes against file B's checksum. The distinct values make
+        // selection observable, and the upper case on the line that must win
+        // keeps the case-folding claim in `normalized_sha256_hex` pinned in the
+        // same fixture.
         let sums = "\
 b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70  other.exe\n\
-B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n";
+A11D5E68F2B7C9034D5E6F708192A3B4C5D6E7F8091A2B3C4D5E6F708192A3B4 *mnvoice.exe\n";
         assert_eq!(
             super::expected_hash(sums, "mnvoice.exe").unwrap(),
-            "b810fff67ec7d67ab0804704ea52b678180dbd6e4d55b02ccb244f167378ab70",
+            "a11d5e68f2b7c9034d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4",
             "the line naming the requested asset decides, not the first one"
         );
     }

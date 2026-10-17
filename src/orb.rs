@@ -561,7 +561,11 @@ mod tests {
             crate::config::DEFAULT_ORB_FLUID_LEVEL,
         );
 
-        let opaque = buf.iter().filter(|&&p| ((p >> 24) & 0xFF) > 200).count();
+        // The shared helper, not a second spelling of its threshold: pass 14
+        // introduced `body_pixels` as the one owner of "reads as the orb's
+        // body", and this line kept its own copy of the same predicate, so
+        // tuning the helper would have left this test on the old number.
+        let opaque = body_pixels(&buf);
         assert!(opaque > 150, "orb must have visible opaque pixels, got {opaque}");
 
         let centre = (ORB_HEIGHT / 2 * ORB_WIDTH + ORB_WIDTH / 2) as usize;

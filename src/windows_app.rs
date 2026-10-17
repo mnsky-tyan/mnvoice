@@ -43,8 +43,9 @@ const NO_SPEECH: &str = "No speech detected";
 #[allow(clippy::manual_dangling_ptr)]
 const IDI_APP: PCWSTR = PCWSTR(1 as *const u16);
 
-/// Loads the embedded mnvoice icon. Falls back to the OS generic icon if the
-/// resource is somehow missing, so the tray icon is never blank.
+/// Loads the embedded mnvoice icon at the default (large) size. Falls back to
+/// the OS generic icon if the resource is somehow missing, so an icon is never
+/// blank. Used for the window class; the tray uses `tray_icon`.
 unsafe fn app_icon() -> HICON {
     if let Ok(mod_) = GetModuleHandleW(None) {
         if let Ok(h) = LoadIconW(HINSTANCE(mod_.0), IDI_APP) {
@@ -54,6 +55,47 @@ unsafe fn app_icon() -> HICON {
         }
     }
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default()
+}
+
+/// The embedded icon at the size the taskbar tray actually draws into, named
+/// for its one caller because that caller is the whole reason it exists.
+///
+/// The request is SM_CXSMICON rather than the default icon metric, and what
+/// that changes is the SIZE chosen, not the artwork. Measured in this process:
+/// `LoadIconW(IDI_APP)` resolves to SM_CXICON (32 px here) while the tray slot
+/// is SM_CXSMICON (16 px at 100% scaling, 19 px at 125%, 24 px at 150%), so
+/// the tray has been down-sampling a 32 px frame into a 16 px slot, and at
+/// higher scaling a 32 px frame into a 19 or 24 px slot. This exe carries a
+/// responsive .ico - mark-only at 16-48 px, the full brand card at 64-256 px
+/// (see AGENTS.md, "App and tray icon") - and at 100% the tray was already
+/// showing a mark; what was unreachable were the frames rasterised FOR the
+/// tray's own size. `LoadIconW` cannot express a size at all, which is why
+/// this is `LoadImageW`. Pinning the two metrics apart is what the test for
+/// this call asserts.
+///
+/// `LR_SHARED` is required: without it every call leaks a fresh icon handle,
+/// and the tray calls this on each modify.
+///
+/// The fallback keeps `app_icon`'s shape (a system icon is always loadable),
+/// so an exe built without the resource, or a session reporting a zero metric,
+/// still shows something.
+unsafe fn tray_icon() -> HICON {
+    let cx = GetSystemMetrics(SM_CXSMICON);
+    let cy = GetSystemMetrics(SM_CYSMICON);
+    // A metric of zero is not a size to request: LoadImageW would be asked for
+    // a zero-pixel icon. Fall back to the default-size load in that case.
+    if cx <= 0 || cy <= 0 {
+        return app_icon();
+    }
+    if let Ok(mod_) = GetModuleHandleW(None) {
+        if let Ok(h) = LoadImageW(HINSTANCE(mod_.0), IDI_APP, IMAGE_ICON, cx, cy, LR_SHARED) {
+            let icon = HICON(h.0);
+            if !icon.is_invalid() {
+                return icon;
+            }
+        }
+    }
+    app_icon()
 }
 
 const HOTKEY_TOGGLE: i32 = 1;
@@ -612,7 +654,13 @@ fn register_hotkey_with_retry(
 fn run_message_loop() {
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        // `GetMessageW` returns TRUE for a message, FALSE for WM_QUIT, and -1
+        // for an error. `BOOL::as_bool` is `self.0 != 0`, so a bare
+        // `while ...as_bool()` treats the error case as "keep pumping" and
+        // re-dispatches the previous MSG in a tight loop - the exact
+        // anti-pattern MSDN names on the GetMessage page. Testing the raw
+        // value keeps both real answers and ends the pump on the third.
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -677,7 +725,9 @@ unsafe fn app_ref(hwnd: HWND) -> Option<&'static mut App> {
 unsafe fn add_tray(hwnd: HWND, tip: &str) {
     let mut nid = tray_nid(hwnd, NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID);
     nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = unsafe { app_icon() };
+    // The tray is a small-icon surface: this is where the mark-only frames
+    // exist to be used (see `tray_icon`).
+    nid.hIcon = unsafe { tray_icon() };
     fill_wide(&mut nid.szTip, tip);
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -952,7 +1002,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let id = wparam.0;
                 match id {
                     IDM_EXIT => {
-                        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_nid(hwnd, Default::default()));
+                        // NIF_GUID is part of the icon's identity, not a
+                        // modifier on it: the other three calls set it, and
+                        // with it clear the shell addresses (hwnd, uID) -
+                        // which is not this icon, because uID is ignored once
+                        // a GUID identifies it. MSDN's own troubleshooting note
+                        // for guidItem is that NIF_GUID must be set in EVERY
+                        // Shell_NotifyIcon call, so the previous
+                        // `Default::default()` (flags = 0) made the one
+                        // explicit delete a no-op and the icon lingered until
+                        // the shell reclaimed it at process exit.
+                        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_nid(hwnd, NIF_GUID));
                         // Release the global hotkey so the next launch can claim it.
                         // Without this, a killed or exited instance can leave Windows
                         // still believing the hotkey is owned, breaking the next start.
@@ -1427,10 +1487,24 @@ fn autostart_starting(state: AutostartState) -> bool {
 /// steady state, and the Run value's Task Manager override is only read while
 /// an old Run entry may still be there.
 fn autostart_enabled() -> bool {
-    let state = if task_exists() {
-        AutostartState::TaskPresent
-    } else {
-        autostart_state(run_key_set(), run_key_disabled)
+    let state = match task_state() {
+        TaskState::Present => AutostartState::TaskPresent,
+        // A disabled row starts nothing on its own, so it settles nothing: the
+        // Run key is still the other mechanism that could be starting mnvoice
+        // (an install that migrated and then had its task turned off), and the
+        // answer has to come from there. This is the same enabled/disabled
+        // distinction the Run-key path already models as
+        // `RunValueEnabled`/`RunValueDisabled`; before it, a task the user
+        // disabled in Task Scheduler drew the box checked, and the only click
+        // a checked box offers DELETES the task - the inverse of "turn it on",
+        // recoverable only by clicking twice.
+        // `Unknown` keeps its pre-existing route through the Run key: an
+        // unanswerable task question has always been answered by the other
+        // mechanism rather than by a guess, and this change is about the
+        // disabled row, not about re-deciding that.
+        TaskState::Disabled | TaskState::Absent | TaskState::Unknown => {
+            autostart_state(run_key_set(), run_key_disabled)
+        }
     };
     autostart_starting(state)
 }
@@ -1580,17 +1654,99 @@ fn startup_approved_disabled(blob: &[u8]) -> bool {
     matches!(blob.first(), Some(0x03) | Some(0x06))
 }
 
-/// The schtasks arguments that ask whether the autostart task exists.
+/// The schtasks arguments that ask whether the autostart task exists AND
+/// whether it is enabled.
 ///
-/// Deliberately no `/fo`: the exit status answers the question on every
-/// Windows, while a listing's field separator is the machine's own list
-/// separator (a semicolon on a default German system), so anything that
-/// parsed that text was answering a question about the locale instead.
+/// `/xml` rather than a table: the exit status alone answers only "is there a
+/// task row", and a disabled row is not something Windows starts at logon, so
+/// the exit code was being read as "starts at logon" for a task the user had
+/// turned off in Task Scheduler. The XML is the locale-proof way to get the
+/// second fact - element names (`<Enabled>`) are English on every Windows,
+/// unlike a LIST/TABLE status column, whose text and field separator both
+/// follow the machine (a semicolon separator on a default German system).
+/// Measured here: an enabled task's XML omits `<Enabled>` entirely, and
+/// `schtasks /change /tn <task> /disable` makes the same query emit
+/// `<Enabled>false</Enabled>` while its exit code stays 0.
+///
+/// Deliberately no `/fo`: it has no meaning for `/xml`, and the rule that
+/// kept it out (never parse locale-dependent text) is the reason `/xml` is
+/// safe to parse at all.
 fn schtasks_query_args() -> Vec<String> {
-    ["query", "/tn", AUTOSTART_TASK]
+    ["query", "/tn", AUTOSTART_TASK, "/xml"]
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Decode the scheduler's task document into text.
+///
+/// The document declares `encoding="UTF-16"` and, measured on this machine,
+/// arrives as plain ASCII bytes with no byte-order mark - the declaration
+/// describes the Task Scheduler's internal XML encoding, not the bytes
+/// `schtasks` writes to stdout. That gap is why this decodes rather than
+/// assuming: on a build that honoured its own declaration, a lossy UTF-8 read
+/// would interleave every character with a replacement mark, the `<Task`
+/// guard would fail, and the enabled/disabled answer would be lost SILENTLY
+/// (the checkmark would fall back to the Run key, which is the pre-change
+/// behaviour, so nothing would look wrong). Both shapes are accepted, and an
+/// absent mark means the ASCII path.
+fn task_xml_text(bytes: &[u8]) -> String {
+    const UTF16LE: &[u8] = &[0xFF, 0xFE];
+    const UTF16BE: &[u8] = &[0xFE, 0xFF];
+    let (units, swap) = if bytes.starts_with(UTF16LE) {
+        (&bytes[2..], false)
+    } else if bytes.starts_with(UTF16BE) {
+        (&bytes[2..], true)
+    } else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    let mut out = String::with_capacity(units.len() / 2);
+    for pair in units.chunks(2) {
+        let lo = pair[0];
+        let hi = pair.get(1).copied().unwrap_or(0);
+        let code = if swap {
+            u16::from_be_bytes([lo, hi])
+        } else {
+            u16::from_le_bytes([lo, hi])
+        };
+        out.push(char::from_u32(code as u32).unwrap_or('\u{fffd}'));
+    }
+    out
+}
+
+/// Whether a task's XML document records it as switched off.
+///
+/// Absent means enabled: measured, an enabled task's document carries no
+/// `<Enabled>` element at ANY level (the trigger's is omitted too when true),
+/// and a disabled one carries exactly `<Enabled>false</Enabled>`. So the
+/// default is true, and a document that says nothing is a task Windows will
+/// start.
+///
+/// The scan is over the element's own text rather than whole lines, because
+/// the scheduler pretty-prints today and no part of the format promises it
+/// will: a line-based match would read a single-line document as enabled,
+/// which is the silent direction this must not fail in. Matching any
+/// `<Enabled>` that says false also treats a disabled logon TRIGGER as not
+/// starting, which is the right answer to the question being asked - a task
+/// whose trigger is off does not run at logon either.
+///
+/// Split out so the classification is testable without spawning the
+/// scheduler, which is how the rest of the autostart rules are pinned.
+fn task_xml_disabled(xml: &str) -> bool {
+    const OPEN: &str = "<Enabled>";
+    const CLOSE: &str = "</Enabled>";
+    let mut rest = xml;
+    while let Some(open) = rest.find(OPEN) {
+        let after = &rest[open + OPEN.len()..];
+        let Some(close) = after.find(CLOSE) else {
+            return false;
+        };
+        if after[..close].trim().eq_ignore_ascii_case("false") {
+            return true;
+        }
+        rest = &after[close + CLOSE.len()..];
+    }
+    false
 }
 
 /// What the scheduler says about the at-logon autostart task.
@@ -1600,26 +1756,54 @@ fn schtasks_query_args() -> Vec<String> {
 /// nothing at all and has to fail the toggle rather than look like success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskState {
+    /// Registered and enabled: Windows starts it at logon.
     Present,
+    /// Registered but switched off (Task Scheduler > Disable, or
+    /// `schtasks /change /disable`). The row exists, so a query exits 0, but
+    /// nothing runs at logon.
+    Disabled,
     Absent,
     Unknown,
 }
 
 /// Ask the scheduler about the task.
 ///
-/// Only a process that could not be spawned at all is unanswerable: schtasks
-/// exits zero for a task that is there and non-zero when it is not, and that
-/// exit code is the only thing there is to ask.
+/// The exit code answers existence and the document answers enabled-ness, and
+/// both are needed: a disabled task exits 0 like an enabled one, so reading
+/// the code alone reported "starts at logon" for a task the user had turned
+/// off. Only a process that could not be spawned at all is unanswerable.
+///
+/// A successful query whose XML cannot be read at all (empty, or not a
+/// document) is `Unknown` rather than `Present`: claiming a start the machine
+/// did not confirm is the failure mode the `Unknown` variant exists to
+/// prevent, and it is what makes the toggle refuse rather than guess.
 fn task_state() -> TaskState {
     match schtasks_cmd().args(schtasks_query_args()).output() {
-        Ok(out) if out.status.success() => TaskState::Present,
+        Ok(out) if out.status.success() => {
+            let xml = task_xml_text(&out.stdout);
+            if xml.contains("<Task") {
+                if task_xml_disabled(&xml) {
+                    TaskState::Disabled
+                } else {
+                    TaskState::Present
+                }
+            } else {
+                TaskState::Unknown
+            }
+        }
         Ok(_) => TaskState::Absent,
         Err(_) => TaskState::Unknown,
     }
 }
 
+/// True when a task row exists, whichever way it is switched.
+///
+/// The migration asks this question (a row of any kind means the task has
+/// already been created, and re-creating it is not its job), while the
+/// checkmark asks the enabled-ness question below. Keeping the two apart is
+/// what stops a disabled task from being read as "starts at logon".
 fn task_exists() -> bool {
-    task_state() == TaskState::Present
+    matches!(task_state(), TaskState::Present | TaskState::Disabled)
 }
 
 /// The schtasks arguments that create the autostart task.
@@ -2099,6 +2283,161 @@ mod tests {
         fill_wide(&mut dst, "anything");
     }
 
+    /// The XML the scheduler writes is the only place the enabled flag lives,
+    /// and its two shapes are measured on this machine rather than assumed:
+    /// an enabled task's document omits `<Enabled>` entirely, and
+    /// `schtasks /change /tn <task> /disable` makes the same query emit
+    /// `<Enabled>false</Enabled>` with the exit code unchanged at 0. So
+    /// "absent" must read as enabled and only an explicit false as disabled -
+    /// reading absence as disabled would draw the box unchecked for every
+    /// working autostart.
+    #[test]
+    fn a_disabled_task_row_is_not_read_as_an_autostart() {
+        let enabled_doc = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+</Task>"#;
+        let disabled_doc = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Settings>
+    <Enabled>false</Enabled>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+</Task>"#;
+        assert!(
+            !task_xml_disabled(enabled_doc),
+            "no <Enabled> element means enabled"
+        );
+        assert!(
+            task_xml_disabled(disabled_doc),
+            "the explicit false is the disabled answer"
+        );
+        // A `<Enabled>true</Enabled>` anywhere is not the disabled answer, so a
+        // document that carries a true (here at trigger level) and says nothing
+        // at task level still reads as enabled. Measured on this machine, the
+        // scheduler's own enabled document carries no <Enabled> element at all,
+        // so the true case below is the belt rather than the observed shape.
+        assert!(
+            enabled_doc.contains("<Enabled>true</Enabled>"),
+            "the fixture must actually carry the true spelling it claims to tolerate"
+        );
+        // Indentation and line endings are the scheduler's, not ours.
+        assert!(task_xml_disabled(
+            "<Settings>\r\n  <Enabled>false</Enabled>\r\n</Settings>"
+        ));
+        // An empty or unreadable document is not a disabled answer either; the
+        // caller classifies a document with no <Task> as Unknown before ever
+        // asking this question.
+        assert!(!task_xml_disabled(""));
+    }
+
+    /// The decoder accepts both byte shapes the scheduler's own declaration
+    /// leaves open: the ASCII bytes measured on this machine, and a real
+    /// UTF-16 document (which the `encoding="UTF-16"` declaration promises and
+    /// a future build could honour). Getting this wrong is silent, so both
+    /// paths are asserted rather than one plus an assumption.
+    #[test]
+    fn the_task_document_is_decoded_whichever_way_it_arrives() {
+        let ascii = "<Task><Settings><Enabled>false</Enabled></Settings></Task>";
+        assert!(task_xml_disabled(&task_xml_text(ascii.as_bytes())));
+
+        let mut utf16le = vec![0xFFu8, 0xFE];
+        for u in "Task".encode_utf16() {
+            utf16le.extend_from_slice(&u.to_le_bytes());
+        }
+        let mut doc = vec![0xFFu8, 0xFE];
+        for u in ascii.encode_utf16() {
+            doc.extend_from_slice(&u.to_le_bytes());
+        }
+        assert!(
+            task_xml_disabled(&task_xml_text(&doc)),
+            "a UTF-16LE document must give the same disabled answer"
+        );
+        let mut utf16be = vec![0xFEu8, 0xFF];
+        for u in ascii.encode_utf16() {
+            utf16be.extend_from_slice(&u.to_be_bytes());
+        }
+        assert!(
+            task_xml_disabled(&task_xml_text(&utf16be)),
+            "a UTF-16BE document must too"
+        );
+        // The `<Task` guard the caller uses has to survive the decode as well.
+        assert!(task_xml_text(&doc).contains("<Task"));
+        // A truncated final code unit is a replacement character, not a panic.
+        assert!(!task_xml_text(&[0xFF, 0xFE, b'T']).contains("<Task"));
+    }
+
+    /// The tray must be able to get the SMALL frames of the .ico.
+    ///
+    /// This is the assertion behind `tray_icon`. It measures which
+    /// frame the loader actually picked (GetIconInfo -> GetObjectW on its
+    /// bitmap) rather than trusting the size argument, and it is what showed
+    /// `LoadIconW` resolving to SM_CXICON (measured here: 32 px) while the
+    /// tray slot is SM_CXSMICON (16 px at this session's scaling) - so the
+    /// frames built for the tray surface were unreachable. The two sizes are
+    /// asserted apart because a single metric would make the test pass either
+    /// way.
+    ///
+    /// Skipped when the test binary carries no embedded icon resource, which
+    /// is a build fact, not a behaviour failure: what is being tested is which
+    /// frame the loader selects from a set, and there is no set to select from
+    /// without it.
+    #[test]
+    fn the_tray_asks_for_the_small_icon_frames() {
+        let small = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        let large = unsafe { GetSystemMetrics(SM_CXICON) };
+        // A metric of 0 would be a broken session, not a broken choice; and if
+        // the two metrics were equal there would be no size difference to
+        // detect, so the measurement below would prove nothing either way.
+        if small <= 0 || large <= 0 || small == large {
+            return;
+        }
+        let picked = unsafe { icon_size_of(tray_icon()) };
+        let Some((w, _h)) = picked else {
+            // No resource in this binary: nothing to measure.
+            return;
+        };
+        assert_eq!(w, small, "the tray must load the small frame it draws into");
+        // The window class keeps the default-size load, and this is the proof
+        // that the two requests land on different frames: if the metrics were
+        // equal, the assertion above would prove nothing either way.
+        if let Some((lw, _)) = unsafe { icon_size_of(app_icon()) } {
+            assert_eq!(lw, large, "the default load must stay on the large frame");
+        }
+    }
+
+    /// The pixel size of a loaded icon, measured from its colour bitmap.
+    /// Returns None when the icon carries no usable bitmap.
+    ///
+    /// Imported locally because the product code never measures a bitmap: this
+    /// exists only to read back what the icon loader chose.
+    unsafe fn icon_size_of(icon: HICON) -> Option<(i32, i32)> {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP, HGDIOBJ};
+        // This binding takes the struct as an out-parameter, not a return.
+        let mut info = ICONINFO::default();
+        GetIconInfo(icon, &mut info).ok()?;
+        // Colour first, then the mask: a monochrome icon carries no colour
+        // bitmap, and the mask is then the only real size to read.
+        let bm = if !info.hbmColor.is_invalid() {
+            info.hbmColor
+        } else if !info.hbmMask.is_invalid() {
+            info.hbmMask
+        } else {
+            return None;
+        };
+        let mut bmp = BITMAP::default();
+        let ok = GetObjectW(
+            HGDIOBJ(bm.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut _ as *mut core::ffi::c_void),
+        );
+        // The bitmaps GetIconInfo hands back are copies owned by the caller.
+        let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+        let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+        (ok != 0).then(|| (bmp.bmWidth, bmp.bmHeight))
+    }
+
     #[test]
     fn the_query_arguments_do_not_ask_for_a_format() {
         // The answer comes from the exit status, which means the same thing
@@ -2111,14 +2450,19 @@ mod tests {
         // scanned for those flags, and it could not fail once the equality
         // passed - two spellings of one check, where only the strict one can
         // disagree.
+        //
+        // `/xml` is now part of the contract: it is what lets the answer say
+        // "disabled" as well as "present", and it is parseable on every locale
+        // because element names are English (a table's status text is not).
         assert_eq!(
             args,
             vec![
                 "query".to_string(),
                 "/tn".to_string(),
-                AUTOSTART_TASK.to_string()
+                AUTOSTART_TASK.to_string(),
+                "/xml".to_string()
             ],
-            "the existence question is a plain query, with no format argument"
+            "the existence-and-enabledness question is an xml query, with no format argument"
         );
     }
 

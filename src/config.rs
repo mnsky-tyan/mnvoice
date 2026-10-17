@@ -98,8 +98,19 @@ fn derive(raw: RawFields) -> Result<Config, String> {
         "rest" | "http" | "batch" | "groq" | "openai" => Protocol::Rest,
         "streaming" | "stream" | "websocket" | "ws" | "deepgram" => Protocol::Streaming,
         _ => {
-            if raw.base_url.contains("groq.com")
-                || raw.base_url.contains("openai.com")
+            // The host is compared at a domain boundary, not by substring:
+            // `raw.base_url.contains("groq.com")` was true for a self-hosted
+            // endpoint that merely had the name in its path or a spoofed label
+            // in front of it (`https://groq.com.example.net/`,
+            // `http://tunnel.internal/mirror/groq.com/v1`), and inference is
+            // exactly where that matters - a user pointing at their own Whisper
+            // box was silently switched to a provider's API path. The model
+            // name stays a substring test on purpose: model identifiers are
+            // free-form ("whisper-large-v3-turbo", "groq/whisper-lg3"), so
+            // there is no boundary to compare against.
+            let host = crate::rest::host_of(&raw.base_url).unwrap_or_default();
+            if crate::rest::host_is_domain(&host, "groq.com")
+                || crate::rest::host_is_domain(&host, "openai.com")
                 || raw.model.contains("whisper")
             {
                 Protocol::Rest
@@ -194,7 +205,7 @@ fn derive(raw: RawFields) -> Result<Config, String> {
     // requests, not typos.
     let max_seconds = parse_positive_num("MAX_SECONDS", &raw.max_seconds)?;
     let vad_silence_ms = parse_u32_num("VAD_SILENCE_MS", &raw.vad_silence_ms)?;
-    let vad_rms_threshold = parse_num("VAD_RMS_THRESHOLD", &raw.vad_rms_threshold)?;
+    let vad_rms_threshold = parse_rms_num("VAD_RMS_THRESHOLD", &raw.vad_rms_threshold)?;
 
     Ok(Config {
         protocol,
@@ -349,6 +360,37 @@ fn parse_u32_num(key: &str, v: &str) -> Result<u32, String> {
         return Err(format!("{key} must be a whole number >= 0: {v:?}"));
     }
     Ok(f as u32)
+}
+
+/// `VAD_RMS_THRESHOLD`, held to the `0..=32767` scale both README and
+/// `Config::vad_rms_threshold` document.
+///
+/// The bare number parse used to accept anything `f64` parses, and the three
+/// spellings that survive it each break dictation silently, with no config
+/// error anywhere:
+///
+/// - `NaN` and `inf` (and `1e400`, which parses to `inf`) make every comparison
+///   `rms > threshold` false, so every chunk reads as silence and every
+///   dictation ends at the 10 s no-speech limit reporting "No speech detected".
+/// - a negative value is the inverse: digital silence satisfies
+///   `0.0 > -400.0`, so the post-voice window never opens and only
+///   `MAX_SECONDS` ends the session.
+///
+/// All three are measured above, not inferred: `"-400".parse::<f64>()` and
+/// `"NaN".parse::<f64>()` both return `Ok`. Refusing them at load is the only
+/// place the mistake can be named, because the symptom (never speech, or never
+/// silence) reads as a broken microphone rather than a typo three screens away.
+///
+/// The upper bound is the documented one rather than a new invention. A
+/// threshold above the largest RMS an i16 buffer can carry is behaviourally
+/// identical to `inf` - nothing ever counts as speech - so accepting it would
+/// keep the silent failure the check exists to remove.
+fn parse_rms_num(key: &str, v: &str) -> Result<f64, String> {
+    let f = parse_num(key, v)?;
+    if !f.is_finite() || f < 0.0 || f > 32767.0 {
+        return Err(format!("{key} must be a number from 0 to 32767: {v:?}"));
+    }
+    Ok(f)
 }
 
 /// `MAX_SECONDS`, which additionally may not be 0 (see `derive`).
@@ -1012,10 +1054,31 @@ mod tests {
 
     #[test]
     fn every_field_has_a_unique_canonical_name() {
-        for (names, _) in FIELDS {
-            let (canonical, aliases) = names.split_first().expect("every field needs a canonical name");
-            assert!(!aliases.contains(canonical), "{canonical} must appear exactly once");
+        // The whole table's names must be unique, not merely each row's own
+        // first name absent from its own alias list - the assertion the old
+        // body made, which no reachable table could fail because `set` matches
+        // a name by scanning rows in order, so a name in two rows is silently
+        // claimed by the first and the second row's field never fills.
+        //
+        // Two properties, then, both about the table as a whole: every name
+        // appears exactly once across all rows, and every row has a canonical
+        // name (its first) at all.
+        let mut seen: Vec<&str> = Vec::new();
+        for (names, field) in FIELDS {
+            let (canonical, _aliases) = names.split_first().expect("every field needs a canonical name");
+            assert!(!canonical.is_empty(), "{field:?}: a canonical name cannot be empty");
+            for name in names.iter() {
+                assert!(
+                    !seen.contains(name),
+                    "{name} is claimed by more than one field: {field:?} and the earlier row"
+                );
+                seen.push(name);
+            }
         }
+        // The count is the cheap proof the loop actually looked at everything:
+        // a row that failed to reach the inner loop would show up here.
+        let total: usize = FIELDS.iter().map(|(names, _)| names.len()).sum();
+        assert_eq!(seen.len(), total, "some name was never checked");
     }
 
     #[test]
@@ -1347,6 +1410,19 @@ mod tests {
         assert!(err("API_KEY=k\nMAX_SECONDS=0").contains("MAX_SECONDS"));
         // A non-whole VAD_SILENCE_MS is as loud as a non-number.
         assert!(err("API_KEY=k\nVAD_SILENCE_MS=3000.5").contains("VAD_SILENCE_MS"));
+        // The RMS threshold's documented range is enforced, not just its
+        // numeric-ness. Each of these parses as an f64 and then breaks every
+        // dictation silently: NaN/inf make every chunk read as silence (so
+        // "No speech detected" at 10 s, forever), a negative makes digital
+        // silence read as speech (so only MAX_SECONDS ever ends a session).
+        // `1e400` is in the list because it parses to +inf rather than failing.
+        for bad in ["-400", "-inf", "NaN", "inf", "1e400", "40000"] {
+            let e = err(&format!("API_KEY=k\nVAD_RMS_THRESHOLD={bad}"));
+            assert!(
+                e.contains("VAD_RMS_THRESHOLD"),
+                "{bad} must be refused by name, got: {e}"
+            );
+        }
         // The two VAD zeroes stay legal (documented "always"/"first tick" meanings).
         let cfg = load_from("API_KEY=k\nVAD_SILENCE_MS=0\nVAD_RMS_THRESHOLD=0");
         assert_eq!(cfg.vad_silence_ms, 0);
