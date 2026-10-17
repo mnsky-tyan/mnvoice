@@ -23,16 +23,21 @@
 // poisoned value means, for instance, in `unix_audio`'s error slot, where
 // recovering is the point precisely because "no error" would be a lie.
 //
-// Four sites deliberately do NOT come here, and they are the exceptions that
-// prove the rule rather than oversights: `platform/linux_impl.rs`'s injector
-// lock and `platform/unix_http.rs`'s three websocket socket locks each turn a
-// poison into an `Err`. Their data is not a string or a flag but a live
-// external handle - an X11 connection or a TCP socket - so a value written
-// under a panicked owner cannot be trusted to be a usable handle at all, and
-// the honest answer to the caller is "this send/type failed", not "carry on".
-// `stream.rs`'s captured-text slot uses `if let Ok(..)` for the third shape:
-// it is a best-effort diagnostic write whose failure must not end a session.
-// A fifth pattern would be a bug; these three are the whole menu.
+// Production sites deliberately NOT here are all of one kind, and that kind is
+// the exception that proves the rule rather than an oversight:
+// `platform/linux_impl.rs`'s injector lock and `platform/unix_http.rs`'s three
+// websocket locks (both sends and the read) turn a poison into an `Err`. Their
+// data is not a string or a flag but a live external handle - an X11
+// connection or a TCP socket - so a value written under a panicked owner
+// cannot be trusted to be a usable handle at all, and the honest answer to the
+// caller is "this send/type failed", not "carry on". Recovering and failing
+// are therefore the whole production menu, and a third shape would be a bug.
+//
+// (`stream.rs`'s captured-text slot does use `if let Ok(..)`, but it lives in
+// `mod tests` inside the mock-provider harness: a test that cannot record the
+// request head fails its own assertion, which is not a policy the product
+// implements, so it is not counted among the menu above. An earlier version of
+// this comment listed it as a third production shape.)
 //
 // Deliberately NOT a `RwLock`/`Condvar` generalisation, and not a wrapper type:
 // the callers want the ordinary `MutexGuard` and its `Deref`, unchanged.

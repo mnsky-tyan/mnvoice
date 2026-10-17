@@ -42,12 +42,56 @@ fn transcribe(cfg: &Config, wav: &[u8]) -> Result<String, String> {
 /// configured endpoint - the Windows release this port must not change posts
 /// to that path verbatim, and trimming it would send the request somewhere
 /// else (an empty path, for a base URL whose path is just `/`).
+/// True when `host` is `domain` itself or a subdomain of it.
+///
+/// A plain `base_url.contains("groq.com")` matched the substring anywhere in
+/// the URL, so a self-hosted endpoint whose path or hostname merely CONTAINS
+/// it (`https://groq.com.evil.test/v1`, `https://proxy.internal/groq.com/mirror`)
+/// was routed to another provider's API path and inferred as that provider's
+/// protocol. Comparing the authority's host component against a domain
+/// boundary cannot be fooled by a label that ends with the name: the only
+/// shapes accepted are the domain itself and its real subdomains.
+pub(crate) fn host_is_domain(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// The host component of a URL, lowercased, with userinfo, port and IPv6
+/// brackets removed. `None` when the value has no authority to read.
+///
+/// Total by design: the protocol inference in `config.rs` calls this on a
+/// value the user typed that may not parse at all, and "could not tell" must
+/// be a `None` there rather than an error path. `parse_base_url` is the
+/// strict version used when the request is actually built.
+pub(crate) fn host_of(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_u, h)| h);
+    // An IPv6 literal is bracketed and never a domain name, so it can only
+    // fail a domain comparison; return it as-is and let the comparison decide.
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, p)| {
+            if p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() {
+                h
+            } else {
+                authority
+            }
+        })
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
 fn endpoint_url(base_url: &str) -> Result<String, String> {
     let (host, _port, _secure, base_path) = parse_base_url(base_url)?;
     if !base_path.is_empty() {
         return Ok(base_url.to_string());
     }
-    let endpoint_path = if host.contains("groq.com") {
+    let endpoint_path = if host_is_domain(&host, "groq.com") {
         "/openai/v1/audio/transcriptions"
     } else {
         "/v1/audio/transcriptions"
@@ -93,6 +137,15 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
         if let Some(transcript) = parse_json_transcript(trimmed) {
             return Ok(transcript);
         }
+        // A body that opens as a JSON object and carries no key this parser
+        // knows falls through to being typed verbatim, which is deliberate and
+        // was re-examined while fixing the escape decoder: refusing it would
+        // lose a dictation that merely BEGAN with a brace (a developer
+        // speaking "{ hello }" under `response_format=text` arrives here as
+        // bare text), and the stated priority in `looks_like_a_refusal` is
+        // that losing heard words is worse than typing an odd body. The cost
+        // of that choice is a truncated or unknown-keyed JSON 200, which is
+        // typed instead of refused.
     }
     if looks_like_a_refusal(trimmed) {
         return Err(format!(
@@ -136,14 +189,20 @@ fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
 /// is as common as the compact spelling).
 fn looks_like_a_refusal(body: &str) -> bool {
     let start = body.trim_start();
-    // Only the marker prefixes are examined, never a copy of the whole body.
-    // This runs on every REST response, and the body is bounded at 8 MiB
-    // (`MAX_TRANSCRIPT_BYTES`), so the old `start.to_ascii_lowercase()`
-    // allocated and lowercased up to 8 MiB to answer a question about its
-    // first 14 bytes. Behaviour is identical: the same markers, matched
-    // ASCII-case-insensitively, against a string that no longer pays for a
+    // The HTML/XML shapes are decided on their PREFIX alone, and never on a
+    // copy of the body. This runs on every REST response and the body is
+    // bounded at 8 MiB (`MAX_TRANSCRIPT_BYTES`), so the old
+    // `start.to_ascii_lowercase()` allocated and lowercased up to 8 MiB to
+    // answer a question about the first 14 bytes. Behaviour is identical: the
+    // same markers, matched ASCII-case-insensitively, without paying for a
     // full copy. Byte-slicing is avoided on purpose - clamping to a fixed
     // length would panic on a multibyte character at that boundary.
+    //
+    // The JSON clauses below are NOT prefix-only: they scan the object for
+    // `"error"` and `"message"`. That is a different decision made for a
+    // different reason (an error object can carry its member anywhere), and
+    // the whole-body scan is paid for only once the body has already been
+    // established to open as a JSON object.
     if starts_with_ignore_case(start, "<!doctype html")
         || starts_with_ignore_case(start, "<html")
         || starts_with_ignore_case(start, "<?xml")
@@ -188,8 +247,7 @@ pub fn parse_json_transcript(json: &str) -> Option<String> {
                     while let Some(c) = chars.next() {
                         match c {
                             '"' => return Some(out),
-                            '\\' => {
-                                match chars.next()? {
+                            '\\' => match chars.next()? {
                                     '"' => out.push('"'),
                                     '\\' => out.push('\\'),
                                     '/' => out.push('/'),
@@ -198,20 +256,9 @@ pub fn parse_json_transcript(json: &str) -> Option<String> {
                                     'n' => out.push('\n'),
                                     'r' => out.push('\r'),
                                     't' => out.push('\t'),
-                                    'u' => {
-                                        let mut hex = String::with_capacity(4);
-                                        for _ in 0..4 {
-                                            hex.push(chars.next()?);
-                                        }
-                                        if let Ok(code) = u16::from_str_radix(&hex, 16) {
-                                            if let Some(ch) = char::from_u32(code as u32) {
-                                                out.push(ch);
-                                            }
-                                        }
-                                    }
+                                    'u' => push_unicode_escape(&mut chars, &mut out),
                                     other => out.push(other),
-                                }
-                            }
+                            },
                             other => out.push(other),
                         }
                     }
@@ -235,12 +282,92 @@ const DISFLUENCIES: &[&str] = &[
 ];
 
 /// True if the token is a disfluency, ignoring surrounding punctuation and case.
+///
+/// The trim keeps `-` on purpose, and the case it exists for is the streaming
+/// path: words arrive split on whitespace out of a provider frame, so an
+/// affirmative that a provider breaks across chunks reaches this as the token
+/// `uh-` (and later `huh`). Trimming hyphens like any other punctuation would
+/// reduce `uh-` to `uh`, drop it as a filler, and type "huh" - the exact
+/// half-word the list above refuses to eat whole. Leaving `-` in place makes
+/// `uh-` a token that matches nothing, which is what a fragment of an
+/// affirmative should do.
+///
+/// The cost is that a hyphen-edged filler survives too (`-uh` is typed rather
+/// than dropped). That is the right direction: this filter's stated bias is
+/// that eating a meaningful word is worse than missing a filler.
 pub fn is_disfluency(word: &str) -> bool {
     let norm = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
     if norm.is_empty() {
         return false;
     }
     DISFLUENCIES.iter().any(|d| norm.eq_ignore_ascii_case(d))
+}
+
+/// Append the character a JSON `\u` escape names, consuming it from `chars`.
+///
+/// The old inline decoder had three ways to lose words the user actually
+/// dictated, all silent:
+/// - it decoded each escape on its own, and `char::from_u32` refuses a lone
+///   surrogate, so the pair JSON uses for anything outside the BMP (an emoji
+///   as `\ud83d\ude00`, which is how providers write it) dropped BOTH halves;
+/// - bad hex (`\u00ZZ`) fell through `if let Ok(..)` and dropped one character
+///   with no trace;
+/// - an escape truncated to fewer than four characters pulled `chars.next()?`
+///   all the way out of `parse_json_transcript`, so one malformed escape lost
+///   the whole transcript.
+///
+/// So this pairs surrogates and, for anything it genuinely cannot decode,
+/// writes U+FFFD and keeps going. A replacement mark in a typed transcript is
+/// visibly odd; a vanished word is indistinguishable from the provider not
+/// hearing it, which is the worse failure for a dictation tool.
+///
+/// Nothing here is consumed unless four ASCII hex digits follow, so a
+/// malformed escape cannot swallow the closing quote and mis-locate the end
+/// of the string.
+fn push_unicode_escape(chars: &mut std::str::Chars<'_>, out: &mut String) {
+    const REPLACEMENT: char = '\u{fffd}';
+    let Some(high) = take_hex4(chars) else {
+        out.push(REPLACEMENT);
+        return;
+    };
+    // A high surrogate is only the first half of a non-BMP character.
+    if (0xD800..=0xDBFF).contains(&high) {
+        if chars.as_str().starts_with("\\u") {
+            let before = chars.clone();
+            let _ = chars.next(); // backslash
+            let _ = chars.next(); // 'u'
+            if let Some(low) = take_hex4(chars) {
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    let scaled =
+                        0x10000u32 + (((high - 0xD800) as u32) << 10) + (low - 0xDC00) as u32;
+                    if let Some(c) = char::from_u32(scaled) {
+                        out.push(c);
+                        return;
+                    }
+                }
+            }
+            // Not a low half: hand the escape back so it is decoded on its own
+            // merits rather than being eaten here.
+            *chars = before;
+        }
+        out.push(REPLACEMENT);
+        return;
+    }
+    out.push(char::from_u32(high as u32).unwrap_or(REPLACEMENT));
+}
+
+/// Four ASCII hex digits from the front of `chars`, or None without consuming
+/// anything. A non-ASCII first character is not a hex digit, so `len` and the
+/// byte check together also prove all four are one character each.
+fn take_hex4(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    let four: String = chars.as_str().chars().take(4).collect();
+    if four.len() != 4 || !four.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    for _ in 0..4 {
+        let _ = chars.next();
+    }
+    u16::from_str_radix(&four, 16).ok()
 }
 
 /// Remove disfluency tokens from a transcript and normalise whitespace.
@@ -761,6 +888,117 @@ mod tests {
         assert_eq!(parse_json_transcript(json), Some("line 1\nline 2 \"quoted\"".to_string()));
     }
 
+    /// A provider writing an emoji (or any non-BMP character) escapes it as a
+    /// surrogate PAIR, and decoding each half alone yields `char::from_u32`
+    /// -> None: the whole character used to be dropped twice over, so the word
+    /// vanished from the transcript and looked like the provider had not heard
+    /// it. Now the pair is combined, and a half that cannot be combined becomes
+    /// U+FFFD rather than nothing.
+    #[test]
+    fn a_surrogate_pair_becomes_one_character() {
+        let emoji = r#"{"text":"great \ud83d\ude00 nice"}"#;
+        assert_eq!(
+            parse_json_transcript(emoji),
+            Some("great \u{1f600} nice".to_string()),
+            "the pair must combine into the character it names"
+        );
+        // A high half with no low half after it is a lone surrogate: keep a
+        // visible mark and keep the rest of the string.
+        let lone = r#"{"text":"a\ud800b"}"#;
+        assert_eq!(
+            parse_json_transcript(lone),
+            Some("a\u{fffd}b".to_string()),
+            "a lone high half must still leave the surrounding words intact"
+        );
+        // A low half on its own is equally undecodable, and equally must not
+        // cost anything else.
+        let low = r#"{"text":"x\udc00y"}"#;
+        assert_eq!(parse_json_transcript(low), Some("x\u{fffd}y".to_string()));
+        // A high half followed by something that is not a low half: the second
+        // escape has to be decoded on its own merits, not eaten as a pair.
+        let not_low = r#"{"text":"\ud83d\ud83d"}"#;
+        assert_eq!(
+            parse_json_transcript(not_low),
+            Some("\u{fffd}\u{fffd}".to_string()),
+            "two high halves are two bad escapes, not one"
+        );
+    }
+
+    /// Bad hex and a truncated escape must cost one character, not the
+    /// transcript. The old code returned None from the whole function when an
+    /// escape ran out of input, so a provider that truncated one field lost
+    /// every word of the dictation.
+    #[test]
+    fn an_undecodable_escape_costs_itself_only() {
+        // Truncated mid-escape. Nothing is consumed on a failed decode, so the
+        // two digits that WERE there survive as literal text and the string is
+        // still terminated by its own quote: the marker plus the partial escape
+        // is what the user sees, instead of the whole transcript being lost.
+        let truncated = r#"{"text":"hello \u12"}"#;
+        assert_eq!(
+            parse_json_transcript(truncated),
+            Some("hello \u{fffd}12".to_string())
+        );
+        // Non-hex digits: the escape's own text is NOT swallowed (nothing is
+        // consumed on a failed decode), so the digits stay visible and the
+        // closing quote is still found. A strict JSON parser would reject this
+        // document outright; this parser's job is to hand the user as much of
+        // what the provider said as it can, and losing the words around a
+        // malformed escape is the failure being fixed here.
+        let bad_hex = r#"{"text":"a\u00ZZb"}"#;
+        assert_eq!(
+            parse_json_transcript(bad_hex),
+            Some("a\u{fffd}00ZZb".to_string())
+        );
+        // A valid BMP escape still works exactly as before.
+        let plain = r#"{"text":"caf\u00e9"}"#;
+        assert_eq!(parse_json_transcript(plain), Some("caf\u{e9}".to_string()));
+    }
+
+    /// A provider domain is recognised at a label boundary and nowhere else.
+    ///
+    /// Both halves matter: a spoofed or look-alike host must NOT select
+    /// Groq's path, and a real deployment of the provider (apex, `www.`, a
+    /// regional subdomain, an explicit port, a trailing dot from a FQDN) must
+    /// still be recognised. The old `contains` got the second half right only
+    /// by accident and the first half wrong.
+    #[test]
+    fn a_provider_domain_is_matched_at_the_boundary_not_as_a_substring() {
+        for url in [
+            "https://api.groq.com",
+            "https://api.groq.com:443",
+            "https://www.groq.com",
+            "https://groq.com.",
+            "https://user:pass@api.groq.com/v1",
+        ] {
+            let host = host_of(url).unwrap_or_default();
+            assert!(host_is_domain(&host, "groq.com"), "{url} must be Groq");
+        }
+        for url in [
+            "https://groq.com.evil.test/v1",
+            "https://notgroq.com/v1",
+            "https://mygroq.com/v1",
+            "http://tunnel.internal/mirror/groq.com/v1",
+            "https://api.openai.com",
+            "http://localhost:1234/v1",
+        ] {
+            let host = host_of(url).unwrap_or_default();
+            assert!(!host_is_domain(&host, "groq.com"), "{url} must not be Groq");
+        }
+        // A path can never be read as a host, whatever it contains.
+        assert_eq!(
+            host_of("https://x.test/groq.com").as_deref(),
+            Some("x.test")
+        );
+        // Nothing to compare against, rather than a wrong answer.
+        assert_eq!(host_of("not a url"), None);
+        assert_eq!(host_of("https://"), None);
+        assert_eq!(host_of("https:///path"), None);
+        // A non-numeric port colon belongs to the host, not a port split.
+        assert_eq!(host_of("https://[::1]:8080/v1").as_deref(), Some("::1"));
+        assert_eq!(host_of("https://[::1]/v1").as_deref(), Some("::1"));
+    }
+
     #[test]
     fn test_parse_base_url() {
         let (host, port, secure, path) = parse_base_url("https://api.groq.com/openai/v1/audio/transcriptions").unwrap();
@@ -969,6 +1207,23 @@ mod tests {
         for w in ["uh-huh", "mm-hmm", "mhm", "uh-hum"] {
             assert!(!is_disfluency(w), "{w} is an affirmative, not a filler");
         }
+        // The same protection has to hold when a provider SPLITS the
+        // affirmative across chunks, which is what the hyphen in the trim set
+        // is for. Without it, `uh-` trims to `uh`, is dropped as a filler, and
+        // the user is left typed with "huh".
+        for w in ["uh-", "mm-", "uh-huh-"] {
+            assert!(
+                !is_disfluency(w),
+                "{w} is an affirmative fragment, not a filler"
+            );
+        }
+        // A filler edged with ordinary punctuation is still the filler.
+        for w in ["(uh)", "um,", "\u{2014}hmm"] {
+            assert!(
+                is_disfluency(w),
+                "{w} is a filler whatever it is edged with"
+            );
+        }
     }
 
     /// A model, language or keyterm containing a line break or the multipart
@@ -1027,17 +1282,6 @@ mod tests {
         assert!(text.ends_with(&format!("--{BOUNDARY}--\r\n")), "{text}");
     }
 
-    /// The two response ceilings must be different ceilings, not one shared
-    /// number: a transcript is a few kilobytes and a release executable is
-    /// several megabytes, and the intent requires the asset path to keep
-    /// headroom the transcript path does not. This drives the real Windows
-    /// transport (`transcribe` -> `WinHttpTransport::post` -> the capped
-    /// `read_body`) against a loopback server that answers with more bytes than
-    /// `MAX_TRANSCRIPT_BYTES`, and asserts the body really was clipped there.
-    ///
-    /// It is deliberately not a test of truncation *silently* happening - that
-    /// behaviour was reviewed and declined - but of the two bounds being
-    /// distinct, which is what the split was for.
     /// Every request must carry the one user agent, whatever the method and
     /// whatever the platform.
     ///
@@ -1124,6 +1368,17 @@ mod tests {
         );
     }
 
+    /// The two response ceilings must be different ceilings, not one shared
+    /// number: a transcript is a few kilobytes and a release executable is
+    /// several megabytes, and the intent requires the asset path to keep
+    /// headroom the transcript path does not. This drives the real Windows
+    /// transport (`transcribe` -> `WinHttpTransport::post` -> the capped
+    /// `read_body`) against a loopback server that answers with more bytes than
+    /// `MAX_TRANSCRIPT_BYTES`, and asserts the body really was clipped there.
+    ///
+    /// It is deliberately not a test of truncation *silently* happening - that
+    /// behaviour was reviewed and declined - but of the two bounds being
+    /// distinct, which is what the split was for.
     #[test]
     fn a_transcript_response_is_bounded_by_the_transcript_ceiling() {
         use std::io::{Read as _, Write as _};

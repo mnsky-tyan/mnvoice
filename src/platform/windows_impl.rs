@@ -234,8 +234,15 @@ impl WinHttpTransport {
         handles.request = Some(request);
 
         // Added before the handle is returned, so it applies to every caller
-        // (GET, POST, WebSocket upgrade). `WinHttpAddRequestHeaders` takes a
-        // length rather than a terminator, so the trailing CRLF is dropped.
+        // (GET, POST, WebSocket upgrade).
+        //
+        // The binding passes `slice.len()` as `dwHeadersLength`, so the slice
+        // handed over must not count `wide`'s appended UTF-16 NUL as header
+        // text. What the slice drops is THAT terminator, not the header's own
+        // trailing CRLF: the string still ends in CRLF when it goes to
+        // WinHTTP, which is the line ending the API expects per header line.
+        // (An earlier comment here said the CRLF was dropped, which was never
+        // what the arithmetic did.)
         if let Err(e) = WinHttpAddRequestHeaders(
             request,
             &agent_w[..agent_w.len() - 1],
@@ -329,8 +336,9 @@ impl Transport for WinHttpTransport {
             let headers = wide(&format!("Accept: {accept}\r\n"));
             let result = (|| {
                 // Headers go on before the send; anything added afterwards
-                // never reaches the wire. Trailing CRLF trimmed because
-                // WinHttpAddRequestHeaders takes a length, not a terminator.
+                // never reaches the wire. As in `open`, the element removed is
+                // `wide`'s appended NUL (the length argument counts header
+                // characters), and the CRLF that ends the header line stays.
                 WinHttpAddRequestHeaders(
                     request,
                     &headers[..headers.len() - 1],
