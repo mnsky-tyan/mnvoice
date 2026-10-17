@@ -992,6 +992,63 @@ mod tests {
         );
     }
 
+    /// One incoming message cannot be made to grow the process without limit.
+    ///
+    /// `read` reassembles fragments before handing anything back, so a peer
+    /// that keeps sending continuations keeps the buffer growing until it
+    /// either completes or is refused. tungstenite refused at its own default
+    /// of 64 MiB and the WinHTTP reader had no bound at all, which is the
+    /// mistyped-`BASE_URL` risk `MAX_TRANSCRIPT_BYTES` already covers on the
+    /// REST path: a transcript frame is a few hundred bytes, so a message this
+    /// large is a broken or hostile provider, not a long dictation. Both
+    /// transports now refuse at `MAX_WS_MESSAGE_BYTES`, and this drives the
+    /// shared seam so neither can regress alone.
+    #[test]
+    fn an_over_long_message_is_refused_rather_than_buffered() {
+        use std::io::Write as _;
+        use crate::platform::http::{MAX_WS_MESSAGE_BYTES, NativeTransport};
+
+        // One byte past the ceiling, in frames the peer never marks final
+        // until the last one: the reader has to accumulate all of it before it
+        // could decide the message was merely large.
+        let payload = vec![b'a'; MAX_WS_MESSAGE_BYTES + 1];
+        let (port, server) = live_provider::serve(move |stream| {
+            let chunk = 256 * 1024;
+            let mut off = 0;
+            while off < payload.len() {
+                let n = (payload.len() - off).min(chunk);
+                let last = off + n >= payload.len();
+                let opcode = if off == 0 { 0x1 } else { 0x0 };
+                if stream
+                    .write_all(&live_provider::fragment(opcode, &payload[off..off + n], last))
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = stream.flush();
+                off += n;
+            }
+            // Hold the socket open while the client decides, then let it go.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/");
+        let socket = NativeTransport
+            .websocket(&url, &[("Authorization", "Bearer tok")])
+            .expect("the loopback upgrade succeeds");
+        let read = socket
+            .read()
+            .expect_err("an over-long message must not be delivered as a transcript");
+        // Each transport words its own refusal (WinHTTP says "message
+        // exceeded", tungstenite surfaces its frame error), so what both can be
+        // held to is the number: the bound that fired is the one this crate set.
+        assert!(
+            read.contains(&MAX_WS_MESSAGE_BYTES.to_string()),
+            "the refusal must name the bound that fired, got: {read}"
+        );
+        let _ = server.join();
+    }
+
     /// The wire-level counterpart of `a_model_or_language_cannot_inject_query_parameters`:
     /// the same hostile values, observed as the request line the real transport
     /// puts on a real socket, rather than as a string the URL builder returned.

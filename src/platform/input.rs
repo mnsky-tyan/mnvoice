@@ -32,6 +32,11 @@ pub trait Injector: Send + Sync {
 /// Shared by every backend: apps that buffer input (browsers, terminals)
 /// auto-repeat or drop events when a large batch lands at once, so each
 /// character is followed by this small sleep before the next.
+///
+/// It is a floor, not a guarantee of the total gap: a backend whose injection
+/// call sleeps internally adds to it. macOS does (see the note in
+/// `macos_impl::type_text`), so that backend types each character slower than
+/// this number while Linux and Windows pay exactly it.
 pub const KEY_GAP: Duration = Duration::from_millis(2);
 
 // The real platform injector is only reached outside tests (see `global`),

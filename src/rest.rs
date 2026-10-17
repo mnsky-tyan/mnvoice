@@ -103,23 +103,6 @@ fn fallback_transcript(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Whether a 200 body is a provider's error payload rather than a transcript.
-///
-/// Kept deliberately narrow. A false positive would reject a real transcript,
-/// which loses a dictation the user already spoke; a false negative types an
-/// error page, which is what the guard is for. So only the shapes that can only
-/// be an error are listed - a JSON object with an `error` member, an HTML
-/// document, and an XML one - and anything ambiguous is left to the fallback.
-///
-/// The JSON clauses are read only when the body opens as a JSON object, for
-/// that same reason: a provider honouring `response_format=text` returns the
-/// words the user dictated, and a dictated bug report or commit body happily
-/// contains `"error"`. Quoted-key shapes found anywhere in a bare transcript
-/// would throw away a dictation that was actually heard.
-///
-/// The `"message"` value may be separated from its key and colon by ASCII
-/// whitespace, because providers pretty-print their JSON (`{"message": "..."}`
-/// is as common as the compact spelling).
 /// ASCII-case-insensitive "does `haystack` begin with `needle`", comparing
 /// bytes without lowercasing (or copying) either side. Both sides are folded,
 /// so neither argument has to be pre-lowercased for the comparison to hold.
@@ -131,19 +114,40 @@ fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
             .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
 }
 
+/// Whether a 200 body is a provider's error payload rather than a transcript.
+///
+/// Kept deliberately narrow. A false positive would reject a real transcript,
+/// which loses a dictation the user already spoke; a false negative types an
+/// error page, which is what the guard is for. So only the shapes that can only
+/// be an error are listed - a JSON object with an `error` member, an HTML
+/// document, and an XML error envelope - and anything ambiguous is left to the
+/// fallback. The XML case has two spellings because providers use both: a
+/// declaration-led document (`<?xml ...`) and the bare envelope an AWS/S3-style
+/// API returns (`<Error><Code>...`), which carries no declaration at all.
+///
+/// The JSON clauses are read only when the body opens as a JSON object, for
+/// that same reason: a provider honouring `response_format=text` returns the
+/// words the user dictated, and a dictated bug report or commit body happily
+/// contains `"error"`. Quoted-key shapes found anywhere in a bare transcript
+/// would throw away a dictation that was actually heard.
+///
+/// The `"message"` value may be separated from its key and colon by ASCII
+/// whitespace, because providers pretty-print their JSON (`{"message": "..."}`
+/// is as common as the compact spelling).
 fn looks_like_a_refusal(body: &str) -> bool {
     let start = body.trim_start();
     // Only the marker prefixes are examined, never a copy of the whole body.
     // This runs on every REST response, and the body is bounded at 8 MiB
     // (`MAX_TRANSCRIPT_BYTES`), so the old `start.to_ascii_lowercase()`
     // allocated and lowercased up to 8 MiB to answer a question about its
-    // first 14 bytes. Behaviour is identical: the same three markers, matched
+    // first 14 bytes. Behaviour is identical: the same markers, matched
     // ASCII-case-insensitively, against a string that no longer pays for a
     // full copy. Byte-slicing is avoided on purpose - clamping to a fixed
     // length would panic on a multibyte character at that boundary.
     if starts_with_ignore_case(start, "<!doctype html")
         || starts_with_ignore_case(start, "<html")
         || starts_with_ignore_case(start, "<?xml")
+        || starts_with_ignore_case(start, "<error")
     {
         return true;
     }
@@ -263,21 +267,19 @@ pub fn trailing_space_due(trailing_space: bool, text: &str) -> bool {
 ///
 /// FILLER_WORDS=1 keeps the transcript verbatim - the streaming path asks the
 /// provider for that instead, because REST has no such parameter anywhere -
-/// and TRAILING_SPACE only ever appends to text that was actually typed. Both
-/// control surfaces state the rule the same way; it lives here because the
+/// and TRAILING_SPACE only ever appends after text that was actually typed.
+/// Both control surfaces state the rule the same way; it lives here because the
 /// Windows tray and the Unix terminal CLI would otherwise each keep their own
 /// copy and drift.
 ///
-/// (The paragraph above used to sit on `trailing_space_due` - two functions'
-/// docs collided onto the wrong item, and this one had none.)
-/// What the REST path types, and whether a trailing space follows it.
+/// The `bool` half is the trailing-space decision, and it is returned rather
+/// than recomputed by the caller because it is taken on the *stripped* text:
+/// a transcript of nothing but fillers strips to empty, and a caller that
+/// tested its own input would append a space to a dictation that typed
+/// nothing. `trailing_space_due` is the shared predicate, so the streaming path
+/// (which strips word-by-word in `stream.rs`) agrees by construction.
 ///
-/// Module-private: `dictate_rest` is its only production caller, and the API
-/// deliberately cannot be called twice by the same caller (the second call
-/// would re-type), which is what the `bool` half of the return exists to serve.
-/// The shared questions it composes - `strip_disfluencies` locally, and
-/// `trailing_space_due` for the streaming path too - are the parts with more
-/// than one user.
+/// Module-private: `dictate_rest` is its only production caller.
 fn rest_typing(raw: &str, strip_fillers: bool, trailing_space: bool) -> (String, bool) {
     let text = if strip_fillers {
         strip_disfluencies(raw.trim())
@@ -519,6 +521,22 @@ mod tests {
         // ...and does not fire on a body merely beginning with `<h`, the
         // shorter marker's own prefix.
         assert!(!looks_like_a_refusal("<h1>not a marker</h1>"));
+    }
+
+    /// An AWS/S3-style error envelope carries no `<?xml` declaration: the body
+    /// opens `<Error>` directly. The function doc names "an XML one" as a
+    /// caught shape, and before this marker that claim was only true of the
+    /// declaration-led spelling, so a gateway error page was typed into the
+    /// user's focused window.
+    #[test]
+    fn an_xml_error_envelope_without_a_declaration_is_a_refusal() {
+        let envelope = "<Error><Code>AccessDenied</Code><Message>no access</Message></Error>";
+        assert!(looks_like_a_refusal(envelope));
+        assert!(looks_like_a_refusal("  <error>lower case, indented</error>"));
+        // A transcript that merely mentions a tag is still not a refusal: the
+        // markers are prefix-only, exactly like the HTML ones.
+        assert_eq!(fallback_transcript("press <error> to continue").as_deref(),
+                   Ok("press <error> to continue"));
     }
 
     /// The case-insensitive prefix comparison folds BOTH sides, so a caller
@@ -1020,6 +1038,92 @@ mod tests {
     /// It is deliberately not a test of truncation *silently* happening - that
     /// behaviour was reviewed and declined - but of the two bounds being
     /// distinct, which is what the split was for.
+    /// Every request must carry the one user agent, whatever the method and
+    /// whatever the platform.
+    ///
+    /// The constant's doc is that the two backends cannot drift because the
+    /// seam owns the header, but the header was only spelled out on the GET: a
+    /// transcription POST went out as WinHTTP's session name on Windows and as
+    /// `ureq/2.x` on Unix, and the Unix WebSocket upgrade sent none. A provider
+    /// correlating a dictation across its own logs could not tie the two
+    /// requests to one client. This drives the real POST through the transport
+    /// against a loopback peer and reads the header off the wire.
+    #[test]
+    fn the_post_carries_the_shared_user_agent() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(20)));
+            // Read the head, then the body it promises, before answering: see
+            // the note in `a_transcript_response_is_bounded_by_the...` on why
+            // answering early makes the client's write fail.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let want: usize = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut got = 0usize;
+            let mut sink = [0u8; 4096];
+            while got < want {
+                match stream.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got += n,
+                }
+            }
+            let body = "{\"text\":\"ok\"}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if stream.write_all(reply.as_bytes()).is_err() {
+                return String::from_utf8_lossy(&head).to_string();
+            }
+            let _ = stream.flush();
+            // Hold the socket until the client closes it. Returning here would
+            // drop the stream and close it while the client may still be
+            // reading: on macOS that arrives as a reset mid-read and ureq
+            // reports `reading response body failed (Invalid argument (os
+            // error 22))`, which is what this fixture did on CI. The same trap
+            // is recorded in AGENTS.md for the bounded-response test below,
+            // which drains for this reason; a small body is not an exemption,
+            // only a shorter window.
+            let mut sink = [0u8; 512];
+            while let Ok(n) = stream.read(&mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&head).to_string()
+        });
+
+        let url = endpoint_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        let response = crate::platform::http::NativeTransport
+            .post(&url, Some("Bearer tok"), "application/json", b"{}")
+            .expect("the loopback request succeeds");
+        assert_eq!(response.status, 200);
+        let head = server.join().unwrap().to_lowercase();
+        assert!(
+            head.contains(&format!("user-agent: {}", crate::platform::http::USER_AGENT).to_lowercase()),
+            "the POST must identify as the shared agent, head was:\n{head}"
+        );
+    }
+
     #[test]
     fn a_transcript_response_is_bounded_by_the_transcript_ceiling() {
         use std::io::{Read as _, Write as _};

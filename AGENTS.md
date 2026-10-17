@@ -18,6 +18,16 @@ and direct keyboard event injection.
    - Target directory MUST sit on the Windows disk because WSL 9p mounts do not support Windows file locking.
    - Pure unit tests exercise code paths safely without acquiring the single-instance mutex or touching audio hardware.
    - Do NOT create scratch probe executables, live window harnesses, or kill background processes.
+   - **A destructive probe must name a target that cannot exist.** On
+     2026-10-17 a probe of taskkill's exit codes ran
+     `taskkill /F /IM mnvoice.exe /FI "PID ne 999999"` against the LIVE
+     instance: the image name is the product's own, and a filter that matches
+     every PID still selects the running app, so PID 5700 was terminated. The
+     rule is the `/IM` argument, not the `/FI` filter - use a name that has no
+     process behind it (`mnvoice-probe-does-not-exist.exe`), or copy a
+     harmless system binary to a private name and target that. Recovery from
+     this mistake is a user action, not an agent one: the exe on disk is
+     untouched, but only the user can restart their own tray app.
 
 3. **Release & Tag Discipline**:
    - Version bumps must update BOTH `Cargo.toml` AND `Cargo.lock` together (`cargo update -p mnvoice --offline` or `cargo build`).
@@ -48,6 +58,14 @@ and direct keyboard event injection.
      surfaces as `Connection reset by peer (os error 104)`, on macOS as `timed out reading
      response` - it is a flaky-test signature, not a production bug. Write in bounded chunks
      with a write timeout and drain until the client closes.
+   - **The same trap fires with a SMALL body, and on a different error string.**
+     A loopback fixture that wrote a 15-byte JSON reply and returned (dropping
+     the stream) passed Linux and Windows and failed macOS CI with
+     `reading response body failed (Invalid argument (os error 22))`. The
+     window is short, not absent: the client can still be in its read when the
+     server closes. Drain until the client closes regardless of body size, and
+     do not treat "the body is tiny" or "it passed locally" as evidence - the
+     third OS in the matrix is where it shows.
    - `FindWindowW("mnvoiceTrayClass", $null)` returns zero even while the window exists.
      Enumerate with `EnumWindows`, match `GetClassNameW` against `mnvoiceTrayClass` and
      `GetWindowThreadProcessId` against the target PID, then `PostMessageW` the returned
@@ -154,6 +172,18 @@ and direct keyboard event injection.
      Windows-bound work rather than letting an agent thrash. Recovery is the
      user's Windows-side call: restarting WSL kills every WSL process,
      including the agent session and herdr's panes.
+   - **Interop recovered PARTIALLY, and the recovery is per-launch-shape
+     (measured 2026-10-17).** Direct `.exe` invocation over the mount works
+     again - `/mnt/c/Users/tyanw/.cargo/bin/cargo.exe`, `tasklist.exe`,
+     `taskkill.exe` - while `cmd.exe /c echo` still returns `Permission
+     denied`. So the diagnostic above must not be read as "the whole mount is
+     down": test the shape you actually need, and do not use a dead `cmd.exe`
+     to declare `cargo.exe` dead. Consequence for this project: the Windows
+     suite now runs LOCALLY with the authoritative command in rule 2 (183
+     tests, measured 61-62 s wall with a warm target dir including recompiling
+     two source files), so "CI is the only Windows compiler" is obsolete -
+     CI is still the gate, but a Windows-only edit can be compiled and tested
+     before it is pushed. `powershell.exe` was not re-tested this pass.
    - **NEVER run a freshly built `mnvoice.exe` with `--restart` while the live
      instance is running.** The flag's whole job is to kill other mnvoice
      processes and free the hotkey, so it terminates the user's running app -

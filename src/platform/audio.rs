@@ -31,7 +31,7 @@ pub const I16_SCALE: f32 = 32768.0;
 /// an accidental hotkey press does not hold the microphone hostage until
 /// `max_seconds`. Both engines enforce it, including on a capture path that
 /// delivers nothing at all - see [`SilenceWindows::advance_stalled`].
-pub const NO_SPEECH_LIMIT_MS: u64 = 10_000;
+const NO_SPEECH_LIMIT_MS: u64 = 10_000;
 
 /// How much wall-clock audio a buffer of `samples` covers at the shared rate.
 ///
@@ -40,7 +40,7 @@ pub const NO_SPEECH_LIMIT_MS: u64 = 10_000;
 /// covered. A tick that consumed no audio at all is the one case this cannot
 /// cover (`audio_ms(0)` is 0), and it is handled by
 /// [`SilenceWindows::advance_stalled`] instead of being silently free.
-pub fn audio_ms(samples: usize) -> u64 {
+fn audio_ms(samples: usize) -> u64 {
     samples as u64 * 1000 / SAMPLE_RATE as u64
 }
 
@@ -178,7 +178,7 @@ impl SilenceWindows {
 /// configured `VAD_SILENCE_MS`, and the never-heard-speech window against
 /// [`NO_SPEECH_LIMIT_MS`]. The threshold is the limit itself, so a limit of 0
 /// stops on the first silent tick instead of switching the detector off.
-pub fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
+fn silence_expired(since_voice_ms: u64, vad_silence_ms: u32) -> bool {
     since_voice_ms >= vad_silence_ms as u64
 }
 

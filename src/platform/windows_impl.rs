@@ -15,7 +15,7 @@
 // trait documents the contract; the test in `update.rs` pins it.
 
 use crate::platform::http::{
-    Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, USER_AGENT,
+    Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, MAX_WS_MESSAGE_BYTES, USER_AGENT,
 };
 use crate::rest::parse_base_url;
 use windows::core::{w, PCWSTR};
@@ -199,6 +199,16 @@ impl WinHttpTransport {
         }
         handles.connect = Some(connect);
 
+        // One user agent for every request this transport makes. The session
+        // opened above is named `w!("mnvoice")`, and WinHTTP would put that on
+        // the wire for a request that adds no User-Agent header of its own -
+        // which is what made the identity depend on the method: only the GET
+        // spelled out `USER_AGENT`, so a transcription POST identified as
+        // "mnvoice" while the update feed identified as "mnvoice-update". The
+        // trait's doc (see `platform::http::USER_AGENT`) is that the two
+        // backends send one string, so it is added here, where every method
+        // passes, and no caller spells it again.
+        let agent_w = wide(&format!("User-Agent: {USER_AGENT}\r\n"));
         let method_w = wide(method);
         let path_w = wide(&path);
         // dwFlags deliberately 0: WinHTTP disables redirects only when
@@ -223,6 +233,17 @@ impl WinHttpTransport {
         }
         handles.request = Some(request);
 
+        // Added before the handle is returned, so it applies to every caller
+        // (GET, POST, WebSocket upgrade). `WinHttpAddRequestHeaders` takes a
+        // length rather than a terminator, so the trailing CRLF is dropped.
+        if let Err(e) = WinHttpAddRequestHeaders(
+            request,
+            &agent_w[..agent_w.len() - 1],
+            WINHTTP_ADDREQ_FLAG_ADD,
+        ) {
+            return Err(format!("set user agent ({e})"));
+        }
+
         Ok(handles)
     }
 
@@ -231,10 +252,12 @@ impl WinHttpTransport {
     ///
     /// The query result is propagated, not discarded: a failure used to leave
     /// `status` at 0 and hand back `Ok(status)`, so a response whose headers
-    /// could not be read looked like an HTTP 0. Both callers demand exactly 200
-    /// so it still surfaced as an error rather than a false success, but the
-    /// Win32 failure behind it was gone, and a status of 0 is a strange thing
-    /// to report as a status code. `open` checks the sibling call already.
+    /// could not be read looked like an HTTP 0. Every one of the three call
+    /// sites still rejects a bogus 0 - the WebSocket upgrade compares 101
+    /// inline, and GET and POST carry the status out to callers that demand
+    /// 200 - so the failure surfaced as an error rather than a false success.
+    /// What was lost was the Win32 reason behind it, and a status of 0 is a
+    /// strange thing to report as a status code.
     unsafe fn status_of(request: *mut std::ffi::c_void) -> windows::core::Result<u16> {
         let mut status: u32 = 0;
         let mut len = std::mem::size_of::<u32>() as u32;
@@ -303,7 +326,7 @@ impl Transport for WinHttpTransport {
             let handles = Self::open("GET", url, HTTP_DOWNLOAD_TIMEOUTS)?;
             let request = handles.request();
 
-            let headers = wide(&format!("Accept: {accept}\r\nUser-Agent: {USER_AGENT}\r\n"));
+            let headers = wide(&format!("Accept: {accept}\r\n"));
             let result = (|| {
                 // Headers go on before the send; anything added afterwards
                 // never reaches the wire. Trailing CRLF trimmed because
@@ -599,10 +622,13 @@ impl WebSocket for WinHttpSocket {
 
     /// Close the connection.
     ///
-    /// Diverges from the trait's `close` in the one way WinHTTP cannot avoid,
-    /// and the divergence is recorded here because the trait's own text points
-    /// at the implementation that cannot honour it (http.rs, "a backend that
-    /// cannot block this way must say so in its implementation").
+    /// Diverges from the trait's `close` ("send a close frame and shut down
+    /// without waiting for the peer") in the one way WinHTTP cannot avoid. The
+    /// trait expects a backend that cannot honour a promise to say so at its
+    /// own implementation, which is what this note is; the same instruction
+    /// appears on `read` ("a backend that cannot block this way must say so in
+    /// its implementation"), and this method diverges in exactly the way that
+    /// sentence anticipates.
     ///
     /// `WinHttpWebSocketClose` is a negotiated close: it sends a close frame
     /// and waits for the peer's, bounded only by
@@ -699,6 +725,17 @@ impl WebSocket for WinHttpSocket {
                     || buf_type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE;
                 if read > 0 {
                     message.extend_from_slice(&buffer[..read as usize]);
+                }
+                // The accumulation is bounded. tungstenite refuses a message
+                // over its configured cap on Unix; without this check the same
+                // peer behaviour on Windows grew `message` without limit, one
+                // 64 KiB fragment at a time, in a process whose whole job is to
+                // stay responsive. The error ends the session like any other
+                // transport failure, and `stream.rs` reports it.
+                if message.len() > MAX_WS_MESSAGE_BYTES {
+                    return Err(format!(
+                        "websocket message exceeded {MAX_WS_MESSAGE_BYTES} bytes"
+                    ));
                 }
                 // `more_data` and a fragment type both mean this message is
                 // not finished; anything else is a whole message.

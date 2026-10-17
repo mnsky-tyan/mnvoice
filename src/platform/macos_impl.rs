@@ -63,6 +63,18 @@ impl Injector for CgInjector {
         // a single CGEvent. The pacing (one character per event, `KEY_GAP`
         // after each) comes from `input::type_paced`, the contract's single
         // owner, so this and the Linux backend cannot drift on the gap.
+        //
+        // The gap this backend actually delivers is larger than `KEY_GAP`, and
+        // it is not this file's arithmetic: enigo's own `text` ends with a
+        // hardcoded `sleep(2 ms)` (enigo-0.2.1 src/macos/macos_impl.rs, after
+        // its chunk loop) that no option configures away. One character per
+        // call means that sleep is paid per character, so a transcript types
+        // at roughly 4 ms a character here against 2 ms on Linux and Windows.
+        // It is left alone rather than halved: the pacing contract is a floor,
+        // a slower typist is not a dropped character, and matching the number
+        // would mean reimplementing the Unicode-string event post to escape a
+        // dependency's private sleep. Stated here because the alternative is a
+        // reader measuring 4 ms and assuming a bug.
         // On failure the event source is dropped so the next commit rebuilds
         // it; the pacer stops at the first error either way.
         crate::platform::input::type_paced(text, |c| {

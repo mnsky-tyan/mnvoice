@@ -504,7 +504,21 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
     let old = match stage_and_swap(&bytes, &exe, busy) {
         Ok(old) => old,
         Err(e) => {
-            stop_helper(&mut helper);
+            // Stop the watcher only when the install resolved to a runnable
+            // image. A swap whose rollback also failed leaves nothing at the exe
+            // path with the new image still staged beside it, which is exactly
+            // the state `swap_interrupted` recognises and the helper was spawned
+            // to repair once this process is gone. Killing it here would destroy
+            // the last thing able to put an image back, turning a failed update
+            // into an uninstalled one; the staged file is kept for the same
+            // reason (see `stage_and_swap`). The test is `swap_interrupted`, the
+            // same predicate the helper wakes on, so installer and helper agree
+            // by construction about which state is worth a watcher. The repair
+            // then lands when this instance exits, which is later than the user
+            // would like but is not a brick.
+            if !swap_interrupted(&exe) {
+                stop_helper(&mut helper);
+            }
             return Err(e);
         }
     };
@@ -785,8 +799,16 @@ fn stage_and_swap(bytes: &[u8], exe: &Path, busy: impl Fn() -> bool) -> Result<P
         Ok(old) => Ok(old),
         Err(e) => {
             // The install did not land, so a full copy of the new binary must not
-            // be left sitting beside the exe for the next attempt to trip over.
-            let _ = fs::remove_file(&staged);
+            // be left sitting beside the exe for the next attempt to trip over -
+            // unless removing it would leave the install with nothing runnable.
+            // `swap_in` only reports a failed rollback in that state (exe absent,
+            // new image staged, previous image stranded at `.old`), which is
+            // exactly the state `swap_interrupted` recognises and the helper was
+            // spawned to repair. Deleting the staged file there destroys the
+            // repair, so it stays and the helper finishes the install instead.
+            if !swap_interrupted(exe) {
+                let _ = fs::remove_file(&staged);
+            }
             Err(e)
         }
     }
@@ -813,8 +835,18 @@ fn swap_in(staged: &Path, exe: &Path) -> Result<PathBuf, String> {
 
     fs::rename(exe, &old).map_err(|e| format!("cannot move current exe aside ({e})"))?;
     if let Err(e) = fs::rename(staged, exe) {
-        // Put the original back so the install is not left half-done.
-        let _ = fs::rename(&old, exe);
+        // Put the original back so the install is not left half-done, and say
+        // so in the error if that fails. The rollback's own outcome used to be
+        // discarded (`let _ =`), which is how a failed swap and a failed
+        // rollback produced the same message as a swap that had been undone:
+        // the caller could not tell "nothing changed" from "there is no exe
+        // any more", and went on to delete the staged file and stop the helper
+        // that was the only thing left that could repair it.
+        if let Err(re) = fs::rename(&old, exe) {
+            return Err(format!(
+                "cannot install new exe ({e}); and cannot put the previous image back ({re})"
+            ));
+        }
         return Err(format!("cannot install new exe ({e})"));
     }
     Ok(old)
@@ -2317,6 +2349,45 @@ B810FFF67EC7D67AB0804704EA52B678180DBD6E4D55B02CCB244F167378AB70 *mnvoice.exe\n"
         // staged file is consumed.
         assert_eq!(fs::read(old_path(&exe)).unwrap(), installed_exe());
         assert!(!staged_path(&exe).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The half-done state is only survivable because the staged image is
+    /// still there, which is why the installer keeps it when a swap fails
+    /// without a working rollback.
+    ///
+    /// The state itself (no exe, new image staged, previous image stranded at
+    /// `.old`) cannot be produced portably: it needs a rename to fail while its
+    /// own rollback also fails, which on Windows means obstructing a rename
+    /// from inside the process doing it. So this pins the two halves the fix
+    /// depends on, with plain file operations: while the staged file exists the
+    /// state is recognised and `repair_interrupted_install` puts a runnable
+    /// image back; once it is deleted - what the unconditional cleanup used to
+    /// do - the state is invisible and nothing is left to run.
+    #[test]
+    fn the_staged_image_is_the_only_thing_a_half_done_swap_can_be_repaired_with() {
+        let (dir, exe) = install_folder("brick-repair");
+        let old = old_path(&exe);
+        fs::rename(&exe, &old).unwrap(); // the swap-aside step, done
+        fs::write(staged_path(&exe), downloaded_exe()).unwrap(); // staged, not moved in
+        assert!(
+            swap_interrupted(&exe),
+            "no exe with a staged image beside it is the state the helper wakes for"
+        );
+        repair_interrupted_install(&exe, Some(&sha256::hex_digest(&downloaded_exe()))).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), downloaded_exe(), "the repair installs");
+        let _ = fs::remove_dir_all(&dir);
+
+        // The same state, with the staged file cleaned up as the old code did.
+        let (dir, exe) = install_folder("brick-destroyed");
+        fs::rename(&exe, old_path(&exe)).unwrap();
+        fs::write(staged_path(&exe), downloaded_exe()).unwrap();
+        fs::remove_file(staged_path(&exe)).unwrap();
+        assert!(
+            !swap_interrupted(&exe),
+            "without the staged image the half-done state is not recognisable"
+        );
+        assert!(!exe.exists(), "and nothing at the exe path can run");
         let _ = fs::remove_dir_all(&dir);
     }
 

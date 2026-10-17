@@ -793,13 +793,21 @@ pub const DEFAULT_HOTKEY_STR: &str = "Alt+Space";
 ///
 /// Anything else returns None, and the caller leaves `vk` at whatever an
 /// earlier part set - the same behaviour as before the extraction.
+///
+/// The F-number branch is guarded on a non-empty remainder, and that guard is
+/// load-bearing: a bare `f` is the letter F (VK_F, 0x46), not a malformed
+/// F-number. Taking the branch on `"f"` itself made `"".parse::<u32>()` fail
+/// and the `?` return from the whole function, so the character branch below
+/// was never reached and `HOTKEY=F` silently fell back to the default.
 fn key_vk(part: &str) -> Option<u32> {
     if let Some(f_num) = part.strip_prefix('f') {
-        let num = f_num.parse::<u32>().ok()?;
-        if (1..=24).contains(&num) {
-            return Some(0x70 + (num - 1)); // VK_F1 = 0x70
+        if !f_num.is_empty() {
+            let num = f_num.parse::<u32>().ok()?;
+            if (1..=24).contains(&num) {
+                return Some(0x70 + (num - 1)); // VK_F1 = 0x70
+            }
+            return None;
         }
-        return None;
     }
     let mut chars = part.chars();
     let ch = chars.next()?.to_ascii_uppercase();
@@ -969,6 +977,16 @@ mod tests {
 
         // None
         assert_eq!(parse_hotkey("none"), None);
+
+        // A bare F is the letter key (VK_F = 0x46), not a malformed F-number.
+        // The F-number branch used to `?` out of `key_vk` on the empty
+        // remainder, so this parsed to nothing and HOTKEY=F silently kept the
+        // default hotkey while the tray tip said "F".
+        assert_eq!(parse_hotkey("F"), Some((0x4000, 0x46)));
+        assert_eq!(parse_hotkey("Ctrl+F"), Some((0x4002, 0x46)));
+        // A malformed F-number still names no key: f300 is out of the 1..=24
+        // range, and the character branch must not rescue it into VK_F.
+        assert_eq!(parse_hotkey("f300"), None);
     }
 
     #[test]
@@ -1319,11 +1337,7 @@ mod tests {
         // ever reported it.
         let err = |text: &str| {
             let mut raw = RawFields::new();
-            parse(text, |k, v| {
-                if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
-                    raw.set(*field, k, v, true);
-                }
-            });
+            apply_env_text(text, &mut raw);
             derive(raw).err().unwrap_or_else(|| "no error raised".into())
         };
         assert!(err("API_KEY=k\nMAX_SECONDS=12o").contains("MAX_SECONDS"));

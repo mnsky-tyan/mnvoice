@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_WORKER: u32 = WM_APP + 2;
 
-pub const NO_SPEECH: &str = "No speech detected";
+const NO_SPEECH: &str = "No speech detected";
 
 /// Resource id of the icon embedded by build.rs via assets/mnvoice.ico.
 /// MAKEINTRESOURCEW(1) in the Windows API is `1 as *const u16`.
@@ -255,24 +255,32 @@ fn kill_running_instances() {
     log(&restart_log_line(&name, reported));
 }
 
-/// What the restart teardown writes to the log, given what the scheduler
-/// actually reported: `Ok(Some(0))` is a taskkill that ran and succeeded,
-/// `Ok(Some(n))` one that ran and reported `n`, `Ok(None)` one that ended with
-/// no code at all, and `Err` one that could not be spawned.
+/// What the restart teardown writes to the log, given what taskkill reported:
+/// `Ok(Some(0))` is a run that finished without error, `Ok(Some(n))` a run that
+/// exited with code `n`, `Ok(None)` one that ended with no code at all, and
+/// `Err` one that could not be spawned.
 ///
-/// Pure on purpose. The two failure arms cannot be reached through the real
-/// command without a taskkill that genuinely fails, and with
-/// `/FI "PID ne <pid>"` present a no-victim restart exits 0 - so the only
-/// benign way to a failure is a victim the caller cannot terminate, an
-/// elevated or protected process. Producing one takes an interactive UAC
-/// consent, which stalls an automated run indefinitely and leaves a prompt on
-/// the secure desktop that a non-elevated process cannot dismiss. Classifying
-/// a value means the arms are pinned by a unit test with no process spawned.
+/// Pure on purpose: the failure arms cannot be reached through the real command
+/// without a victim the caller cannot terminate (an elevated or protected
+/// process), and producing one takes an interactive UAC consent that stalls an
+/// automated run indefinitely. Classifying a value pins the arms in a unit test
+/// with no process spawned.
+///
+/// The zero arm deliberately does not claim a termination. Measured on this
+/// machine: with `/FI "PID ne <self>"`, a run that killed a real victim and a
+/// run where the filter matched nothing both exit 0 - the second prints
+/// "INFO: No tasks running with the specified criteria." and the first prints
+/// one "SUCCESS:" line per kill. So the exit code cannot tell the two apart,
+/// and counting the SUCCESS lines is not a fix either: those strings come from
+/// Windows message resources and are localized, so a non-English taskkill would
+/// read as zero kills. Naming the code, and what it does and does not prove, is
+/// the most this call can honestly say. (128 is the only code with a single
+/// meaning here: no such image.)
 fn restart_log_line(name: &str, reported: std::io::Result<Option<i32>>) -> String {
     match reported {
-        Ok(Some(0)) => format!("restart: terminated other {name} instances"),
-        // taskkill exits non-zero both for "no process matched" (the ordinary
-        // first-restart case, filtered out by /FI) and for a real failure.
+        Ok(Some(0)) => format!(
+            "restart: taskkill exit 0 for other {name} instances (killed one, or none matched)"
+        ),
         Ok(code) => format!(
             "restart: taskkill reported {} for other {name} instances",
             code.unwrap_or(-1)
@@ -1379,7 +1387,16 @@ enum AutostartState {
     /// The logon task is registered: the steady state after the migration,
     /// where the task's own answer settles everything.
     TaskPresent,
-    /// Neither mechanism is registered, so nothing starts at logon.
+    /// Neither mechanism is known to start mnvoice at logon.
+    ///
+    /// Two ways in: the Run key is confirmed absent, and the query that would
+    /// have answered could not be made (see `autostart_state`'s `None` arm).
+    /// Both draw the same unchecked box, so the menu needs no third answer;
+    /// what they must not share is a claim of knowledge, which is why this says
+    /// "not known to" rather than "is not". What a click then does is NOT
+    /// decided from this state - `toggle_autostart` re-reads live - so an
+    /// unchecked box over an autostart that is really on deletes it rather than
+    /// re-enabling it (see `AUTOSTART_CACHED` for why that window is small).
     NoRunValue,
     /// No logon task, and a Run value Windows still starts.
     RunValueEnabled,
@@ -1426,9 +1443,18 @@ fn autostart_enabled() -> bool {
 /// IDM_STARTUP handler was moved onto a worker thread to escape. So the probe
 /// runs off the UI thread (at startup and after each mutation) and the menu
 /// reads this. `-1` means "not probed yet", and the checkbox is then drawn
-/// unchecked - the safe direction, because an unchecked box offers to enable
-/// something that is already on, which the toggle handles idempotently, while
-/// a checked box would offer to turn off something that may not be there.
+/// unchecked.
+///
+/// Unchecked is the direction that cannot promise a removal of something that
+/// is not there, but it is NOT harmless in the other way, and the earlier note
+/// here got that wrong: `toggle_autostart` ignores what the menu showed and
+/// recomputes `enable` from a live `autostart_enabled()`. So a stale unchecked
+/// box over an autostart that really is on does not "enable it again
+/// idempotently" - the click computes `enable = false` and deletes the task,
+/// the inverse of what the user just clicked for. The mitigation is that the
+/// cache is filled at startup and refreshed after every mutation, so the window
+/// where the box can disagree with reality is the initial probe, not ordinary
+/// use; it is not zero, and saying "idempotent" hid that.
 static AUTOSTART_CACHED: AtomicI8 = AtomicI8::new(-1);
 
 fn autostart_cached() -> bool {
@@ -1464,8 +1490,13 @@ fn autostart_state(present: Option<bool>, disabled: impl FnOnce() -> bool) -> Au
         Some(false) => AutostartState::NoRunValue,
         Some(true) if disabled() => AutostartState::RunValueDisabled,
         Some(true) => AutostartState::RunValueEnabled,
-        // Nothing could be read, so nothing is claimed. Reading as not-enabled
-        // is the safe click direction: the menu item enables.
+        // Nothing could be read, so nothing is claimed. Folding that into
+        // `NoRunValue` is a deliberate collapse, not an assertion that the key
+        // is absent: the variant means "not known to start at logon", which is
+        // true of both cases. It bounds what the CHECKMARK may claim, not what
+        // the click does: `toggle_autostart` ignores this state and re-reads
+        // live, so a fresh answer of "on" makes the click a delete (see
+        // `AUTOSTART_CACHED` for the one window where box and reality differ).
         None => AutostartState::NoRunValue,
     }
 }
@@ -1652,7 +1683,7 @@ fn autostart_lock() -> MutexGuard<'static, ()> {
 /// the user to do anything. Both mechanisms firing for one boot is harmless -
 /// the single-instance mutex makes the loser exit - and the task is left in
 /// place, so the swap only ever runs in this direction.
-pub fn migrate_autostart() {
+fn migrate_autostart() {
     let _mutation = autostart_lock();
     if task_exists() || run_key_set() != Some(true) {
         return;
@@ -2075,6 +2106,11 @@ mod tests {
         // separator is a comma, and that separator is the machine's list
         // separator, so no format argument may ever appear here to parse.
         let args = schtasks_query_args();
+        // The exact list IS the rule: a `/fo` or `/format` anywhere in it would
+        // fail this equality. The test used to carry a second assertion that
+        // scanned for those flags, and it could not fail once the equality
+        // passed - two spellings of one check, where only the strict one can
+        // disagree.
         assert_eq!(
             args,
             vec![
@@ -2082,14 +2118,7 @@ mod tests {
                 "/tn".to_string(),
                 AUTOSTART_TASK.to_string()
             ],
-            "the existence question is a plain query"
-        );
-        assert!(
-            !args.iter().any(|a| a
-                .trim_start_matches('/')
-                .eq_ignore_ascii_case("fo")
-                || a.trim_start_matches('/').eq_ignore_ascii_case("format")),
-            "expected no format argument in {args:?}"
+            "the existence question is a plain query, with no format argument"
         );
     }
 
@@ -2438,10 +2467,13 @@ mod tests {
     #[test]
     fn the_restart_report_names_what_the_scheduler_actually_said() {
         // A teardown that worked, and the ordinary first restart where /FI
-        // filtered every victim out: taskkill exits 0 for both.
+        // filtered every victim out: measured, taskkill exits 0 for both, so
+        // the line says which code it saw and that the code cannot distinguish
+        // them. It must not claim a kill.
         assert_eq!(
             restart_log_line("mnvoice.exe", Ok(Some(0))),
-            "restart: terminated other mnvoice.exe instances"
+            "restart: taskkill exit 0 for other mnvoice.exe instances \
+             (killed one, or none matched)"
         );
         // A non-zero exit is reported as the number the scheduler gave. A
         // restart log claiming a teardown that never happened is worse than no
