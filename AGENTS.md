@@ -194,3 +194,21 @@ and direct keyboard event injection.
      `cfg(windows)` dev-dependency so the Windows test build can compute
      `Sec-WebSocket-Accept` with `derive_accept_key` instead of ~95 lines of
      hand-rolled SHA-1/base64. The release binary is unchanged (dev-only).
+   - **The exe/tray icon is generated artwork, not a hand-editable asset.**
+     `assets/mnvoice.ico` is built from the mn-brand master
+     `~/mnsky/mn-brand/icons/mnvoice.svg` with librsvg (the brand renderer,
+     `mn-brand/svg_render.py`), never from a screenshot or an upscale. The two
+     source SVGs next to it record exactly what the ICO contains:
+     `mnvoice-icon.svg` is the master minus the full-square page background
+     (transparent corners, so the card floats), and `mnvoice-mark.svg` is that
+     plus the wordmark paths dropped and the remaining artwork scaled 1.15x
+     about the mark's own centre. Sizes 16-48 use the mark-only file, 64-256
+     the full card: at tray sizes the wordmark collapses into mush and the mark
+     stroke is sub-pixel, so a responsive set is the only version that stays
+     legible. 1.15x is the measured maximum before the mark clips the card edge
+     (1.25x puts ink outside the rounded rect). Do not "fix" the small sizes by
+     thickening or redrawing the signature - the brand forbids it.
+     Regenerate with the recipe in the commit that introduced them, and verify
+     a rebuild by extracting the RT_ICON PNG frames from the exe and comparing
+     pixels against the source renders (`rc.exe` re-encodes, so byte equality
+     against the .ico is not expected; pixel equality is).
