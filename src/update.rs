@@ -530,20 +530,42 @@ pub fn install_and_relaunch(rel: &Release, busy: impl Fn() -> bool) -> Result<()
                 // new version) happens when it exits, which is the timing this
                 // branch was written to give.
                 //
-                // `forget` leaks one `Child` per install that reached this
-                // state, which is the point: the handle must outlive the
-                // function, and the process is a tray app that ends within a
-                // session. The exe path staying empty until then costs nothing
-                // the user can see - the single-instance mutex means no second
-                // copy could start here anyway.
-                //
-                // The visible cost of deferring is that the repair's relaunch
-                // rides on the user's own Exit: they close the tray app and a
-                // fresh mnvoice window appears a moment later. That is odd but
-                // bounded (only a helper that actually found the half-done state
-                // restarts anything, and it exits afterwards), and it is the
-                // lesser harm against cutting a live dictation short.
-                std::mem::forget(helper);
+                // BEFORE deferring, put the previous image back. The deferred
+                // repair is a live process, not a file: if the machine loses
+                // power, or this process is killed outright, the helper dies
+                // with it and nothing repairs the install - and with the exe
+                // path empty the logon task and every shortcut then point at
+                // nothing, autostart fails silently, and `startup_cleanup` can
+                // never run because the app cannot start to run it. Restoring
+                // first keeps the directory runnable no matter what happens to
+                // the process, and costs nothing the user can see: the running
+                // instance keeps its loaded image either way, nothing is
+                // killed, and no dictation is cut.
+                let restored = restore_old_image(&exe);
+                if restored.is_ok() && !swap_interrupted(&exe) {
+                    // The install is runnable again, so there is nothing left
+                    // for a watcher to repair: the staged file beside it is
+                    // removed by `clean_stale` at the next start. Stopping the
+                    // helper here, rather than forgetting it, is what keeps
+                    // the repair from racing a retry in the same session.
+                    stop_helper(&mut helper);
+                } else {
+                    //
+                    // `forget` leaks one `Child` per install that reached this
+                    // state, which is the point: the handle must outlive the
+                    // function, and the process is a tray app that ends within a
+                    // session. The exe path staying empty until then costs nothing
+                    // the user can see - the single-instance mutex means no second
+                    // copy could start here anyway.
+                    //
+                    // The visible cost of deferring is that the repair's relaunch
+                    // rides on the user's own Exit: they close the tray app and a
+                    // fresh mnvoice window appears a moment later. That is odd but
+                    // bounded (only a helper that actually found the half-done state
+                    // restarts anything, and it exits afterwards), and it is the
+                    // lesser harm against cutting a live dictation short.
+                    std::mem::forget(helper);
+                }
             } else {
                 stop_helper(&mut helper);
             }
@@ -1338,19 +1360,29 @@ mod tests {
 
     #[test]
     fn a_bare_tag_after_the_split_still_updates_windows() {
-        // The legacy shape, and the shape the current Windows installs run:
-        // a bare tag is Windows' own release, however new the feed is. The
-        // expected tag names Windows explicitly because the rule being pinned
-        // is Windows' - a bare tag means "the one release that predates the
-        // per-platform split", which is this install's.
+        // The legacy shape, and still a supported publish shape (the release
+        // workflow's windows job skips the suffix for a bare tag): a bare tag
+        // is Windows' own release, however new the feed is. The bare entry is
+        // the NEWEST ours-tag in this fixture, which is what makes the test
+        // discriminate - the first version listed the bare tag third, behind a
+        // suffixed one, so the bare entry never resolved, deleting it changed
+        // no assertion, and a resolver that dropped bare acceptance outright
+        // still passed (both verified against the real resolver). The bare tag
+        // is also FIRST, because resolution walks the feed in order and the
+        // feed's own order is newest-first (GitHub atom): a resolver that
+        // dropped bare acceptance would find nothing ours ahead of it and
+        // resolve to nothing here.
         let feed = r#"<feed>
+          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.16"/></entry>
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.2.0-linux"/></entry>
           <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.15-win"/></entry>
-          <entry><link href="https://github.com/mnsky-tyan/mnvoice/releases/tag/v0.1.14"/></entry>
         </feed>"#;
         let tag = newest_tag_for_this_platform(feed).unwrap();
-        assert_eq!(tag, "v0.1.15-win");
-        assert!(is_newer(&version_of_tag(&tag), "0.1.14"));
+        assert_eq!(
+            tag, "v0.1.16",
+            "the newest bare tag is this install's release, not the older suffixed one"
+        );
+        assert!(is_newer(&version_of_tag(&tag), "0.1.15"));
     }
 
     #[test]

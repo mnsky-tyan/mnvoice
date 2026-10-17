@@ -196,13 +196,21 @@ fn derive(raw: RawFields) -> Result<Config, String> {
 
     // The three numeric fields, parsed here rather than in `set` so one bad
     // spelling is a config error naming its own key instead of a silent
-    // default. Ranges: a zero MAX_SECONDS is refused because its only effect
+    // default. (A BLANK numeric - `MAX_SECONDS=` with nothing after the `=` -
+    // is that loud case, while the string fields treat blank as unset and fall
+    // back to their defaults. The asymmetry is deliberate: a number with no
+    // value is a truncated line, and a comment-out is spelled by deleting the
+    // whole line, so a bare `KEY=` for a number is worth naming.) Ranges: a zero MAX_SECONDS is refused because its only effect
     // is a deadline that already passed - the session returns Ok(()) with no
     // audio and no transcript, which no reading of "120" could intend. The two
     // VAD bounds keep zero deliberately: `silence_expired` documents 0 as
-    // "stop on the first silent tick", and an RMS threshold of 0 makes every
-    // tick count as speech, i.e. never stop for silence - both are coherent
-    // requests, not typos.
+    // "stop on the first silent tick", and an RMS threshold of 0 counts any
+    // NONZERO level as speech - so it is a usable "gate on anything but pure
+    // digital silence" setting, not a switch that disables the detector: the
+    // comparison is `rms > threshold`, so a chunk whose RMS is exactly 0.0 is
+    // still silence (measured: `a_chunk_exactly_at_the_threshold_counts_as_
+    // silence`), and the 10 s no-speech limit still ends a silent session.
+    // Both are coherent requests, not typos.
     let max_seconds = parse_positive_num("MAX_SECONDS", &raw.max_seconds)?;
     let vad_silence_ms = parse_u32_num("VAD_SILENCE_MS", &raw.vad_silence_ms)?;
     let vad_rms_threshold = parse_rms_num("VAD_RMS_THRESHOLD", &raw.vad_rms_threshold)?;

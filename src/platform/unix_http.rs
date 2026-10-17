@@ -233,8 +233,11 @@ struct UnixSocket {
 /// they exist for the same reason: the contract on the trait forbids holding
 /// the lock across a wait for a frame that has not arrived, and a send on the
 /// main thread must never queue behind the provider's silence. One
-/// millisecond is the smallest value that is not zero - a zero read timeout
-/// means "block forever" to the socket, not "return immediately".
+/// millisecond is a chosen poll, not the smallest usable one: std refuses a
+/// zero duration outright (`set_read_timeout` fails with "cannot set a 0
+/// duration timeout", measured), and any nonzero value down to a microsecond
+/// is accepted and behaves as a poll - so a zero value never reaches the
+/// socket here, it fails the setup through `socket_setup` instead.
 const READ_POLL_MS: u64 = 1;
 
 /// Error text for a websocket mutex whose owner panicked mid-call.
