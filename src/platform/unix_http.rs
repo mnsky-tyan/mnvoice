@@ -22,7 +22,9 @@
 // A failed request cannot poison the next one.
 
 use crate::locks::lock_poisoned;
-use crate::platform::http::{Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, USER_AGENT};
+use crate::platform::http::{
+    Response, Transport, WebSocket, MAX_TRANSCRIPT_BYTES, MAX_WS_MESSAGE_BYTES, USER_AGENT,
+};
 use std::io::Read as _;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -160,11 +162,10 @@ fn download_agent() -> Result<&'static ureq::Agent, String> {
 /// a JSON transcript or a release executable, and the two want different
 /// ceilings. See [`MAX_TRANSCRIPT_BYTES`] and
 /// [`MAX_ASSET_BYTES`](crate::platform::http::MAX_ASSET_BYTES).
-/// GET with an `Accept` header and a bounded body.
 ///
 /// Module-private: `UnixTransport::get` is its only production caller (tests
-/// call it directly). Narrowing these three keeps this module's reachable
-/// surface to the trait the rest of the crate actually consumes.
+/// call it directly). Narrowing it keeps this module's reachable surface to the
+/// trait the rest of the crate actually consumes.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn get(url: &str, accept: &str, max_bytes: u64) -> Result<Response, String> {
     ensure_tls_ready();
@@ -189,7 +190,15 @@ fn post(
     body: &[u8],
 ) -> Result<Response, String> {
     ensure_tls_ready();
-    let mut req = rest_agent()?.post(url).set("Content-Type", content_type);
+    // The same user agent the GET and the Windows transport send. ureq only
+    // substitutes its own string when the caller sets none, and the POST was
+    // the one request that set none - so a transcription identified itself as
+    // "ureq/..." to the provider while the update feed identified as
+    // `USER_AGENT`. See `platform::http::USER_AGENT`.
+    let mut req = rest_agent()?
+        .post(url)
+        .set("Content-Type", content_type)
+        .set("User-Agent", USER_AGENT);
     if let Some(auth) = auth {
         req = req.set("Authorization", auth);
     }
@@ -237,9 +246,14 @@ fn socket_lock_poisoned() -> String {
     "websocket lock poisoned".to_string()
 }
 
-/// Error text for the handful of socket options that must succeed before a
-/// WebSocket handshake can even start. They used to each spell an identical
-/// `format!("websocket socket setup failed ({e})")` closure - six copies that
+/// Error text for a socket option this path could not set.
+///
+/// Most of its sites run before the handshake, where a refused option really
+/// does mean the upgrade cannot start; the two that follow it (the read poll
+/// interval and the write timeout, applied to the cloned descriptor) share the
+/// wording because they are the same class of failure - a socket that will not
+/// take the bounds this transport needs. They used to each spell an identical
+/// `format!("websocket socket setup failed ({e})")` closure, six copies that
 /// buried the messages which ARE distinct ("websocket connect failed") and
 /// gave six places to edit if the wording ever moved. One owner, one wording.
 fn socket_setup(e: std::io::Error) -> String {
@@ -268,6 +282,16 @@ fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> 
             .map_err(|_| format!("invalid header value for {name}"))?;
         request.headers_mut().insert(name, value);
     }
+    // The upgrade is a request too, and it identified as nothing: tungstenite
+    // adds no user agent of its own, so the streaming handshake went out
+    // without one on Unix while Windows named the session `mnvoice`. Same
+    // header, same constant, so the provider's logs line up across methods
+    // and platforms (see `platform::http::USER_AGENT`).
+    request.headers_mut().insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_str(USER_AGENT)
+            .map_err(|_| "invalid user agent value".to_string())?,
+    );
 
     let uri = request.uri();
     let host = uri
@@ -301,7 +325,15 @@ fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> 
         .try_clone()
         .map_err(socket_setup)?;
 
-    let (socket, _) = tungstenite::client_tls_with_config(request, stream, None, None)
+    // One bound for both transports (see `MAX_WS_MESSAGE_BYTES`): tungstenite's
+    // default would let a single message reach 64 MiB, eight times what the
+    // REST path buffers, and the Windows reader now refuses the same size.
+    // `max_frame_size` is set alongside so a message cannot arrive as one
+    // oversized frame that the message cap only sees after it is buffered.
+    let cfg = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_MESSAGE_BYTES));
+    let (socket, _) = tungstenite::client_tls_with_config(request, stream, Some(cfg), None)
         .map_err(|e| format!("websocket connect failed ({e})"))?;
     // Both bounds live on the shared socket, so every write is bounded by
     // construction: audio frames, the CloseStream frame, the close frame and
@@ -340,8 +372,10 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
     // has none: `to_socket_addrs` blocks in getaddrinfo for as long as the
     // resolver takes, and a host with a broken DNS server can hang past every
     // timeout below - the connect bound would never be reached because the call
-    // never got that far. Windows resolves inside its connect timeout, so
-    // without this the two backends disagree about how long a connect may take.
+    // never got that far. The Windows backend asks for no separate resolve
+    // bound (the resolve slot of all three of its timeout tuples is 0), so this
+    // bound is what makes how long a connect may take a number this file
+    // states, rather than one that depends on the resolver underneath.
     //
     // The address is dropped if the bound expires, which is correct here: the
     // caller already has the host name and would retry from scratch, and a
@@ -386,9 +420,15 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpS
             Err(e) => last_err = Some(e),
         }
     }
+    // `addrs` was proved non-empty above, so the loop ran and every address
+    // failed: the `None` arm is unreachable. It stays because a `match` on an
+    // Option is total without a panic, and its text says what actually
+    // happened (no listed address answered) rather than the old "cannot
+    // resolve", which blamed the resolver for a connect failure - resolution
+    // had already succeeded by this point.
     Err(match last_err {
         Some(e) => format!("websocket connect failed ({e})"),
-        None => format!("cannot resolve {host}"),
+        None => format!("cannot reach {host}:{port}"),
     })
 }
 
@@ -420,13 +460,23 @@ impl Transport for UnixTransport {
     }
 }
 
+/// Error text for a frame this socket could not send.
+///
+/// Same wording as the Windows backend's `send_failed`, because both transports
+/// land in the same log line and a reader should not have to know which one
+/// produced the failure. Spelled once here for the same reason: `send_binary`
+/// and `send_text` used to each carry an identical `format!`.
+fn send_failed(e: tungstenite::Error) -> String {
+    format!("websocket send failed ({e})")
+}
+
 impl WebSocket for UnixSocket {
     fn send_binary(&self, data: &[u8]) -> Result<(), String> {
         self.socket
             .lock()
             .map_err(|_| socket_lock_poisoned())?
             .send(Message::Binary(data.to_vec().into()))
-            .map_err(|e| format!("websocket send failed ({e})"))
+            .map_err(send_failed)
     }
 
     fn send_text(&self, text: &str) -> Result<(), String> {
@@ -434,7 +484,7 @@ impl WebSocket for UnixSocket {
             .lock()
             .map_err(|_| socket_lock_poisoned())?
             .send(Message::Text(text.to_owned().into()))
-            .map_err(|e| format!("websocket send failed ({e})"))
+            .map_err(send_failed)
     }
 
     fn close(&self) {
@@ -804,10 +854,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             let head = answer_websocket_handshake(&mut conn);
-            // The request line must carry the bracketed authority, because
-            // that is what a URI requires; the connector is what has to strip.
+            // The request line is the literal path: the brackets belong to the
+            // authority, which travels in the Host header below, not to the
+            // target. This used to be an `||` with a looser second test that
+            // the first one already implied, and a `format!` around a
+            // constant.
             assert!(
-                head.starts_with(&format!("GET / HTTP/1.1\r\n") ) || head.starts_with("GET / "),
+                head.starts_with("GET / HTTP/1.1\r\n"),
                 "unexpected handshake request: {head}"
             );
             assert!(

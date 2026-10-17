@@ -35,6 +35,24 @@ pub const USER_AGENT: &str = "mnvoice-update";
 /// one and far below anything that would strain the allocator.
 pub const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Ceiling on one incoming WebSocket message, in bytes.
+///
+/// The streaming transcript arrives as JSON frames the reader reassembles, and
+/// each transport had a different answer for how much of one it would buffer:
+/// WinHTTP accumulated fragments with no bound at all, while tungstenite
+/// defaults to 64 MiB per message. A `BASE_URL` that points at a peer which
+/// streams fragments forever therefore grew the process on Windows without
+/// limit, which is the same mistyped-endpoint risk `MAX_TRANSCRIPT_BYTES`
+/// covers on the REST path.
+///
+/// One constant for both transports, deliberately the same size as the REST
+/// bound: a transcript frame is a few hundred bytes, so a message this large is
+/// not a long dictation, it is a broken or hostile peer. The Unix side passes
+/// it to tungstenite as both `max_message_size` and `max_frame_size` so no
+/// single frame can smuggle past it, and the Windows side checks its own
+/// accumulation against it while reading.
+pub const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Ceiling on a downloaded release asset, in bytes.
 ///
 /// Separate from [`MAX_TRANSCRIPT_BYTES`] because the two paths carry
@@ -53,7 +71,7 @@ pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 /// `rest::preview`, and in the tray's transcription log line) with two
 /// different truncation styles. Changing it in one place used to desynchronize
 /// the messages a user reads in `%TEMP%\mnvoice.log`.
-pub const PREVIEW_CHARS: usize = 200;
+const PREVIEW_CHARS: usize = 200;
 
 /// A bounded, char-safe prefix of a body, for the messages that quote one.
 ///

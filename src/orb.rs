@@ -577,31 +577,51 @@ mod tests {
         assert!((20..60).contains(&green), "green byte looks wrong: {green}");
     }
 
+    /// Pixels a frame paints with enough alpha to read as the orb's body, as
+    /// opposed to the halo. Measured at the default fluid level: 223 while
+    /// recording, 122 while transcribing, and 18 at the floor level - so the
+    /// count tracks the fluid, which is what these tests are about.
+    fn body_pixels(buf: &[u32]) -> usize {
+        buf.iter().filter(|&&p| ((p >> 24) & 0xFF) > 200).count()
+    }
+
+    fn frame(state: OrbState, level: f32) -> Vec<u32> {
+        let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
+        render_gas_fluid(10, &mut buf, state, crate::config::DEFAULT_ORB_COLOR, level);
+        buf
+    }
+
+    /// Both live states must paint a body, not just a halo.
+    ///
+    /// This used to count `p != 0`, which is a fixed 1664 at every state,
+    /// fluid level and tick because the aura covers those pixels whatever the
+    /// fluid does - a renderer that drew no fluid at all still passed. Counting
+    /// strongly-visible pixels instead makes the assertion able to fail, which
+    /// is the point of a test that claims to check visibility.
     #[test]
     fn a_recording_frame_renders_visible_pixels() {
-        let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(
-            10,
-            &mut buf,
-            OrbState::Recording,
-            crate::config::DEFAULT_ORB_COLOR,
-            crate::config::DEFAULT_ORB_FLUID_LEVEL,
-        );
-        let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
+        let body = body_pixels(&frame(OrbState::Recording, crate::config::DEFAULT_ORB_FLUID_LEVEL));
+        assert!(body > 100, "recording orb should paint a fluid body, got {body} pixels");
     }
 
     #[test]
     fn a_transcribing_frame_renders_visible_pixels() {
-        let mut buf = vec![0u32; (ORB_WIDTH * ORB_HEIGHT) as usize];
-        render_gas_fluid(
-            10,
-            &mut buf,
-            OrbState::Transcribing,
-            crate::config::DEFAULT_ORB_COLOR,
-            crate::config::DEFAULT_ORB_FLUID_LEVEL,
+        let body = body_pixels(&frame(OrbState::Transcribing, crate::config::DEFAULT_ORB_FLUID_LEVEL));
+        assert!(body > 100, "transcribing orb should paint a fluid body, got {body} pixels");
+    }
+
+    /// The body grows with `ORB_FLUID_LEVEL`, which is the whole reason the
+    /// setting exists. The previous tests could not have caught it if the level
+    /// were ignored entirely, because the pixels they counted did not depend on
+    /// it.
+    #[test]
+    fn more_fluid_paints_a_bigger_body() {
+        let floor = crate::config::parse_fluid_level("5");
+        let low = body_pixels(&frame(OrbState::Recording, floor));
+        let high = body_pixels(&frame(OrbState::Recording, 1.0));
+        assert!(
+            high > low * 2,
+            "a full orb must paint far more body than one at the floor ({low} -> {high})"
         );
-        let non_zero = buf.iter().filter(|&&p| p != 0).count();
-        assert!(non_zero > 300, "Gas fluid orb should render visible pixels");
     }
 }

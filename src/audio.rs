@@ -312,6 +312,20 @@ unsafe fn run_session(engine: &mut EngineState, req: &CaptureRequest) -> Result<
                 .capture_client
                 .ReleaseBuffer(frames)
                 .map_err(|e| format!("capture release ({e})"))?;
+            // `GetNextPacketSize` said there was a packet but `GetBuffer`
+            // handed back none - a device can do this after a format or
+            // position reset. Nothing was consumed, so, exactly as in the
+            // `packet == 0` branch above, `advance`'s audio-time accounting
+            // cannot move a window. Charge the tick and pace the loop:
+            // without this the same packet count is re-read every iteration
+            // at full CPU, and a device stuck in this state runs to
+            // `max_seconds` instead of ending on the no-speech limit.
+            if silence.advance_stalled(POLL_MS, req.vad_silence_ms) {
+                req.stop.store(true, Ordering::SeqCst);
+                break;
+            }
+            thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
         }
 
         // Push CHUNK_SAMPLES chunks (40 ms) for ultra-low latency streaming
