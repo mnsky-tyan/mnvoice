@@ -63,18 +63,26 @@ unsafe fn app_icon() -> HICON {
 /// The request is SM_CXSMICON rather than the default icon metric, and what
 /// that changes is the SIZE chosen, not the artwork. Measured in this process:
 /// `LoadIconW(IDI_APP)` resolves to SM_CXICON (32 px here) while the tray slot
-/// is SM_CXSMICON (16 px at 100% scaling, 19 px at 125%, 24 px at 150%), so
+/// is SM_CXSMICON (16 px at 100% scaling, 20 px at 125%, 24 px at 150%), so
 /// the tray has been down-sampling a 32 px frame into a 16 px slot, and at
-/// higher scaling a 32 px frame into a 19 or 24 px slot. This exe carries a
+/// higher scaling a 32 px frame into a 20 or 24 px slot. This exe carries a
 /// responsive .ico - mark-only at 16-48 px, the full brand card at 64-256 px
-/// (see AGENTS.md, "App and tray icon") - and at 100% the tray was already
+/// (see AGENTS.md, "The exe/tray icon is generated artwork, not a
+/// hand-editable asset") - and at 100% the tray was already
 /// showing a mark; what was unreachable were the frames rasterised FOR the
 /// tray's own size. `LoadIconW` cannot express a size at all, which is why
 /// this is `LoadImageW`. Pinning the two metrics apart is what the test for
 /// this call asserts.
 ///
-/// `LR_SHARED` is required: without it every call leaks a fresh icon handle,
-/// and the tray calls this on each modify.
+/// `LR_SHARED` is required for a reason that is about ownership, not
+/// frequency: without it `LoadImageW` returns a fresh handle the caller must
+/// `DestroyIcon`, and this call has exactly one production caller -
+/// `add_tray`, which runs once per process at `NIM_ADD`. The `NIM_MODIFY`
+/// calls (`set_tray_tip`, `balloon`) set only `NIF_TIP`/`NIF_INFO` and never
+/// touch the icon, so the loaded handle is simply never destroyed - which is
+/// also what makes it match the fallback it sits beside: `app_icon` returns a
+/// shared handle, and the two must not be treated differently by a caller
+/// that never destroys either.
 ///
 /// The fallback keeps `app_icon`'s shape (a system icon is always loadable),
 /// so an exe built without the resource, or a session reporting a zero metric,
@@ -1456,7 +1464,8 @@ enum AutostartState {
     /// "not known to" rather than "is not". What a click then does is NOT
     /// decided from this state - `toggle_autostart` re-reads live - so an
     /// unchecked box over an autostart that is really on deletes it rather than
-    /// re-enabling it (see `AUTOSTART_CACHED` for why that window is small).
+    /// re-enabling it (see `AUTOSTART_CACHED` for how long that window can
+    /// last - it is not small).
     NoRunValue,
     /// No logon task, and a Run value Windows still starts.
     RunValueEnabled,
@@ -1525,10 +1534,20 @@ fn autostart_enabled() -> bool {
 /// recomputes `enable` from a live `autostart_enabled()`. So a stale unchecked
 /// box over an autostart that really is on does not "enable it again
 /// idempotently" - the click computes `enable = false` and deletes the task,
-/// the inverse of what the user just clicked for. The mitigation is that the
-/// cache is filled at startup and refreshed after every mutation, so the window
-/// where the box can disagree with reality is the initial probe, not ordinary
-/// use; it is not zero, and saying "idempotent" hid that.
+/// the inverse of what the user just clicked for.
+/// The honest size of that window is: the cache is filled at startup and
+/// refreshed after every mutation THIS PROCESS makes, and nothing else writes
+/// it - so an autostart changed outside the app (Task Scheduler, Task Manager,
+/// a hand-edited Run key) is never observed for the rest of the session, and
+/// the box can disagree with reality from the moment of that change onward,
+/// not just around the initial probe. The action itself is always live (the
+/// toggle re-reads under the lock), so the disagreement costs one surprising
+/// click, recoverable by clicking again: the mutation refreshes the cache and
+/// the box then tells the truth. A re-probe on every menu open would narrow
+/// this to the time between the menu opening and the click landing, but the
+/// probe spawns up to two reg.exe processes and was kept off the menu path
+/// for exactly that cost (see `show_menu`); the one-click recovery is the
+/// accepted trade. It is not zero, and saying "idempotent" hid that.
 static AUTOSTART_CACHED: AtomicI8 = AtomicI8::new(-1);
 
 fn autostart_cached() -> bool {
@@ -2379,10 +2398,14 @@ mod tests {
     /// asserted apart because a single metric would make the test pass either
     /// way.
     ///
-    /// Skipped when the test binary carries no embedded icon resource, which
-    /// is a build fact, not a behaviour failure: what is being tested is which
-    /// frame the loader selects from a set, and there is no set to select from
-    /// without it.
+    /// A build with no embedded icon resource cannot reach the `None` skip
+    /// below and fails here instead - which is the right verdict, not a hole
+    /// in the test: `tray_icon` falls back to `app_icon`, which falls back to
+    /// the always-loadable system application icon at the LARGE metric, so the
+    /// assertion then reads 32 == 16 and names the exact regression. (An
+    /// earlier version of this doc promised a skip for that build; the chain
+    /// of fallbacks makes that unreachable.) The skip that remains covers
+    /// `GetIconInfo` itself failing or both bitmaps being invalid.
     #[test]
     fn the_tray_asks_for_the_small_icon_frames() {
         let small = unsafe { GetSystemMetrics(SM_CXSMICON) };
@@ -2395,7 +2418,9 @@ mod tests {
         }
         let picked = unsafe { icon_size_of(tray_icon()) };
         let Some((w, _h)) = picked else {
-            // No resource in this binary: nothing to measure.
+            // The icon could not be measured at all (GetIconInfo failed, or
+            // both bitmaps were invalid). Not the resource-less build - see
+            // the doc above for why that one cannot get here.
             return;
         };
         assert_eq!(w, small, "the tray must load the small frame it draws into");

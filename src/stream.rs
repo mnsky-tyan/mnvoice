@@ -1083,23 +1083,35 @@ mod tests {
     /// `words.len() - 1 > typed_word_count` and typed nothing, and its final
     /// frame committed from the wrong offset, so the leading words of every
     /// clause after an empty final were lost.
+    ///
+    /// The fixture must reach that state, which is not the obvious shape: the
+    /// empty final has to follow an interim DIRECTLY. A non-empty final
+    /// beforehand would itself run the reset, and the first version of this
+    /// test had exactly that, so it passed against the pre-fix code and pinned
+    /// nothing (verified: it went green with the reset moved back inside the
+    /// guard). Verified both ways now - pre-fix types "one two six", losing
+    /// clause two's leading words, fixed types "four five six".
     #[test]
     fn an_empty_final_frame_resets_the_clause_cursor() {
         use std::io::Write as _;
         let (port, server) = live_provider::serve(|stream| {
-            // Clause one: interims type "one two", the final types "three".
+            // Clause one: an interim, then a final that is EMPTY. That is the
+            // legal frame the bug tripped on, and it has to follow the interim
+            // DIRECTLY: a non-empty final in between would itself run the
+            // reset, which made the first version of this test pass against
+            // the pre-fix code and pin nothing. An empty final also means the
+            // provider finalised the clause with no transcript, so "three" -
+            // the trailing word only a final would commit - is never typed,
+            // and the assertions below must not ask for it.
             let _ = stream.write_all(&live_provider::result_frame("one two three", false, false));
             let _ = stream.flush();
             std::thread::sleep(Duration::from_millis(120));
-            let _ = stream.write_all(&live_provider::result_frame("one two three", true, false));
-            let _ = stream.flush();
-            std::thread::sleep(Duration::from_millis(120));
-            // The frame the bug tripped on: final, and empty.
             let _ = stream.write_all(&live_provider::result_frame("", true, false));
             let _ = stream.flush();
             std::thread::sleep(Duration::from_millis(120));
             // Clause two: with a stale cursor of 2, "four" is never typed and
-            // the final commits only "six".
+            // the final commits only "six". With the cursor reset to 0, the
+            // interim types "four" and the final commits the whole clause.
             let _ = stream.write_all(&live_provider::result_frame("four five", false, false));
             let _ = stream.flush();
             std::thread::sleep(Duration::from_millis(120));
@@ -1113,9 +1125,11 @@ mod tests {
         let out = live_provider::drive(&cfg, 60);
         let _ = server.join();
         let text = out.expect("the session must not error");
+        // Clause one's interim words: "three" is deliberately absent, see the
+        // fixture comment - an empty final commits nothing.
         assert!(
-            text.contains("one two three"),
-            "clause one must be typed whole: {text}"
+            text.contains("one") && text.contains("two"),
+            "clause one's interim words must be typed: {text}"
         );
         assert!(
             text.contains("four") && text.contains("five") && text.contains("six"),
