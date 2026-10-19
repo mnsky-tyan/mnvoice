@@ -430,11 +430,18 @@ described in the Linux and macOS section below.
 ## Linux and macOS
 
 The engine is identical - same capture pipeline, same streaming protocol,
-same typing into the focused window - but the control surface is a terminal
-rather than a tray icon:
+same typing into the focused window.
+
+On Linux the desktop app is the default control surface, and it works the way
+the Windows tray does: the process runs in the background, the configured
+hotkey starts and stops a dictation from any app, a 48px fluid orb shows what
+is happening, and the words are typed into whatever window has focus - native
+Wayland windows included. The hotkey goes through the compositor's
+GlobalShortcuts portal; typing goes through the RemoteDesktop portal.
 
 ```bash
-./mnvoice
+./mnvoice            # the desktop app (default)
+./mnvoice --terminal # the terminal build, for sessions without a compositor
 ```
 
 - Download `mnvoice-linux-x64` (or `mnvoice-macos-arm64`) from the matching
@@ -443,23 +450,44 @@ rather than a tray icon:
   to sit beside it.
 - Put a `mnvoice.env` next to the binary (same format as the Windows one,
   `API_KEY=...` is all you need) and a `keywords.txt` if you use keyterms.
-- Press **Enter** to start a dictation. Press **Enter** again to stop early;
-  3 s of silence (`VAD_SILENCE_MS`) or the max duration also stops it. Words
-  type into the focused window as they are recognized and echo to stdout.
-  Ctrl+C quits. If the provider connection drops mid-dictation, whatever was
-  already typed is kept and the transcript line ends with
-  `[connection lost: ...]` rather than reading as a complete dictation.
+- On the terminal build, press **Enter** to start a dictation. Press
+  **Enter** again to stop early; 3 s of silence (`VAD_SILENCE_MS`) or the max
+  duration also stops it. Words type into the focused window as they are
+  recognized and echo to stdout. Ctrl+C quits. If the provider connection
+  drops mid-dictation, whatever was already typed is kept and the transcript
+  line ends with `[connection lost: ...]` rather than reading as a complete
+  dictation.
+- On the desktop app, press the configured hotkey (`HOTKEY=Alt+Space` by
+  default) to start and again to stop; `CANCEL_KEY` discards a recording in
+  flight. The first launch writes two desktop files - the app's identity
+  (`~/.local/share/applications/mnvoice.desktop`, which the GlobalShortcuts
+  portal reads the app id from) and the logon task
+  (`~/.config/autostart/mnvoice.desktop`), so the app is running by the time
+  you sit down, the same way the Windows logon task works. The compositor
+  shows one confirmation dialog for the hotkey binding and one for keyboard
+  access on the first dictation; both grants persist.
 
 Known limits in this release, stated rather than papered over:
 
-- **Linux typing is X11/XWayland.** Typed keys reach X11 and XWayland
-  windows; a native Wayland window receives nothing, and nothing on this path
-  can detect that. A missing X display is the only failure the binary reports,
-  so the guard is to use an X session or wait for the input-capture portal path.
+- **The Linux hotkey needs a desktop launch.** The GlobalShortcuts portal
+  refuses a process with no app id, and the app id comes from the systemd user
+  unit the process runs in (`app-mnvoice-*.scope`) plus the identity desktop
+  file. Started from a terminal, the app logs the refusal and keeps running
+  without a hotkey; the guard is the autostart entry the app writes, or
+  `systemd-run --user --scope -u app-mnvoice-test mnvoice` for a manual
+  desktop launch.
+- **Linux typing falls back to XTest without a portal grant.** With the
+  RemoteDesktop grant the compositor synthesizes the keystrokes and native
+  Wayland windows receive them; without it the X11 XTest injector runs, which
+  reaches X11 and XWayland windows only.
+- **No tray and no self-update on Linux yet.** The tray (StatusNotifierItem)
+  and the updater are Windows-only; the hotkey, the orb and the typing are the
+  interaction model, and they are delivered.
 - **macOS typing needs permission.** Grant the binary Accessibility under
   System Settings > Privacy & Security > Accessibility; without it the
-  first injection fails with an error naming the exact setting.
-- **No orb, tray, hotkey or self-update yet** on these platforms; capture
+  first injection fails with an error naming the exact setting. macOS has no
+  desktop surface yet; the terminal build is its control surface.
+- **No orb, tray, hotkey or self-update yet on macOS**; capture
   start is a device open rather than Windows' ~4 ms standby trick, because
   the audio library has no equivalent.
 - **No proxy support.** Windows resolves a proxy from the system, but the

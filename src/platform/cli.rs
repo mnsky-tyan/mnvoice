@@ -209,6 +209,34 @@ fn dictate(
     engine: &dyn audio::Audio,
     lines: &Receiver<()>,
 ) -> Result<(), String> {
+    dictate_with_controls(cfg, engine, lines, None, |text| {
+        if text.is_empty() {
+            println!("(no speech detected)");
+        } else {
+            println!("transcript: {text}");
+        }
+    })
+}
+
+/// One dictation with the full control surface: the toggle channel raises
+/// `stop`, the optional cancel channel discards the transcript, and the
+/// caller owns what happens to the finished text (the CLI prints it, the
+/// desktop app types it at the cursor).
+///
+/// The CLI's old `dictate` is this with no cancel channel and a print for a
+/// callback, which is why the two spellings are one function: the desktop app
+/// and the CLI share the capture, the VAD and the transcriber, and only the
+/// text's destination differs.
+pub fn dictate_with_controls<F>(
+    cfg: &config::Config,
+    engine: &dyn audio::Audio,
+    lines: &Receiver<()>,
+    cancel_lines: Option<&Receiver<()>>,
+    on_transcript: F,
+) -> Result<(), String>
+where
+    F: FnOnce(String),
+{
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let capture_done = engine.capture_to_channel(
@@ -222,8 +250,8 @@ fn dictate(
     println!("recording... (Enter to stop)");
 
     // The CLI has no cancel key (Enter stops and transcribes), so this flag is
-    // never set here; it exists so the REST path takes the same contract as
-    // the tray and the streaming path instead of a special-cased signature.
+    // never set there; the desktop app raises it from the portal's cancel
+    // shortcut, which is the Windows tray's CANCEL_KEY contract.
     let cancelled = Arc::new(AtomicBool::new(false));
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
@@ -241,16 +269,26 @@ fn dictate(
                 samples.extend_from_slice(&chunk);
             }
             captured?;
-            println!("stopped ({}s of audio)", samples.len() / SAMPLE_RATE as usize);
+            println!(
+                "stopped ({}s of audio)",
+                samples.len() / SAMPLE_RATE as usize
+            );
             crate::rest::dictate_rest(cfg, &samples, &cancelled)?
         }
     };
 
-    if text.is_empty() {
-        println!("(no speech detected)");
-    } else {
-        println!("transcript: {text}");
+    if let Some(cancel_lines) = cancel_lines {
+        // A cancel that arrived while the transcriber was finishing still
+        // counts: the user asked to discard, so the transcript does not land.
+        if cancel_lines.try_recv().is_ok() {
+            cancelled.store(true, Ordering::SeqCst);
+        }
     }
+    if cancelled.load(Ordering::SeqCst) {
+        println!("(cancelled)");
+        return Ok(());
+    }
+    on_transcript(text);
     Ok(())
 }
 
@@ -448,7 +486,7 @@ mod tests {
         // One bad byte in the middle: \xff is not valid UTF-8 in any position.
         let raw: &[u8] = b"first\n\xff broken\nsecond\n";
         let (tx, rx) = mpsc::channel::<()>();
-        let mut lines = (&raw[..]).lines();
+        let mut lines = raw.lines();
         forward_lines(&mut lines, &tx);
         drop(tx);
 
@@ -484,10 +522,7 @@ mod tests {
                     self.sent = true;
                     return Ok(b"\n");
                 }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "device gone",
-                ))
+                Err(std::io::Error::other("device gone"))
             }
             fn consume(&mut self, _amt: usize) {}
         }

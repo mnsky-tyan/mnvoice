@@ -50,11 +50,13 @@ struct StreamResult {
 /// checks are also how frames that are not transcript results at all (metadata,
 /// errors, pings) get rejected cheaply before any parsing work happens.
 fn parse_stream_json(json: &str) -> Option<StreamResult> {
-    if !json.contains("\"Results\"") && !json.contains("\"results\"") && !json.contains("\"text\"") {
+    if !json.contains("\"Results\"") && !json.contains("\"results\"") && !json.contains("\"text\"")
+    {
         return None;
     }
     let transcript = crate::rest::parse_json_transcript(json).unwrap_or_default();
-    let speech_final = json.contains("\"speech_final\":true") || json.contains("\"speech_final\": true");
+    let speech_final =
+        json.contains("\"speech_final\":true") || json.contains("\"speech_final\": true");
     let is_final = json.contains("\"is_final\":true") || json.contains("\"is_final\": true");
     Some(StreamResult {
         transcript,
@@ -162,7 +164,7 @@ fn commit_words(
     input::type_text(&to_type);
     *has_typed_any = true;
 
-    let mut full = lock_poisoned(&full);
+    let mut full = lock_poisoned(full);
     if !full.is_empty() {
         full.push(' ');
     }
@@ -260,8 +262,7 @@ pub fn run_stream(
                     if !reader_done_clone.load(Ordering::SeqCst)
                         && !stop_clone.load(Ordering::SeqCst)
                     {
-                        let mut slot =
-                            lock_poisoned(&read_error_clone);
+                        let mut slot = lock_poisoned(&read_error_clone);
                         *slot = Some(e);
                     }
                     break;
@@ -314,11 +315,23 @@ pub fn run_stream(
 
                     if res.is_final {
                         // Sentence/clause finalized: type all remaining words to the end
-                        commit_words(&words, typed_word_count, words.len(), &mut has_typed_any, &full_transcript_clone);
+                        commit_words(
+                            &words,
+                            typed_word_count,
+                            words.len(),
+                            &mut has_typed_any,
+                            &full_transcript_clone,
+                        );
                     } else {
                         // Interim results: type completed words (all except the trailing partial word)
                         if words.len() > 1 && words.len() - 1 > typed_word_count {
-                            commit_words(&words, typed_word_count, words.len() - 1, &mut has_typed_any, &full_transcript_clone);
+                            commit_words(
+                                &words,
+                                typed_word_count,
+                                words.len() - 1,
+                                &mut has_typed_any,
+                                &full_transcript_clone,
+                            );
                             typed_word_count = words.len() - 1;
                         }
                     }
@@ -347,7 +360,13 @@ pub fn run_stream(
         // Skipped entirely on cancel so a discarded session leaves nothing behind.
         if !latest_uncommitted.is_empty() && !cancelled_clone.load(Ordering::SeqCst) {
             let words: Vec<&str> = latest_uncommitted.split_whitespace().collect();
-            commit_words(&words, typed_word_count, words.len(), &mut has_typed_any, &full_transcript_clone);
+            commit_words(
+                &words,
+                typed_word_count,
+                words.len(),
+                &mut has_typed_any,
+                &full_transcript_clone,
+            );
         }
         // The reader is out, so nothing more can arrive and the main thread's
         // wait can end with it rather than running out its clock.
@@ -494,7 +513,10 @@ mod tests {
             url.starts_with("wss://api.deepgram.com:443/v1/listen?model=nova-3&"),
             "{url}"
         );
-        assert!(url.contains("&keyterm=Kubernetes"), "nova-3 uses keyterm: {url}");
+        assert!(
+            url.contains("&keyterm=Kubernetes"),
+            "nova-3 uses keyterm: {url}"
+        );
     }
 
     #[test]
@@ -651,9 +673,8 @@ mod tests {
         pub fn serve(
             after_handshake: impl FnOnce(&mut TcpStream) + Send + 'static,
         ) -> (u16, std::thread::JoinHandle<()>) {
-            let (port, handle, _head) = serve_capturing_head(move |_head, stream| {
-                after_handshake(stream)
-            });
+            let (port, handle, _head) =
+                serve_capturing_head(move |_head, stream| after_handshake(stream));
             (port, handle)
         }
 
@@ -1029,8 +1050,8 @@ mod tests {
     /// shared seam so neither can regress alone.
     #[test]
     fn an_over_long_message_is_refused_rather_than_buffered() {
+        use crate::platform::http::{NativeTransport, MAX_WS_MESSAGE_BYTES};
         use std::io::Write as _;
-        use crate::platform::http::{MAX_WS_MESSAGE_BYTES, NativeTransport};
 
         // One byte past the ceiling, in frames the peer never marks final
         // until the last one: the reader has to accumulate all of it before it
@@ -1044,7 +1065,11 @@ mod tests {
                 let last = off + n >= payload.len();
                 let opcode = if off == 0 { 0x1 } else { 0x0 };
                 if stream
-                    .write_all(&live_provider::fragment(opcode, &payload[off..off + n], last))
+                    .write_all(&live_provider::fragment(
+                        opcode,
+                        &payload[off..off + n],
+                        last,
+                    ))
                     .is_err()
                 {
                     return;
@@ -1198,7 +1223,10 @@ mod tests {
         let head = lock_poisoned(&head).clone();
         let request_line = head.lines().next().unwrap_or_default().to_string();
 
-        assert!(out.is_ok(), "a hostile model must not break the session: {out:?}");
+        assert!(
+            out.is_ok(),
+            "a hostile model must not break the session: {out:?}"
+        );
         // The hostile text arrives as one encoded value, and the parameters the
         // session declares are all still there as parameters of their own.
         assert!(

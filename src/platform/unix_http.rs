@@ -309,9 +309,7 @@ fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> 
     let stream = connect_with_timeout(&host, port, CONNECT_TIMEOUT)?;
     // `connect_timeout` completes the connect through a non-blocking socket,
     // so the mode is set back explicitly rather than assumed.
-    stream
-        .set_nonblocking(false)
-        .map_err(socket_setup)?;
+    stream.set_nonblocking(false).map_err(socket_setup)?;
     // The handshake runs under its own bound; it is replaced by the much
     // shorter poll interval once the socket exists.
     stream
@@ -319,14 +317,10 @@ fn websocket(url: &str, headers: &[(&str, &str)]) -> Result<UnixSocket, String> 
         .map_err(socket_setup)?;
     // tungstenite's own `connect` sets this; the streaming loop types words as
     // they arrive, so a delayed small frame is a visible stutter.
-    stream
-        .set_nodelay(true)
-        .map_err(socket_setup)?;
+    stream.set_nodelay(true).map_err(socket_setup)?;
     // A second handle on the same socket: the stream itself moves into the TLS
     // wrapper, and a duplicated descriptor shares the socket's options.
-    let options = stream
-        .try_clone()
-        .map_err(socket_setup)?;
+    let options = stream.try_clone().map_err(socket_setup)?;
 
     // One bound for both transports (see `MAX_WS_MESSAGE_BYTES`): tungstenite's
     // default would let a single message reach 64 MiB, eight times what the
