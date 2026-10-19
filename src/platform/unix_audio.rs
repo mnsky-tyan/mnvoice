@@ -248,7 +248,7 @@ fn taken_error(slot: &Arc<Mutex<Option<String>>>) -> Option<String> {
 /// `GetBuffer` reports a whole number of frames: the two agree that a partial
 /// frame must not be dropped, and only this side can actually produce one.
 fn take_frames(buffer: &Arc<Mutex<Vec<f32>>>, channels: usize) -> Vec<f32> {
-    let mut buf = lock_poisoned(&buffer);
+    let mut buf = lock_poisoned(buffer);
     // Only whole frames leave the buffer, so what stays is by construction a
     // partial one.
     let whole = buf.len() / channels * channels;

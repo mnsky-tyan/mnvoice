@@ -55,6 +55,23 @@ enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
 # Security.framework and therefore the platform's own verifier and keychain
 # trust. See unix_http.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The desktop app's portals: the global hotkey (GlobalShortcuts) and the
+# Wayland typing session (RemoteDesktop). ashpd is the maintained XDG portals
+# wrapper - the reis crate's own type-text example uses it - and the async-io
+# feature keeps tokio out of the binary, which the engine's no-async-runtime
+# ethos asks for.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts", "remote_desktop", "screencast"] }
+# The keysym each character maps to for the portal's keyboard injection.
+xkbcommon = "0.8"
+# The orb's layer-shell overlay surface.
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# Driving the portal futures and the orb's shm buffers without a runtime.
+futures-executor = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
+rustix = { version = "0.38", features = ["mm", "fs"] }
+enumflags2 = "0.7"
+
 # The rustls dependency is for the crypto provider only (see unix_http.rs);
 # the stack itself is behind ureq and tungstenite's rustls feature.
 rustls = { version = "0.23", default-features = false, features = [

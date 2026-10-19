@@ -242,3 +242,43 @@ and direct keyboard event injection.
      a rebuild by extracting the RT_ICON PNG frames from the exe and comparing
      pixels against the source renders (`rc.exe` re-encodes, so byte equality
      against the .ico is not expected; pixel equality is).
+
+## Repo wiki
+
+```
+mnvoice/
+├── AGENTS.md              this file: test rules, release discipline, repo wiki
+├── Cargo.toml             deps: windows (Win32), cpal+enigo (Unix), ashpd+wayland (Linux desktop)
+├── build.rs               winres: bakes the version resource + icon into mnvoice.exe
+├── src/
+│   ├── main.rs            entry: Windows -> windows_app; Linux -> linux_app (or --terminal); macOS -> cli
+│   ├── windows_app.rs     the Windows tray app: window, tray, hotkey, message loop (2,982 lines)
+│   ├── audio.rs           WASAPI capture engine + standby pre-init (Windows)
+│   ├── orb.rs             the orb's Windows surface: Win32 layered window
+│   ├── orb_render.rs      the platform-neutral orb render: 48px fluid, premultiplied ARGB
+│   ├── config.rs          mnvoice.env parse: providers, hotkeys, orb, aliases (single owner)
+│   ├── stream.rs          the streaming transport: Deepgram WebSocket, word commits
+│   ├── rest.rs            the REST transport: OpenAI-compatible batch transcription
+│   ├── update.rs          the self-updater: download, sha256 verify, swap, relaunch (Windows)
+│   ├── paste.rs           Windows Unicode typing pairs
+│   ├── locks.rs           poison-recovery helpers
+│   ├── test_hooks.rs      test-only counters for stream tests
+│   └── platform/
+│       ├── mod.rs         the seam boundary: tag parsing, version, per-platform modules
+│       ├── audio.rs       the Audio trait
+│       ├── http.rs        the Http trait (redirect contract the updater depends on)
+│       ├── input.rs       the Injector trait + the KEY_GAP pacing contract
+│       ├── cli.rs         the terminal control surface (Enter to toggle) + dictate_with_controls
+│       ├── unix_audio.rs  cpal capture (Linux, macOS)
+│       ├── unix_http.rs   ureq + tungstenite transport (Linux, macOS)
+│       ├── linux_app.rs   the Linux desktop app: flock, autostart, hotkey+orb+typing wiring
+│       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey, RemoteDesktop typing
+│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay + shm
+│       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
+│       ├── macos_impl.rs  the macOS injector (CoreGraphics)
+│       └── windows_impl.rs the SendInput injector
+├── .github/               release workflows per platform (win/linux/macos tags)
+└── docs/                  notes from each pass
+```
+
+Entry points: `src/main.rs` (platform dispatch), `windows_app::main()` (Windows tray), `linux_app::main()` (Linux desktop), `platform::cli::run()` (terminal, all platforms).

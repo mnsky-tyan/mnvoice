@@ -42,6 +42,15 @@ pub mod unix_http;
 #[cfg(target_os = "linux")]
 pub mod linux_impl;
 
+#[cfg(target_os = "linux")]
+pub mod linux_orb;
+
+#[cfg(target_os = "linux")]
+pub mod linux_portal;
+
+#[cfg(target_os = "linux")]
+pub mod linux_app;
+
 #[cfg(target_os = "macos")]
 pub mod macos_impl;
 
