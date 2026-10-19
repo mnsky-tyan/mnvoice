@@ -12,7 +12,11 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::orb_render::{OrbState, ORB_HEIGHT, ORB_WIDTH};
+use crate::orb_render::{ORB_HEIGHT, ORB_WIDTH};
+
+// The orb's state moves to `orb_render` with the simulation, but the Windows
+// call sites name it `orb::OrbState`, so the name stays reachable from here.
+pub use crate::orb_render::OrbState;
 use crate::windows_app::log;
 
 const ORB_CLASS_NAME: PCWSTR = w!("mnvoiceOrbClass");
