@@ -203,12 +203,15 @@ All settings go in `mnvoice.env` next to the executable. Full reference below.
 HOTKEY=Alt+Space
 
 # Cancel recording and discard transcript
-CANCEL_KEY=Escape
+# (a chord on Linux - see the note under the table)
+CANCEL_KEY=Alt+Escape
 ```
 
 Supported modifiers: `Alt`, `Ctrl`, `Shift`, `Win` (also accepted: `Option`, `Control`, `Windows`, `Super`, `Cmd`)  
 Supported keys: `Space`, `Escape`/`Esc`, `Tab`, `Enter`/`Return`, `BackQuote`/`Tilde`/`` ` ``/`~`, `Pause`, `CapsLock`/`Caps`, `Insert`, `Delete`/`Del`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `F1`-`F24`, `A`-`Z`, `0`-`9`  
 The word `none` is how either key is disabled: with `HOTKEY=none` no toggle key is registered and dictation moves to the tray menu's **Dictate** item; with `CANCEL_KEY=none` there is no way to discard a recording mid-speech (the CLI has no cancel key on any platform). These settings need a loaded config - if the config itself fails to load (a missing API key, for example), the defaults apply instead.
+
+On **Linux**, give `CANCEL_KEY` a chord (`Alt+Escape`, the default) rather than a bare `Escape`. The desktop's GlobalShortcuts portal hands the key to mnvoice for the whole life of the process - closing the session does not give it back - so a bare `Escape` would be dead in every other app until mnvoice quits. The app refuses to bind a bare cancel key and says so in its log; stop a recording with the toggle key or the tray's **Stop & transcribe** instead. On **Windows** a bare `Escape` is fine: the cancel key is registered only while a recording runs and released when it stops, so the default there is `Escape`.
 
 Examples:
 ```ini
@@ -282,7 +285,7 @@ Every key below works with any provider and any API key unless marked otherwise.
 | `BASE_URL` | provider default | Custom endpoint, port, or reverse proxy |
 | `LANGUAGE` | `en` | Language code, or `auto` for detection |
 | `HOTKEY` | `Alt+Space` | Trigger hotkey. See Keybindings above for syntax; `none` disables it (tray menu only). |
-| `CANCEL_KEY` | `Escape` | Discard the recording mid-speech (`none` to disable) |
+| `CANCEL_KEY` | `Escape` on Windows, `Alt+Escape` on Linux | Discard the recording mid-speech (`none` to disable). Linux needs a chord - see Keybindings above. |
 | `FILLER_WORDS` | `0` | `0` strips "uh"/"um"/"erm", `1` keeps them verbatim |
 | `KEYWORDS` | - | Comma-separated vocabulary hints. `keywords.txt` beside the exe is auto-loaded too. |
 | `AUTO_UPDATE` | off | `1` installs a newer published release automatically. Off by default; see [Updates](#updates). |

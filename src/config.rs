@@ -717,18 +717,36 @@ pub fn test_config() -> Config {
     }
 }
 
-// CANCEL_KEY defaults to a chord, not a bare Escape. Measured on
-// Kubuntu/KDE 2026-10-20: a GlobalShortcuts binding on plain Esc is grabbed by
-// kglobalaccel for the process's whole life, and closing the portal session
-// does NOT release the grab (verified: after the session was closed the grab
-// stayed live until the process exited). A bare Esc could never be given up
-// from inside the app, so it is dead in every other app the whole time
-// mnvoice runs. Alt+Esc is unbound by default on KDE (checked against
-// kglobalshortcutsrc/kwinrc) and a chord remains grabbable without costing
-// Esc. Set CANCEL_KEY=none to disable cancel, or CANCEL_KEY=Alt+Escape to
-// pin this, or pick any other chord.
-pub const DEFAULT_CANCEL_MOD: u32 = 0x0001; // MOD_ALT | MOD_NOREPEAT
+// The cancel key's default is platform-specific because what a binding *costs*
+// is platform-specific. Measured on Kubuntu/KDE 2026-10-20: a GlobalShortcuts
+// binding on plain Esc is grabbed by kglobalaccel for the process's whole life,
+// and closing the portal session does NOT release the grab (verified: after the
+// session was closed the grab stayed live until the process exited). A bare Esc
+// could never be given up from inside the app, so on Linux it is dead in every
+// other app the whole time mnvoice runs. Alt+Esc is unbound by default on KDE
+// (checked against kglobalshortcutsrc/kwinrc), so Linux defaults to that chord -
+// and `linux_portal::cancel_binding` refuses a bare key whatever the config
+// says, so a copied `CANCEL_KEY=Escape` cannot re-steal it.
+//
+// Windows needs no such compromise: the tray registers the cancel key only while
+// a recording runs and unregisters it at the stop (`windows_app::toggle`), so a
+// bare Escape is free again between dictations and the shipped default stays.
+//
+// Set CANCEL_KEY=none to disable cancel on any platform.
+
+/// The modifier bits `parse_hotkey` speaks, named once so the defaults below and
+/// the platform guard agree on what "has a modifier" means.
+pub const MOD_ALT: u32 = 0x0001;
+pub const MOD_NOREPEAT: u32 = 0x4000;
+
+#[cfg(windows)]
+pub const DEFAULT_CANCEL_MOD: u32 = MOD_NOREPEAT; // a bare, non-repeating Escape
+#[cfg(not(windows))]
+pub const DEFAULT_CANCEL_MOD: u32 = MOD_ALT | MOD_NOREPEAT;
 pub const DEFAULT_CANCEL_VK: u32 = 0x1B; // VK_ESCAPE
+#[cfg(windows)]
+pub const DEFAULT_CANCEL_STR: &str = "Escape";
+#[cfg(not(windows))]
 pub const DEFAULT_CANCEL_STR: &str = "Alt+Escape";
 
 /// How long one dictation may run before it stops itself.
@@ -841,7 +859,7 @@ pub fn parse_fluid_level(s: &str) -> f32 {
     DEFAULT_ORB_FLUID_LEVEL // default
 }
 
-pub const DEFAULT_HOTKEY_MOD: u32 = 0x0001 | 0x4000; // MOD_ALT | MOD_NOREPEAT
+pub const DEFAULT_HOTKEY_MOD: u32 = MOD_ALT | MOD_NOREPEAT;
 pub const DEFAULT_HOTKEY_VK: u32 = 0x20; // VK_SPACE
 pub const DEFAULT_HOTKEY_STR: &str = "Alt+Space";
 
@@ -884,14 +902,14 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
         return None;
     }
 
-    let mut modifiers: u32 = 0x4000; // MOD_NOREPEAT
+    let mut modifiers: u32 = MOD_NOREPEAT;
     let mut vk: u32 = 0;
 
     for part in s.split('+').map(|p| p.trim()) {
         match part.to_lowercase().as_str() {
-            "alt" | "option" => modifiers |= 0x0001,      // MOD_ALT
-            "ctrl" | "control" => modifiers |= 0x0002,  // MOD_CONTROL
-            "shift" => modifiers |= 0x0004,             // MOD_SHIFT
+            "alt" | "option" => modifiers |= MOD_ALT,
+            "ctrl" | "control" => modifiers |= 0x0002, // MOD_CONTROL
+            "shift" => modifiers |= 0x0004,            // MOD_SHIFT
             "win" | "windows" | "super" | "cmd" => modifiers |= 0x0008, // MOD_WIN
             "space" => vk = 0x20,                       // VK_SPACE
             "esc" | "escape" => vk = 0x1B,              // VK_ESCAPE

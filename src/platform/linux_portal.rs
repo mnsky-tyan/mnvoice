@@ -46,6 +46,78 @@ pub enum HotkeyEvent {
     Cancel,
 }
 
+/// Whether a key can be bound through the portal without taking it away from
+/// every other application.
+///
+/// A `GlobalShortcuts` binding is grabbed by kglobalaccel for the whole life of
+/// the process, and closing the session does NOT give it back (measured
+/// 2026-10-20: the bare-Esc grab stayed live after the session was closed and
+/// only disappeared when mnvoice exited). So a key with no modifier is a
+/// different class of mistake here than anywhere else in the config: not a
+/// setting that does not work, but a system-wide key the user cannot press in
+/// any other app until mnvoice quits. Windows can bind a bare Esc because it
+/// registers per recording and unregisters at the stop (`windows_app::toggle`);
+/// the portal has no equivalent, so this platform declines the binding instead.
+///
+/// `MOD_NOREPEAT` is the parser's own flag on every key, not a modifier the user
+/// pressed, so a real chord is any other bit set: Alt, Ctrl, Shift or Win.
+fn has_modifier(modifiers: u32) -> bool {
+    modifiers & !config::MOD_NOREPEAT != 0
+}
+
+/// The warning a bare toggle key deserves, or `None` for a chord.
+///
+/// The opposite decision from `cancel_binding`, and for one reason: refusing the
+/// cancel key still leaves two ways to stop a recording (the toggle and the
+/// tray's "Stop & transcribe"), while refusing the toggle would leave the app
+/// running with no way in at all. A bare toggle key is also a far less common
+/// choice than a bare Esc was, and less damaging: `A` steals a letter, `Space`
+/// steals a key the user is unlikely to need while dictating into an app.
+/// So this says what is happening instead of declining - and returns the words
+/// rather than printing them, so the choice is something a test can pin.
+fn bare_toggle_warning(hotkey_str: &str) -> Option<String> {
+    let bare = match config::parse_hotkey(hotkey_str) {
+        Some((modifiers, _)) => !has_modifier(modifiers),
+        None => false,
+    };
+    bare.then(|| {
+        format!(
+            "mnvoice: HOTKEY={hotkey_str} is a bare key; the desktop portal keeps it for every \
+             app until mnvoice quits, so typing it elsewhere will not work. A chord such as \
+             Alt+Space avoids that."
+        )
+    })
+}
+
+/// The cancel key's portal trigger, or `None` when binding it would steal a
+/// bare key from every other app.
+///
+/// "none" and an unspellable key are already handled by the config (they yield
+/// the sentinel pair and the default string), so this is the last gate: it reads
+/// the same string the bind site sends to the portal, and refuses exactly what
+/// would hurt - a key with no modifier. The refusal is a skipped binding, not a
+/// dead app: the dictation key still binds, and the user can stop a recording
+/// with the toggle key or the tray row as on any build without a cancel key.
+fn cancel_binding(cancel_str: &str) -> Option<String> {
+    if cancel_str.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    match config::parse_hotkey(cancel_str) {
+        Some((modifiers, _)) if has_modifier(modifiers) => Some(portal_trigger(cancel_str)),
+        Some(_) => {
+            eprintln!(
+                "mnvoice: CANCEL_KEY={cancel_str} is a bare key; the desktop portal grabs it \
+                 for every app until mnvoice quits, so it is not bound. \
+                 Use a chord (Alt+Escape) or CANCEL_KEY=none."
+            );
+            None
+        }
+        // Unspellable: the config already swapped in its own default, so this
+        // only happens if a caller hands the raw spelling over.
+        None => None,
+    }
+}
+
 /// Maps a config hotkey spelling to the portal's trigger format.
 ///
 /// The portal's parser (`xdgshortcut.cpp` in xdg-desktop-portal-kde) only
@@ -146,10 +218,17 @@ where
 
     let mut shortcuts = vec![NewShortcut::new("toggle", "Start or stop dictation")
         .preferred_trigger(Some(portal_trigger(&hotkey_str).as_str()))];
-    if !cancel_str.eq_ignore_ascii_case("none") {
+    // A bare toggle is bound anyway (see `bare_toggle_warning`), but said.
+    if let Some(warning) = bare_toggle_warning(&hotkey_str) {
+        eprintln!("{warning}");
+    }
+    // The guard, not the config, is what keeps a bare key out of the grab: a
+    // user who copies `CANCEL_KEY=Escape` from the old README gets the refusal
+    // logged and the dictation key still bound.
+    if let Some(trigger) = cancel_binding(&cancel_str) {
         shortcuts.push(
             NewShortcut::new("cancel", "Cancel the recording")
-                .preferred_trigger(Some(portal_trigger(&cancel_str).as_str())),
+                .preferred_trigger(Some(trigger.as_str())),
         );
     }
 
@@ -282,5 +361,64 @@ impl WaylandTyper {
             std::thread::sleep(crate::platform::input::KEY_GAP);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chord_is_the_only_thing_the_portal_will_grab_for_good() {
+        // The rule that keeps the user's Esc. A binding here lasts the process's
+        // whole life (measured 2026-10-20), so a key with no modifier must never
+        // reach the portal - not from the default, not from a config a user
+        // copied out of the old README.
+        assert_eq!(cancel_binding("Escape").as_deref(), None);
+        assert_eq!(cancel_binding("esc").as_deref(), None);
+        assert_eq!(
+            cancel_binding("Alt+Escape").as_deref(),
+            Some("ALT+ESCAPE"),
+            "the default spelling binds"
+        );
+        assert_eq!(
+            cancel_binding("Ctrl+Shift+D").as_deref(),
+            Some("CTRL+SHIFT+D")
+        );
+    }
+
+    #[test]
+    fn none_and_garbage_bind_nothing() {
+        assert_eq!(cancel_binding("none").as_deref(), None);
+        assert_eq!(cancel_binding("NONE").as_deref(), None);
+        // The config replaces an unspellable value with its default before it
+        // gets here; the raw spelling binds nothing rather than grabbing a key
+        // nobody asked for.
+        assert_eq!(cancel_binding("Foobar").as_deref(), None);
+    }
+
+    #[test]
+    fn no_modifier_is_not_a_chord() {
+        // MOD_NOREPEAT rides on every parsed key, so "has a modifier" cannot
+        // mean "non-zero": bare Escape is (MOD_NOREPEAT, 0x1B).
+        assert!(!has_modifier(config::MOD_NOREPEAT));
+        assert!(has_modifier(config::MOD_ALT | config::MOD_NOREPEAT));
+        let bare = config::parse_hotkey("Escape").unwrap();
+        let chord = config::parse_hotkey("Alt+Escape").unwrap();
+        assert!(!has_modifier(bare.0), "bare Esc is {bare:?}");
+        assert!(has_modifier(chord.0), "Alt+Esc is {chord:?}");
+    }
+
+    #[test]
+    fn a_bare_toggle_is_warned_about_and_still_bound() {
+        // Refusing the toggle would leave the app with no way in, so a bare
+        // toggle key is bound and said out loud instead - the opposite of the
+        // cancel rule above, and the reason that rule is safe to enforce.
+        let warning = bare_toggle_warning("Space").expect("a bare toggle warns");
+        assert!(warning.contains("HOTKEY=Space"), "{warning}");
+        assert!(warning.contains("bare key"), "{warning}");
+        // The shipped default, and any chord, says nothing.
+        assert!(bare_toggle_warning("Alt+Space").is_none());
+        assert!(bare_toggle_warning("none").is_none());
     }
 }
