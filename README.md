@@ -127,12 +127,14 @@ system tray icon
     -> Exit
 ```
 
-On Linux the same icon carries the rows that have a Linux answer - `Dictate` /
-`Stop & transcribe`, `Restart`, `Quit`:
+On Linux the same icon carries the rows that have a Linux answer, with the
+same three labels: `Dictate` / `Stop & transcribe` / `Transcribing...`,
+`Restart`, `Quit`:
 
 ```
 system tray icon
-    -> Dictate              (or "Stop & transcribe" while recording)
+    -> Dictate              (or "Stop & transcribe" while capturing,
+                             "Transcribing..." disabled while it finishes)
     -> Restart              (frees the hotkey and starts fresh)
     -> Quit
 ```
@@ -146,6 +148,12 @@ configured here). A row that could not do the thing would be a lie.
 Left click opens the menu, the convention for an item with no window to raise.
 The icon is the same orb the overlay shows, painted by the same renderer, and
 its tooltip names the hotkey.
+
+The Linux orb is a Wayland layer-shell overlay (the protocol panels and OSDs
+use): above every window, click-through, no focus. It is 48 logical pixels on
+every display, so on a screen scaled above 100% it is compositor-upscaled and
+slightly soft - the Windows orb is DPI-unaware and scales the same way. Press
+**Alt+Space** to see it.
 
 ---
 

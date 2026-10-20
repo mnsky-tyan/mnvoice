@@ -48,11 +48,14 @@ pub enum OrbCommand {
 /// cosmetic next to dictation itself.
 pub fn spawn(color: (f32, f32, f32), fluid_level: f32) -> Result<Sender<OrbCommand>, String> {
     let (tx, rx) = std::sync::mpsc::channel::<OrbCommand>();
-    std::thread::spawn(move || {
-        if let Err(e) = run(rx, color, fluid_level) {
-            eprintln!("mnvoice: orb disabled ({e})");
-        }
-    });
+    std::thread::Builder::new()
+        .name("mnvoice-orb".into())
+        .spawn(move || {
+            if let Err(e) = run(rx, color, fluid_level) {
+                eprintln!("mnvoice: orb disabled ({e})");
+            }
+        })
+        .map_err(|e| format!("could not start the orb thread ({e})"))?;
     Ok(tx)
 }
 
@@ -82,6 +85,31 @@ struct Buffer {
 // The mapped pixels are only ever reached through the render's `&mut [u32]`,
 // one buffer at a time, on the one thread that owns the connection.
 unsafe impl Send for Buffer {}
+
+impl OrbState_ {
+    /// A dictation started. Only the flags move here, and `configured` is not
+    /// one of them: it belongs to the layer-shell handshake and is never
+    /// revisited, because a compositor that has already configured a surface
+    /// sends no second configure for an unchanged size. Clearing it on show
+    /// waited for an event that never arrives, so the orb never painted a
+    /// frame - `shown_after_the_handshake_can_paint` pins that.
+    fn mark_visible(&mut self, state: OrbState) {
+        self.state = state;
+        self.visible = true;
+    }
+
+    /// A dictation ended. The surface is unmapped by the caller detaching its
+    /// buffer; the flag stops the render loop spending frames on nothing.
+    fn mark_hidden(&mut self) {
+        self.visible = false;
+    }
+
+    /// Whether a frame may be rendered and committed. Painting needs a
+    /// configured surface; showing needs a live dictation.
+    fn can_paint(&self) -> bool {
+        self.visible && self.configured
+    }
+}
 
 fn run(
     rx: std::sync::mpsc::Receiver<OrbCommand>,
@@ -157,22 +185,35 @@ fn run(
             Duration::from_secs(3600)
         }) {
             Ok(OrbCommand::Show(s)) => {
-                st.state = s;
-                st.visible = true;
-                st.configured = false; // force a fresh configure+paint
-                surface.commit();
+                st.mark_visible(s);
+                // No commit, and no configure reset: see `mark_visible`. The
+                // paint branch below is what re-maps the surface - attach,
+                // damage, commit - which is the Wayland way to show a layer
+                // surface again after a Hide detached its buffer.
             }
             Ok(OrbCommand::State(s)) => st.state = s,
             Ok(OrbCommand::Hide) => {
-                st.visible = false;
+                st.mark_hidden();
                 // Unmap by detaching: the compositor forgets the buffer and the
                 // surface stops being presented, which is the Wayland way to
                 // hide without destroying.
                 surface.attach(None, 0, 0);
                 surface.commit();
             }
-            Err(_) => {
-                st.running = false;
+            Err(e) => {
+                // A timeout is the frame tick, not a shutdown. The two used to
+                // be the same arm: while hidden the wait is an hour, but as
+                // soon as a dictation showed the orb the wait became one frame
+                // (33ms), so the very first Show ended the thread 33ms later -
+                // and `run` returned Ok, so nothing was logged. Every later
+                // `send` hit a dead channel and was dropped by its `let _ =`,
+                // which is the whole reason the orb looked unimplemented on a
+                // machine where the hotkey, the orb state and the tray all
+                // worked. Only a disconnected channel - the app dropped its
+                // sender, so it is shutting down - ends the loop.
+                if let std::sync::mpsc::RecvTimeoutError::Disconnected = e {
+                    st.running = false;
+                }
             }
         }
 
@@ -180,7 +221,7 @@ fn run(
             break;
         }
 
-        if st.visible && st.configured {
+        if st.can_paint() {
             let now = std::time::Instant::now();
             if now.duration_since(last_render) >= interval {
                 last_render = now;
@@ -217,6 +258,10 @@ fn run(
             .roundtrip(&mut st)
             .map_err(|e| format!("Wayland roundtrip failed ({e})"))?;
     }
+    // A thread that leaves this loop stops accepting commands, so the app's
+    // later `Show` sends fail into a `let _` and no future dictation can bring
+    // the orb back. Nothing about it is silent any more.
+    eprintln!("mnvoice: orb thread exited (no further dictation will show it)");
     Ok(())
 }
 
@@ -364,14 +409,20 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for OrbState_ {
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for OrbState_ {
     fn event(
         state: &mut Self,
-        _: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_layer_surface_v1::Event::Configure { .. } => {
+            zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+                // The protocol requires the configure to be acknowledged
+                // before a buffer is committed against it. The ack was never
+                // sent, which no compositor ever caught because the orb never
+                // reached a buffer commit - but the first working render
+                // would have been the place to find out.
+                surface.ack_configure(serial);
                 state.configured = true;
             }
             zwlr_layer_surface_v1::Event::Closed => {
@@ -395,4 +446,71 @@ pub fn orb_config(config: &Option<std::sync::Arc<config::Config>>) -> ((f32, f32
         .map(|c| c.orb_fluid_level)
         .unwrap_or(config::DEFAULT_ORB_FLUID_LEVEL);
     (color, fluid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> OrbState_ {
+        OrbState_ {
+            buffers: [None, None],
+            next: 0,
+            frame: 0,
+            visible: false,
+            state: OrbState::Recording,
+            color: (1.0, 0.5, 0.9),
+            fluid_level: 0.75,
+            configured: false,
+            running: true,
+        }
+    }
+
+    /// The whole handshake, in order: nothing paints before the compositor
+    /// configures the surface, everything paints after.
+    #[test]
+    fn nothing_paints_before_the_compositor_configures() {
+        let mut st = state();
+        st.mark_visible(OrbState::Recording);
+        assert!(!st.can_paint(), "an unconfigured surface has no size yet");
+        st.configured = true; // the configure event, acked in Dispatch
+        assert!(st.can_paint());
+    }
+
+    /// The bug this pins: a dictation's second Show, after a first one already
+    /// completed the handshake. A compositor sends no fresh configure for an
+    /// unchanged size, so if Show cleared `configured` the orb painted no frame
+    /// ever again - which is exactly how the orb came to be invisible on a
+    /// desktop where every other part of the app worked.
+    #[test]
+    fn shown_after_the_handshake_can_paint() {
+        let mut st = state();
+        st.configured = true;
+        st.mark_visible(OrbState::Recording);
+        st.mark_hidden();
+        st.mark_visible(OrbState::Recording);
+        assert!(
+            st.can_paint(),
+            "a re-shown orb must paint without waiting for a configure that never comes"
+        );
+    }
+
+    /// Hide is what stops the frame loop spending CPU on an unmapped surface.
+    #[test]
+    fn hidden_stops_painting() {
+        let mut st = state();
+        st.configured = true;
+        st.mark_visible(OrbState::Recording);
+        st.mark_hidden();
+        assert!(!st.can_paint());
+    }
+
+    /// The state a dictation moves through is carried by the flag, not
+    /// inferred from visibility: the same surface shows both.
+    #[test]
+    fn a_shown_orb_carries_the_state_it_was_shown_with() {
+        let mut st = state();
+        st.mark_visible(OrbState::Transcribing);
+        assert_eq!(st.state, OrbState::Transcribing);
+    }
 }

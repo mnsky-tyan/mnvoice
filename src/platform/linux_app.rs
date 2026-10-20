@@ -37,6 +37,9 @@ pub enum AppEvent {
     Restart,
     /// Stop this process and leave it stopped.
     Quit,
+    /// A dictation worker finished; the loop collects its typer. Sent by the
+    /// worker only, never by the hotkey or the tray.
+    Done,
 }
 
 impl AppEvent {
@@ -143,7 +146,7 @@ pub fn main() -> Result<(), String> {
     // register is logged, not fatal.
     let tray = linux_tray::spawn(
         event_tx.clone(),
-        Arc::new(|| RECORDING.load(std::sync::atomic::Ordering::SeqCst)),
+        Arc::new(phase) as Arc<dyn Fn() -> u8 + Send + Sync>,
         cfg.orb_color,
         cfg.orb_fluid_level,
         cfg.hotkey_str.clone(),
@@ -154,25 +157,38 @@ pub fn main() -> Result<(), String> {
     // The orb starts hidden and shows only while a dictation runs.
     let _ = orb_tx.send(linux_orb::OrbCommand::Hide);
 
-    let engine = unix_audio::CpalAudio;
-    // The hotkey listener's voice: Toggle re-sent on the toggle channel stops
-    // the running dictation, Cancel lands on its own channel.
-    let (toggle_tx, toggle_rx) = mpsc::channel::<()>();
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    // One dictation at a time, on its own thread. The loop must stay
+    // responsive while a dictation runs: a loop that blocks inside `dictate`
+    // queues every press made while it runs, and each queued press starts a
+    // fresh recording the moment the previous one hits its max-seconds stop -
+    // measured: one press to start, three forced 120s stops in a row, and a
+    // recording that re-armed itself after each one with nobody near the
+    // hotkey. The Windows build spawns `worker` on a thread for the same
+    // reason (`windows_app::toggle`).
     let mut typer: Option<linux_portal::WaylandTyper> = None;
-
-    // One hotkey event at a time, forever: Toggle starts (or stops) a
-    // dictation, Cancel discards one in flight. This is the message loop the
-    // Windows tray runs, with the portal as the message source.
-    let _keep = (toggle_tx.clone(), cancel_tx.clone());
+    let mut worker: Option<std::thread::JoinHandle<Option<linux_portal::WaylandTyper>>> = None;
+    // The live dictation's stop and cancel senders. Both ends are created per
+    // dictation and moved into the worker, so a signal from a finished session
+    // can never reach the next one - the Windows build's fresh-session-arcs
+    // shape (`fresh_session_arcs` there).
+    let mut session: Option<Session> = None;
     loop {
         match event_rx.recv() {
             Ok(AppEvent::Toggle) => {
-                if RECORDING.load(std::sync::atomic::Ordering::SeqCst) {
-                    // The same press that started the dictation stops it - the
-                    // Windows hotkey's contract, and the tray's
-                    // "Stop & transcribe" row.
-                    let _ = toggle_tx.send(());
+                if let Some(session) = &session {
+                    if phase() == PHASE_RECORDING {
+                        // The same press that started the dictation stops it -
+                        // the Windows hotkey's contract, and the tray's
+                        // "Stop & transcribe" row. The receiver belongs to the
+                        let _ = session.stop_tx.send(());
+                    } else {
+                        // Capture has ended and the transcript is still being
+                        // typed: `State::Transcribing` in Windows' `toggle`,
+                        // where the same press means "drop it". Sending stop
+                        // here would swallow the press outright - capture is
+                        // already over, so that channel does nothing.
+                        let _ = session.cancel_tx.send(());
+                    }
                 } else {
                     // The cancel key is bound once, with the hotkey (see
                     // linux_portal::hotkey_loop): its default is a chord, not
@@ -180,16 +196,46 @@ pub fn main() -> Result<(), String> {
                     let _ = orb_tx.send(linux_orb::OrbCommand::Show(
                         crate::orb_render::OrbState::Recording,
                     ));
-                    // The tray's first row reads the recording state, so a
-                    // click that starts a dictation has to repaint it.
+                    // Set before the repaint below: the row and the loop's
+                    // "stop or drop" decision both read it - see `PHASE`.
+                    set_phase(PHASE_RECORDING);
+                    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+                    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+                    let worker_cfg = Arc::clone(&cfg);
+                    let orb = orb_tx.clone();
+                    let events = event_tx.clone();
+                    let start_typer = typer.take();
+                    worker = Some(std::thread::spawn(move || {
+                        // Whatever happens to the dictation - Ok, Err, or
+                        // panic - the loop must hear `Done` and stop believing
+                        // a session is live. A panic that skipped the send
+                        // would leave Toggle sending stop signals to a dead
+                        // worker forever.
+                        struct DoneGuard(mpsc::Sender<AppEvent>);
+                        impl Drop for DoneGuard {
+                            fn drop(&mut self) {
+                                let _ = self.0.send(AppEvent::Done);
+                            }
+                        }
+                        let _done = DoneGuard(events);
+                        let engine = unix_audio::CpalAudio;
+                        let mut typer = start_typer;
+                        // Capture is live from this thread's first moment; the
+                        // loop clears it when it collects the worker.
+                        let _recording = RecordingGuard;
+                        let result =
+                            dictate(&worker_cfg, &engine, &stop_rx, &cancel_rx, &mut typer, &orb);
+                        // The orb's lifetime is the recording's; the worker
+                        // owns the hide because the loop is free to handle the
+                        // next event before this thread is collected.
+                        let _ = orb.send(linux_orb::OrbCommand::Hide);
+                        if let Err(e) = result {
+                            eprintln!("dictation failed: {e}");
+                        }
+                        typer
+                    }));
+                    session = Some(Session { stop_tx, cancel_tx });
                     refresh_tray(&tray);
-                    let result =
-                        dictate(&cfg, &engine, &toggle_rx, &cancel_rx, &mut typer, &orb_tx);
-                    let _ = orb_tx.send(linux_orb::OrbCommand::Hide);
-                    refresh_tray(&tray);
-                    if let Err(e) = result {
-                        eprintln!("dictation failed: {e}");
-                    }
                 }
             }
             Ok(AppEvent::Cancel) => {
@@ -198,7 +244,24 @@ pub fn main() -> Result<(), String> {
                 // is bound permanently, so an event racing the recording can
                 // never be discriminated here - the drain at dictate's start
                 // is what keeps a stale press from discarding the next one.
-                let _ = cancel_tx.send(());
+                if let Some(session) = &session {
+                    let _ = session.cancel_tx.send(());
+                }
+            }
+            Ok(AppEvent::Done) => {
+                // The dictation thread finished: take its typer back (the
+                // typing session is opened lazily and reused across
+                // dictations) and repaint the tray, which is a row behind while
+                // the worker runs. The orb is hidden by the worker and the
+                // phase is cleared below.
+                if let Some(handle) = worker.take() {
+                    typer = handle.join().unwrap_or(None);
+                }
+                session = None;
+                // The worker cleared it on the way out; the loop clears it
+                // again in case a panicked worker never got that far.
+                set_phase(PHASE_IDLE);
+                refresh_tray(&tray);
             }
             Ok(AppEvent::Restart) => {
                 eprintln!("mnvoice: restarting");
@@ -225,6 +288,59 @@ pub fn main() -> Result<(), String> {
             }
         }
     }
+}
+
+/// What the dictation in flight is doing, in the three states the Windows tray
+/// names: idle, capturing, and transcribing the tail of a finished capture. One
+/// atomic, because the loop, the tray and the worker all read it and two flags
+/// that must agree will disagree exactly when it matters.
+///
+/// It drives two separate decisions that are easy to confuse:
+///   - the tray's first row: "Dictate" / "Stop & transcribe" / "Transcribing..."
+///   - what a Toggle press means: start / stop capture / drop the transcript
+///
+/// The loop raises it to `Recording` before spawning a worker, so the repaint
+/// that follows already reads "recording" - raising it inside the new thread was
+/// a race that lost, and the row sat on "Dictate" through a live recording.
+/// `dictate` moves it to `Transcribing` when capture ends and to `Idle` when the
+/// transcript is typed; the loop's `Done` arm clears it in case a worker
+/// panicked before it could.
+static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PHASE_IDLE);
+
+pub(crate) const PHASE_IDLE: u8 = 0;
+pub(crate) const PHASE_RECORDING: u8 = 1;
+pub(crate) const PHASE_TRANSCRIBING: u8 = 2;
+
+pub(crate) fn phase() -> u8 {
+    PHASE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn set_phase(phase: u8) {
+    PHASE.store(phase, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Clears the phase when the worker's capture ends, however it ends - return,
+/// `?`, or panic. The same reason the worker's `Done` event uses a guard: a
+/// phase stuck at `Recording` makes the loop send stop signals to a session that
+/// is already over, so a press during the next transcription would "stop"
+/// nothing instead of dropping the transcript.
+struct RecordingGuard;
+
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        if phase() == PHASE_RECORDING {
+            set_phase(PHASE_TRANSCRIBING);
+        }
+    }
+}
+
+/// The live dictation's control signals, created together with each worker
+/// thread and dropped with it, so a stale signal cannot reach the next
+/// recording. Windows does this with a fresh set of shared flags per session
+/// (`fresh_session_arcs`); channels give the same guarantee here.
+struct Session {
+    stop_tx: mpsc::Sender<()>,
+    cancel_tx: mpsc::Sender<()>,
 }
 
 /// Asks the panel to re-read the item, so its label and icon follow the
@@ -313,10 +429,6 @@ fn relaunch_unit(pid: u32) -> String {
     format!("app-mnvoice@{pid}.service")
 }
 
-/// Whether a dictation is in flight. The hotkey's Toggle means "stop" exactly
-/// while one is running, so the flag has to be read, not guessed.
-static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// One dictation: capture, transcribe, type into the focused window.
 ///
 /// The structure mirrors `cli::dictate` - the same engine, the same seam
@@ -331,7 +443,7 @@ fn dictate(
     typer: &mut Option<linux_portal::WaylandTyper>,
     orb_tx: &std::sync::mpsc::Sender<linux_orb::OrbCommand>,
 ) -> Result<(), String> {
-    RECORDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    set_phase(PHASE_RECORDING);
     let result = cli::dictate_with_controls(cfg, engine, toggle_rx, Some(cancel_rx), |text| {
         // The orb moves to the "thinking" state while the transcript is
         // being produced, exactly like the Windows orb.
@@ -340,7 +452,7 @@ fn dictate(
         ));
         type_transcript(typer, text);
     });
-    RECORDING.store(false, std::sync::atomic::Ordering::SeqCst);
+    set_phase(PHASE_IDLE);
     result
 }
 

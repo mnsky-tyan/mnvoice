@@ -292,10 +292,10 @@ mnvoice/
 │       ├── cli.rs         the terminal control surface (Enter to toggle) + dictate_with_controls
 │       ├── unix_audio.rs  cpal capture (Linux, macOS)
 │       ├── unix_http.rs   ureq + tungstenite transport (Linux, macOS)
-│       ├── linux_app.rs   the Linux desktop app: flock, autostart, single event loop (hotkey + tray), relaunch
+│       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
-│       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): menu rows -> AppEvent, icon from orb_render
-│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay + shm
+│       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from orb_render
+│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay + shm, paint loop (timeout is not shutdown)
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)
 │       └── windows_impl.rs the SendInput injector

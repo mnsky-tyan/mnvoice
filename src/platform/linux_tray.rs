@@ -21,6 +21,7 @@
 
 use crate::orb_render::{render_gas_fluid, OrbState, ORB_HEIGHT, ORB_WIDTH};
 use crate::platform::linux_app::AppEvent;
+use crate::platform::linux_app::{PHASE_RECORDING, PHASE_TRANSCRIBING};
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Icon, Status, ToolTip, Tray};
 use std::sync::mpsc::Sender;
@@ -44,12 +45,17 @@ pub enum TrayCommand {
 
 /// The label the user reads for a command. The one place each command's label
 /// is spelled, so the menu and the tests that assert on it cannot drift.
-fn label(command: TrayCommand, recording: bool) -> &'static str {
+///
+/// The first row has a label per phase, as the Windows tray's `dictate_item`
+/// does: what a click will do depends on what is happening, and a row that
+/// offered "Dictate" during a capture would start a second one if clicked.
+fn label(command: TrayCommand, phase: u8) -> &'static str {
     match command {
-        // While a dictation runs the first row stops it, exactly like the
-        // Windows tray's "Stop & transcribe".
-        TrayCommand::Toggle if recording => "Stop & transcribe",
-        TrayCommand::Toggle => "Dictate",
+        TrayCommand::Toggle => match phase {
+            PHASE_RECORDING => "Stop & transcribe",
+            PHASE_TRANSCRIBING => "Transcribing...",
+            _ => "Dictate",
+        },
         TrayCommand::Restart => "Restart",
         TrayCommand::Quit => "Quit",
     }
@@ -72,10 +78,10 @@ fn event(command: TrayCommand) -> AppEvent {
 #[derive(Clone)]
 pub struct MnvoiceTray {
     commands: Sender<AppEvent>,
-    /// Whether a dictation is in flight, read when the menu is built or the
-    /// icon is painted. A `fn`-shaped read rather than a copy of the flag
-    /// because the panel asks for these at any moment, not when we last knew.
-    recording: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// What the app is doing, read when the menu is built or the icon painted.
+    /// A `fn`-shaped read rather than a copy of the value because the panel
+    /// asks for these at any moment, not when we last knew.
+    phase: Arc<dyn Fn() -> u8 + Send + Sync>,
     /// The orb's look, from the config: the tray icon IS the orb.
     color: (f32, f32, f32),
     fluid_level: f32,
@@ -94,14 +100,14 @@ const DEFAULT_FRAME: u32 = 10;
 impl MnvoiceTray {
     pub fn new(
         commands: Sender<AppEvent>,
-        recording: Arc<dyn Fn() -> bool + Send + Sync>,
+        phase: Arc<dyn Fn() -> u8 + Send + Sync>,
         color: (f32, f32, f32),
         fluid_level: f32,
         hotkey_str: String,
     ) -> Self {
         Self {
             commands,
-            recording,
+            phase,
             color,
             fluid_level,
             hotkey_str,
@@ -120,10 +126,10 @@ impl Tray for MnvoiceTray {
     }
 
     fn title(&self) -> String {
-        if (self.recording)() {
-            "mnvoice - recording".into()
-        } else {
-            "mnvoice".into()
+        match (self.phase)() {
+            PHASE_RECORDING => "mnvoice - recording".into(),
+            PHASE_TRANSCRIBING => "mnvoice - transcribing".into(),
+            _ => "mnvoice".into(),
         }
     }
 
@@ -162,7 +168,7 @@ impl Tray for MnvoiceTray {
         render_gas_fluid(
             self.frame,
             &mut buf,
-            if (self.recording)() {
+            if (self.phase)() == PHASE_RECORDING {
                 OrbState::Recording
             } else {
                 // At rest the orb is hidden, so the icon takes the quieter
@@ -185,7 +191,7 @@ impl Tray for MnvoiceTray {
     /// separator, then the app's own controls. Every row is built from `label`,
     /// so a label cannot drift from the command it belongs to.
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let recording = (self.recording)();
+        let phase = (self.phase)();
         let mut items = Vec::new();
         for (index, command) in [TrayCommand::Toggle, TrayCommand::Restart, TrayCommand::Quit]
             .into_iter()
@@ -196,11 +202,16 @@ impl Tray for MnvoiceTray {
                 // as the Windows menu draws it.
                 items.push(MenuItem::Separator);
             }
-            let text = label(command, recording);
+            let text = label(command, phase);
             let sender = self.commands.clone();
             items.push(
                 StandardItem {
                     label: text.into(),
+                    // A click during transcription cannot transcribe faster, and
+                    // a row that offered a control that does nothing would read
+                    // as a broken click - the Windows row is greyed exactly
+                    // here (`dictate_item`).
+                    enabled: !(phase == PHASE_TRANSCRIBING && command == TrayCommand::Toggle),
                     icon_name: if matches!(command, TrayCommand::Quit) {
                         "application-exit".into()
                     } else {
@@ -251,13 +262,13 @@ impl TrayHandle {
 /// orb's missing Wayland connection is.
 pub fn spawn(
     commands: Sender<AppEvent>,
-    recording: Arc<dyn Fn() -> bool + Send + Sync>,
+    phase: Arc<dyn Fn() -> u8 + Send + Sync>,
     color: (f32, f32, f32),
     fluid_level: f32,
     hotkey_str: String,
 ) -> Result<TrayHandle, String> {
     use ksni::blocking::TrayMethods;
-    let tray = MnvoiceTray::new(commands, recording, color, fluid_level, hotkey_str);
+    let tray = MnvoiceTray::new(commands, phase, color, fluid_level, hotkey_str);
     let inner = tray
         .spawn()
         .map_err(|e| format!("system tray unavailable ({e})"))?;
@@ -268,15 +279,16 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::config::{DEFAULT_ORB_COLOR, DEFAULT_ORB_FLUID_LEVEL};
+    use crate::platform::linux_app::PHASE_IDLE;
 
     /// A tray with no D-Bus behind it: the menu and the pixmap are plain data,
     /// so the labels the user reads and the commands they send can be pinned
     /// without a panel running.
-    fn tray(recording: bool) -> (MnvoiceTray, std::sync::mpsc::Receiver<AppEvent>) {
+    fn tray(phase: u8) -> (MnvoiceTray, std::sync::mpsc::Receiver<AppEvent>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let t = MnvoiceTray::new(
             tx,
-            Arc::new(move || recording),
+            Arc::new(move || phase),
             DEFAULT_ORB_COLOR,
             DEFAULT_ORB_FLUID_LEVEL,
             "Alt+Space".into(),
@@ -295,19 +307,36 @@ mod tests {
     }
 
     #[test]
-    fn the_first_row_follows_the_recording() {
-        let (idle, _) = tray(false);
+    fn the_first_row_names_each_phase() {
+        let (idle, _) = tray(PHASE_IDLE);
         assert_eq!(rows(&idle.menu()), vec!["Dictate", "Restart", "Quit"]);
-        let (live, _) = tray(true);
+        let (live, _) = tray(PHASE_RECORDING);
         assert_eq!(
             rows(&live.menu()),
             vec!["Stop & transcribe", "Restart", "Quit"]
         );
+        let (typing, _) = tray(PHASE_TRANSCRIBING);
+        let menu = typing.menu();
+        let rows_live = rows(&menu);
+        assert_eq!(
+            rows_live,
+            vec!["Transcribing...", "Restart", "Quit"],
+            "the row named what the app was doing, so a hotkey press that \
+             dropped the transcript was not something a click could do"
+        );
+        // And it is not clickable either, as on Windows.
+        for item in &menu {
+            if let MenuItem::Standard(row) = item {
+                if row.label == "Transcribing..." {
+                    assert!(!row.enabled);
+                }
+            }
+        }
     }
 
     #[test]
     fn the_menu_carries_the_entries_that_have_a_linux_answer() {
-        let (t, _) = tray(false);
+        let (t, _) = tray(PHASE_IDLE);
         let menu = t.menu();
         // Four rows: the three commands and the separator that splits the
         // recording control from the app's. No "Check for updates" and no
@@ -325,7 +354,7 @@ mod tests {
         // one thing and the click sends another: `label` and `event` are the
         // one place each is named, and this walks the menu comparing what the
         // label produced to what the callback delivered.
-        let (t, rx) = tray(false);
+        let (t, rx) = tray(PHASE_IDLE);
         let menu = t.menu();
         let sent = [AppEvent::Toggle, AppEvent::Restart, AppEvent::Quit];
         let seen = ["Dictate", "Restart", "Quit"];
@@ -347,7 +376,7 @@ mod tests {
 
     #[test]
     fn the_tray_icon_is_the_orb_painted_by_the_shared_renderer() {
-        let (t, _) = tray(true);
+        let (t, _) = tray(PHASE_RECORDING);
         let pixmap = t.icon_pixmap();
         assert_eq!(pixmap.len(), 1, "one size: the orb");
         let icon = &pixmap[0];
@@ -371,13 +400,13 @@ mod tests {
 
     #[test]
     fn the_tooltip_names_the_hotkey_and_says_when_there_is_none() {
-        let (t, _) = tray(false);
+        let (t, _) = tray(PHASE_IDLE);
         assert!(t.tool_tip().description.contains("Alt+Space"));
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let no_key = MnvoiceTray::new(
             tx,
-            Arc::new(|| false),
+            Arc::new(|| PHASE_IDLE),
             DEFAULT_ORB_COLOR,
             DEFAULT_ORB_FLUID_LEVEL,
             "none".into(),
@@ -389,11 +418,12 @@ mod tests {
 
     #[test]
     fn the_item_is_named_for_the_app_and_shows_as_active() {
-        let (t, _) = tray(false);
+        let (t, _) = tray(PHASE_IDLE);
         assert_eq!(t.id(), "mnvoice");
         assert_eq!(t.title(), "mnvoice");
         assert!(matches!(t.status(), Status::Active));
-        let (live, _) = tray(true);
+        let (live, _) = tray(PHASE_RECORDING);
         assert_eq!(live.title(), "mnvoice - recording");
+        assert_eq!(tray(PHASE_TRANSCRIBING).0.title(), "mnvoice - transcribing");
     }
 }
