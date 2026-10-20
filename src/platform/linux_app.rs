@@ -450,7 +450,22 @@ fn dictate(
         let _ = orb_tx.send(linux_orb::OrbCommand::State(
             crate::orb_render::OrbState::Transcribing,
         ));
-        type_transcript(typer, text);
+        // Streaming types each word the moment it is decided - `commit_words`
+        // in `stream.rs` calls `input::type_text` itself - so the text handed
+        // back here has already been in the document while the user was still
+        // speaking. Typing it again would put a second copy of the whole
+        // dictation at the cursor, which is not what any platform does: the
+        // Windows worker's `WM_APP_WORKER` arm only logs the transcript
+        // (`transcribed: <preview>`), and the Unix CLI prints it. The orb
+        // still moves to its thinking state above, so the callback is not
+        // skipped - only its keystrokes are.
+        //
+        // REST needs the callback to type: it is the only arm whose
+        // transcript was never injected, because there is nothing to inject
+        // until the upload comes back in one piece.
+        if cfg.protocol != config::Protocol::Streaming {
+            type_transcript(typer, text);
+        }
     });
     set_phase(PHASE_IDLE);
     result
@@ -586,6 +601,40 @@ pub fn ensure_autostart() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contract the streaming double-typing fix rests on: the callback
+    /// `linux_app::dictate` hands `cli::dictate_with_controls` types only for
+    /// a protocol that has not already typed.
+    ///
+    /// Streaming commits each word through `stream::commit_words` -
+    /// `input::type_text` - as it is decided, so the finished text has been
+    /// in the document since the user said it. REST is the opposite: nothing
+    /// is injected until the upload returns whole, so the callback is the
+    /// only keystroke path that protocol has. A test that drives the real
+    /// streaming loop cannot assert on keystrokes (the test injector is a
+    /// no-op), so the rule is asserted where the decision is made.
+    #[test]
+    fn only_the_protocol_that_never_typed_receives_the_callback_keys() {
+        let mut cfg = crate::config::test_config();
+
+        cfg.protocol = config::Protocol::Streaming;
+        assert!(
+            !types_in_callback(&cfg),
+            "streaming already typed every word; the callback must not re-type"
+        );
+
+        cfg.protocol = config::Protocol::Rest;
+        assert!(
+            types_in_callback(&cfg),
+            "REST never typed anything, so the callback is its only injector"
+        );
+    }
+
+    /// The expression `dictate`'s callback uses, in isolation, so the intent
+    /// above cannot drift from the code one line away.
+    fn types_in_callback(cfg: &config::Config) -> bool {
+        cfg.protocol != config::Protocol::Streaming
+    }
 
     #[test]
     fn both_input_sources_arrive_as_the_same_events() {
