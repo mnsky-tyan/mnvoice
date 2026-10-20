@@ -138,9 +138,18 @@ and direct keyboard event injection.
      on the session bus clears a stale grab without a restart. The Linux
      cancel key therefore defaults to a chord (`Alt+Escape`, unbound on KDE
      by default) - a bare key bound here is dead in every other app until
-     mnvoice quits, so `CANCEL_KEY` must stay a chord or `none`. The earlier
+     mnvoice quits. The rule is enforced at the bind site, not in the default:
+     `linux_portal::cancel_binding` declines a modifier-free cancel key and
+     logs what to write instead, so a copied `CANCEL_KEY=Escape` cannot
+     re-steal it. A bare *toggle* is warned about and bound anyway
+     (`bare_toggle_warning`): refusing cancel still leaves two ways to stop a
+     recording, refusing the toggle leaves no way in at all.
+     Windows is not in this class of problem - it registers cancel at the start
+     of a recording and unregisters it at the stop (`windows_app::toggle`), so
+     `Escape` remains the default there and the platforms' defaults are
+     deliberately different (`cfg(windows)` in `config.rs`). The earlier
      arm/disarm design (bind cancel per recording, close at the stop) is
-     reverted in 93d2b80; do not reintroduce it.
+     reverted in 93d2b80; do not reintroduce it on Linux.
 
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
@@ -284,7 +293,7 @@ mnvoice/
 │       ├── unix_audio.rs  cpal capture (Linux, macOS)
 │       ├── unix_http.rs   ureq + tungstenite transport (Linux, macOS)
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, single event loop (hotkey + tray), relaunch
-│       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey, RemoteDesktop typing (generic over the app's event)
+│       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): menu rows -> AppEvent, icon from orb_render
 │       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay + shm
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
