@@ -164,6 +164,27 @@ and direct keyboard event injection.
      arm/disarm design (bind cancel per recording, close at the stop) is
      reverted in 93d2b80; do not reintroduce it on Linux.
 
+   - **A cancel event must be polled while the capture is live.** The portal's
+     cancel signal was collected only after the transcriber returned, so
+     Alt+Esc during a recording did nothing at all: measured 2026-10-20, the
+     session ran on until the hotkey was pressed again or the silence window
+     expired. `watch_recording` now polls the channel and raises BOTH flags,
+     which is the Windows `cancel()` seam verbatim.
+
+   - **On Wayland, `input::type_text` (XTest) reaches native windows and
+     nothing else - the portal typer is the only path that works there.**
+     Measured 2026-10-20: `xwininfo -root -tree` on `:0` listed only Chocobar,
+     KWin, Fcitx and xsettingsd - no kitty, no Brave, both native Wayland.
+     So `stream::commit_words` typing live through the global injector is
+     invisible in a native Wayland app, and the end-of-session
+     `type_transcript` through `WaylandTyper` is the only keystroke the user
+     ever sees. That looks like a double-typing bug and is NOT one: removing
+     the callback's keystrokes makes streaming type nothing at all in kitty
+     and Brave. It really does double-type into an XWayland window, and the
+     fix is to route the streaming loop's own commits through the portal
+     typer, not to drop the final pass. Do not "fix the double typing" again
+     without measuring which injector reaches the user's actual windows.
+
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
      at the sizing site and `nBlockAlign > 0 ? nBlockAlign : channels *
@@ -244,6 +265,20 @@ and direct keyboard event injection.
      stalled device ran until the longer window expired. Both now call
      `advance_stalled(elapsed_ms, vad_silence_ms)`, which charges both windows
      on a tick that returned no audio.
+
+   - **`VAD_RMS_THRESHOLD=400` is below this laptop's ambient noise floor, so
+     a silent room never closes the 3s window and a dictation never stops by
+     itself.** Measured 2026-10-20 on the user's own capture path (48 kHz
+     stereo mixed to mono, resampled to 16 kHz, 20 ms chunks, `rms_of`): 30 s
+     of silence gives p50=358, p99=571, max=684, and 28% of chunks count as
+     speech, so the longest quiet run was 500 ms against a 3000 ms requirement.
+     The user's `~/.local/bin/mnvoice.env` now sets `VAD_RMS_THRESHOLD=800`
+     (clears the ceiling with margin, still far below speech); a silent
+     recording then auto-stops in ~6 s instead of never. This is a per-machine
+     tuning, NOT a default change - a quiet room is fine at 400, and the
+     shipped `mnvoice.env.example` must stay platform- and hardware-neutral.
+     When "the orb never goes away" is reported again, measure the noise floor
+     through the engine's own metric before touching the capture code.
    - **`AUDCLNT_BUFFERFLAGS_SILENT` packets hold stale buffer contents, not
      silence.** The flag means the driver did not write the buffer; reading it
      feeds a glitch into the transcript. Substituting zeros (a shared const
