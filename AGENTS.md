@@ -130,6 +130,18 @@ and direct keyboard event injection.
      duplicated the pipeline head and blocked recovery with
      `safety: blocked_recover_dirty`. `git stash` first, recover, then pop.
 
+   - **A `GlobalShortcuts` portal binding is grabbed by kglobalaccel for the
+     process's whole life; closing the session does NOT release the grab.**
+     Measured 2026-10-20 on Kubuntu/KDE: after the cancel session was closed
+     the Esc grab stayed live three minutes and only went away when the
+     process exited. `org.kde.KGlobalAccel.unregister(component, shortcut)`
+     on the session bus clears a stale grab without a restart. The Linux
+     cancel key therefore defaults to a chord (`Alt+Escape`, unbound on KDE
+     by default) - a bare key bound here is dead in every other app until
+     mnvoice quits, so `CANCEL_KEY` must stay a chord or `none`. The earlier
+     arm/disarm design (bind cancel per recording, close at the stop) is
+     reverted in 93d2b80; do not reintroduce it.
+
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
      at the sizing site and `nBlockAlign > 0 ? nBlockAlign : channels *
