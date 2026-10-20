@@ -133,10 +133,21 @@ where
 /// channel, so all this does is watch the two channels that already exist: the
 /// line reader, whose next line is the user asking to stop early, and the
 /// engine's report. Returns that report with how long the microphone was open.
+///
+/// `cancel_lines`/`cancelled` are the desktop app's cancel key. It has to be
+/// read HERE, while the capture is still running: it used to be collected only
+/// after the transcriber returned, so Alt+Esc during a recording did nothing at
+/// all and the orb stayed up until the user pressed the hotkey again or the
+/// silence window ran out. Raising both flags is the Windows `cancel()` seam
+/// (`app.cancelled.store(true); app.stop.store(true)`): `cancelled` makes the
+/// streaming reader stop typing at the next word boundary and discards the
+/// transcript, `stop` ends the capture.
 fn watch_recording(
     stop: &Arc<AtomicBool>,
     lines: &Receiver<()>,
     capture_done: &Receiver<Result<(), String>>,
+    cancel_lines: Option<&Receiver<()>>,
+    cancelled: &Arc<AtomicBool>,
 ) -> (Result<(), String>, Duration) {
     let opened = Instant::now();
     loop {
@@ -144,6 +155,12 @@ fn watch_recording(
         // thread raises the same stop signal the VAD would.
         if lines.try_recv().is_ok() {
             stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(cancel_lines) = cancel_lines {
+            if cancel_lines.try_recv().is_ok() {
+                cancelled.store(true, Ordering::SeqCst);
+                stop.store(true, Ordering::SeqCst);
+            }
         }
         match capture_done.try_recv() {
             Ok(result) => return (result, opened.elapsed()),
@@ -188,6 +205,8 @@ fn transcribe_while_recording<T, F>(
     rx: Receiver<Vec<i16>>,
     capture_done: &Receiver<Result<(), String>>,
     lines: &Receiver<()>,
+    cancel_lines: Option<&Receiver<()>>,
+    cancelled: &Arc<AtomicBool>,
     transcribe: F,
 ) -> (Result<T, String>, Duration)
 where
@@ -196,7 +215,8 @@ where
 {
     std::thread::scope(|scope| {
         let transcriber = scope.spawn(|| transcribe(stop, rx));
-        let (captured, recorded) = watch_recording(stop, lines, capture_done);
+        let (captured, recorded) =
+            watch_recording(stop, lines, capture_done, cancel_lines, cancelled);
         let transcribed = transcriber
             .join()
             .unwrap_or_else(|_| Err("transcription stopped unexpectedly".to_string()));
@@ -261,15 +281,21 @@ where
     let cancelled = Arc::new(AtomicBool::new(false));
     let text = match cfg.protocol {
         config::Protocol::Streaming => {
-            let (text, recorded) =
-                transcribe_while_recording(&stop, rx, &capture_done, lines, |stop, rx| {
-                    crate::stream::run_stream(cfg, stop, &cancelled, rx)
-                });
+            let (text, recorded) = transcribe_while_recording(
+                &stop,
+                rx,
+                &capture_done,
+                lines,
+                cancel_lines,
+                &cancelled,
+                |stop, rx| crate::stream::run_stream(cfg, stop, &cancelled, rx),
+            );
             println!("stopped ({}s elapsed)", recorded.as_secs());
             text?
         }
         config::Protocol::Rest => {
-            let (captured, _) = watch_recording(&stop, lines, &capture_done);
+            let (captured, _) =
+                watch_recording(&stop, lines, &capture_done, cancel_lines, &cancelled);
             let mut samples: Vec<i16> = Vec::new();
             while let Ok(chunk) = rx.try_recv() {
                 samples.extend_from_slice(&chunk);
@@ -338,8 +364,14 @@ mod tests {
         drop(line_tx);
         let stop = Arc::new(AtomicBool::new(false));
 
-        let (outcome, _recorded) =
-            transcribe_while_recording(&stop, rx, &done_rx, &line_rx, |_, rx| {
+        let (outcome, _recorded) = transcribe_while_recording(
+            &stop,
+            rx,
+            &done_rx,
+            &line_rx,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            |_, rx: Receiver<Vec<i16>>| {
                 let mut packets = 0usize;
                 let mut fed_at: Option<Instant> = None;
                 for _ in rx.iter() {
@@ -347,7 +379,8 @@ mod tests {
                     fed_at.get_or_insert_with(Instant::now);
                 }
                 Ok((packets, fed_at))
-            });
+            },
+        );
 
         let (packets, fed_at) = outcome.expect("the transcriber ran to completion");
         assert_eq!(packets, 10, "every captured packet reached the transcriber");
@@ -383,14 +416,21 @@ mod tests {
         line_tx.send(()).unwrap();
 
         let began = Instant::now();
-        let (outcome, _recorded) =
-            transcribe_while_recording(&stop, rx, &done_rx, &line_rx, |_, rx| {
+        let (outcome, _recorded) = transcribe_while_recording(
+            &stop,
+            rx,
+            &done_rx,
+            &line_rx,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            |_, rx: Receiver<Vec<i16>>| {
                 let mut packets = 0usize;
                 for _ in rx.iter() {
                     packets += 1;
                 }
                 Ok(packets)
-            });
+            },
+        );
 
         assert!(
             outcome.is_ok(),
@@ -423,14 +463,21 @@ mod tests {
         let (line_tx, line_rx) = mpsc::channel::<()>();
         drop(line_tx);
 
-        let (outcome, _recorded) =
-            transcribe_while_recording(&stop, rx, &done_rx, &line_rx, |_, rx| {
+        let (outcome, _recorded) = transcribe_while_recording(
+            &stop,
+            rx,
+            &done_rx,
+            &line_rx,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            |_, rx: Receiver<Vec<i16>>| {
                 let mut packets = 0usize;
                 for _ in rx.iter() {
                     packets += 1;
                 }
                 Ok(packets)
-            });
+            },
+        );
 
         assert_eq!(outcome, Err("no input audio device found".to_string()));
     }
@@ -589,5 +636,66 @@ mod tests {
             "only the line that started it may begin a dictation"
         );
         assert_eq!(stale, 0, "no stale line may reach the recording loop");
+    }
+
+    /// The cancel key must end the capture, not just discard the transcript.
+    ///
+    /// Measured on the live desktop app (2026-10-20): Alt+Esc during a
+    /// recording did nothing at all. The portal's cancel event was collected
+    /// only after the transcriber had returned, so the microphone stayed open
+    /// and the orb stayed up until the hotkey was pressed again or the silence
+    /// window ran out - the opposite of the Windows `cancel()` seam, which
+    /// raises `cancelled` AND `stop` together.
+    #[test]
+    fn the_cancel_key_stops_the_capture_it_belongs_to() {
+        // An engine that captures until `stop` is raised, then reports - the
+        // shape `unix_audio::capture_to_channel` has. Without honouring `stop`
+        // the test would wait on the engine rather than on the cancel.
+        let (tx, rx) = mpsc::channel::<Vec<i16>>();
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let engine_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !engine_stop.load(Ordering::SeqCst) {
+                if tx.send(vec![0i16; 320]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = done_tx.send(Ok(()));
+        });
+
+        let (line_tx, line_rx) = mpsc::channel::<()>();
+        drop(line_tx); // nobody presses Enter
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = cancel_tx.send(());
+        });
+
+        let opened = Instant::now();
+        let (outcome, recorded) =
+            watch_recording(&stop, &line_rx, &done_rx, Some(&cancel_rx), &cancelled);
+
+        assert!(
+            outcome.is_ok(),
+            "the engine reports cleanly once cancel raises stop: {outcome:?}"
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the cancel event must raise the discard flag",
+        );
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "the cancel event must also raise stop, or the microphone stays open",
+        );
+        assert!(
+            recorded < Duration::from_secs(5),
+            "the session ends on the cancel, not on max_seconds: {recorded:?}"
+        );
+        // The engine's channel is still live; dropping the consumer here ends
+        // its send loop on the next tick rather than leaking it to the process.
+        drop(rx);
     }
 }
