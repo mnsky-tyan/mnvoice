@@ -31,9 +31,10 @@ use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use ashpd::desktop::remote_desktop::{
     DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
 };
-use ashpd::desktop::PersistMode;
+use ashpd::desktop::{PersistMode, Session};
 use enumflags2::BitFlags;
 use futures_util::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -67,16 +68,18 @@ fn portal_trigger(hotkey_str: &str) -> String {
 ///
 /// `HOTKEY=none` returns `Ok(None)`: the disabled control is not a failure,
 /// and the caller keeps running without it (the Windows tray does the same).
-pub fn spawn_hotkey_listener(
+pub fn spawn_hotkey_listener<E, F>(
     cfg: &Option<Arc<config::Config>>,
-    tx: Sender<HotkeyEvent>,
-) -> Result<Option<Sender<()>>, String> {
-    let (hotkey_str, cancel_str) = match cfg.as_ref() {
-        Some(c) => (c.hotkey_str.clone(), c.cancel_key_str.clone()),
-        None => (
-            config::DEFAULT_HOTKEY_STR.to_string(),
-            config::DEFAULT_CANCEL_STR.to_string(),
-        ),
+    tx: Sender<E>,
+    map: F,
+) -> Result<Option<Sender<()>>, String>
+where
+    E: Send + 'static,
+    F: Fn(HotkeyEvent) -> E + Send + 'static,
+{
+    let hotkey_str = match cfg.as_ref() {
+        Some(c) => c.hotkey_str.clone(),
+        None => config::DEFAULT_HOTKEY_STR.to_string(),
     };
     if hotkey_str.eq_ignore_ascii_case("none") {
         return Ok(None);
@@ -85,13 +88,18 @@ pub fn spawn_hotkey_listener(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let result = futures_executor::block_on(hotkey_loop(hotkey_str, cancel_str, tx, stop_rx));
-        // A listener that dies mid-session is reported once, through the same
-        // channel the startup error takes, so the failure is never silent.
+        // The ready signal's contract: Ok once the session is bound, Err if
+        // the portal refused first. hotkey_loop sends Ok itself - the bind
+        // happens inside, before its forever-loop, and a signal sent at the
+        // end of a forever-loop never arrives (every start timed out at 30s:
+        // "hotkey listener did not start within 30s", measured in the
+        // journal on 2026-10-20). A failure before bind lands here.
+        let err_tx = ready_tx.clone();
+        let result =
+            futures_executor::block_on(hotkey_loop(hotkey_str, tx, map, stop_rx, ready_tx));
         if let Err(e) = result {
-            let _ = ready_tx.send(Err(format!("hotkey listener stopped: {e}")));
+            let _ = err_tx.send(Err(e));
         }
-        let _ = ready_tx.send(Ok(()));
     });
     // The listener reports the startup outcome before the app proceeds, so a
     // refused portal is surfaced at launch rather than at the first press.
@@ -102,26 +110,33 @@ pub fn spawn_hotkey_listener(
     }
 }
 
-/// The listener's body: one portal session, two bound shortcuts, signals
+/// The listener's body: one portal session, the toggle key only, signals
 /// forwarded to the app until the stop channel closes.
-async fn hotkey_loop(
+///
+/// Only the toggle is bound here, and only here. The cancel key deliberately
+/// does NOT live in this session: a shortcut bound to a permanent session is
+/// grabbed by kglobalaccel for the app's whole life, and a plain Esc bound
+/// that way is dead in every other app (measured 2026-10-20 - the kglobalaccel
+/// grab consumed Esc system-wide, kglobalshortcutsrc `[mnvoice] cancel=Esc`).
+/// The Windows tray registers the cancel key per recording and unregisters it
+/// at the stop press; `spawn_cancel_key` below is that shape.
+async fn hotkey_loop<E, F>(
     hotkey_str: String,
-    cancel_str: String,
-    tx: Sender<HotkeyEvent>,
+    tx: Sender<E>,
+    map: F,
     stop_rx: std::sync::mpsc::Receiver<()>,
-) -> Result<(), String> {
+    ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), String>
+where
+    E: Send,
+    F: Fn(HotkeyEvent) -> E,
+{
     let gs = GlobalShortcuts::new()
         .await
         .map_err(|e| format!("GlobalShortcuts portal unavailable ({e})"))?;
 
-    let mut shortcuts = vec![NewShortcut::new("toggle", "Start or stop dictation")
+    let shortcuts = [NewShortcut::new("toggle", "Start or stop dictation")
         .preferred_trigger(Some(portal_trigger(&hotkey_str).as_str()))];
-    if !cancel_str.eq_ignore_ascii_case("none") {
-        shortcuts.push(
-            NewShortcut::new("cancel", "Cancel the recording")
-                .preferred_trigger(Some(portal_trigger(&cancel_str).as_str())),
-        );
-    }
 
     let session = gs
         .create_session(ashpd::desktop::CreateSessionOptions::default())
@@ -135,6 +150,10 @@ async fn hotkey_loop(
     )
     .await
     .map_err(|e| format!("binding the hotkeys failed ({e})"))?;
+
+    // The session is bound: signal ready NOW, before the forever-loop. This
+    // is the message the 30s startup timeout waits for.
+    let _ = ready_tx.send(Ok(()));
 
     // The compositor's confirmation dialog appears on the first bind; after it
     // is accepted the binding persists in kglobalaccel.
@@ -165,22 +184,255 @@ async fn hotkey_loop(
                 } else {
                     continue;
                 };
-                if tx.send(event_type).is_err() {
+                if tx.send(map(event_type)).is_err() {
                     return Ok(());
                 }
             }
             futures_util::future::Either::Right((Some(event), _)) => {
                 // Deactivated mirrors Activated on KWin; both count as a press
                 // so a compositor that only emits one still toggles.
-                if event.shortcut_id() == "toggle"
-                    && tx.send(HotkeyEvent::Toggle).is_err()
-                {
+                if event.shortcut_id() == "toggle" && tx.send(map(HotkeyEvent::Toggle)).is_err() {
                     return Ok(());
                 }
             }
             _ => return Ok(()),
         }
     }
+}
+
+/// A message to the cancel-key worker.
+enum CancelMsg {
+    /// Bind the cancel key; the reply carries the arm outcome.
+    Arm { reply: std::sync::mpsc::Sender<Result<(), String>> },
+    /// Release the cancel key.
+    Disarm,
+}
+
+/// The cancel key, armed for the length of one recording.
+///
+/// The portal grab is permanent while a session lives, so this is the Windows
+/// tray's cancel-key shape, not its RegisterHotKey-at-startup shape: claimed
+/// before the orb shows, released when the dictation returns, and free in
+/// every other app the rest of the time.
+///
+/// `CANCEL_KEY=none` returns a key whose arm and disarm are no-ops: the
+/// Windows tray treats "none" as a configured state, not a failure.
+pub struct CancelKey {
+    tx: Option<std::sync::mpsc::Sender<CancelMsg>>,
+}
+
+impl CancelKey {
+    /// Binds the cancel key, blocking until it is live. A failed arm is an
+    /// error, not a fatal one: the recording still runs without it, the way
+    /// the Windows tip records a failed registration and keeps going.
+    pub fn arm(&self) -> Result<(), String> {
+        let Some(tx) = self.tx.as_ref() else { return Ok(()) };
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        tx.send(CancelMsg::Arm { reply: reply_tx })
+            .map_err(|_| "cancel-key worker is gone".to_string())?;
+        match reply_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(_) => Err("cancel key did not arm within 30s".into()),
+        }
+    }
+
+    /// Releases the cancel key. Fire-and-forget: the worker serializes
+    /// arm/disarm, so a following arm always lands after the release.
+    pub fn disarm(&self) {
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(CancelMsg::Disarm);
+        }
+    }
+}
+
+/// Spawns the cancel-key worker. Never fails at startup: a portal refusal
+/// surfaces per arm, where the recording can still proceed without it.
+pub fn spawn_cancel_key<E, F>(
+    cfg: &Option<Arc<config::Config>>,
+    tx: Sender<E>,
+    map: F,
+) -> CancelKey
+where
+    E: Send + 'static,
+    F: Fn(HotkeyEvent) -> E + Send + 'static + Clone,
+{
+    let cancel_str = match cfg.as_ref() {
+        Some(c) => c.cancel_key_str.clone(),
+        None => config::DEFAULT_CANCEL_STR.to_string(),
+    };
+    if cancel_str.eq_ignore_ascii_case("none") {
+        return CancelKey { tx: None };
+    }
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<CancelMsg>();
+    let spawned = std::thread::Builder::new()
+        .name("mnvoice-cancel".into())
+        .spawn(move || cancel_worker(cancel_str, tx, map, msg_rx));
+    if spawned.is_err() {
+        // A worker that could not spawn leaves no key to arm; arm stays a
+        // no-op and the recording runs without cancel, which the arm-time log
+        // never gets to say. Thread spawn failing means the process is dying
+        // anyway, so a silent no-op here beats a second error channel.
+        return CancelKey { tx: None };
+    }
+    CancelKey { tx: Some(msg_tx) }
+}
+
+/// One armed cancel key: the portal session and the forwarder's stop flag.
+struct CancelSession {
+    session: Session<GlobalShortcuts>,
+    stop: Arc<AtomicBool>,
+}
+
+impl CancelSession {
+    /// Releases the grab: the forwarder stops on its next tick and the
+    /// session closes, which is what unbinds the key from kglobalaccel.
+    fn close(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Err(e) = futures_executor::block_on(self.session.close()) {
+            eprintln!("mnvoice: closing the cancel session failed ({e})");
+        }
+    }
+}
+
+/// The worker: one live session at a time, arm/disarm serialized through its
+/// channel, and any session still armed when the app exits closed on the way
+/// out so Esc is never left grabbed by a dead process.
+fn cancel_worker<E, F>(
+    cancel_str: String,
+    tx: Sender<E>,
+    map: F,
+    rx: std::sync::mpsc::Receiver<CancelMsg>,
+) where
+    E: Send + 'static,
+    F: Fn(HotkeyEvent) -> E + Send + 'static + Clone,
+{
+    let mut live: Option<CancelSession> = None;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            CancelMsg::Arm { reply } => {
+                if live.is_some() {
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                match futures_executor::block_on(arm_cancel_session(
+                    &cancel_str,
+                    tx.clone(),
+                    map.clone(),
+                )) {
+                    Ok(session) => {
+                        live = Some(session);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            CancelMsg::Disarm => {
+                if let Some(session) = live.take() {
+                    session.close();
+                }
+            }
+        }
+    }
+    if let Some(session) = live.take() {
+        session.close();
+    }
+}
+
+/// Binds the cancel key in its own portal session and spawns the thread that
+/// forwards its presses. Returns the session so the caller can close it and
+/// free the key again.
+async fn arm_cancel_session<E, F>(
+    cancel_str: &str,
+    tx: Sender<E>,
+    map: F,
+) -> Result<CancelSession, String>
+where
+    E: Send + 'static,
+    F: Fn(HotkeyEvent) -> E + Send + 'static,
+{
+    let gs = GlobalShortcuts::new()
+        .await
+        .map_err(|e| format!("GlobalShortcuts portal unavailable ({e})"))?;
+    let shortcuts = [NewShortcut::new("cancel", "Cancel the recording")
+        .preferred_trigger(Some(portal_trigger(cancel_str).as_str()))];
+    let session = gs
+        .create_session(ashpd::desktop::CreateSessionOptions::default())
+        .await
+        .map_err(|e| format!("cancel session refused ({e})"))?;
+    gs.bind_shortcuts(
+        &session,
+        &shortcuts,
+        None,
+        ashpd::desktop::global_shortcuts::BindShortcutsOptions::default(),
+    )
+    .await
+    .map_err(|e| format!("binding the cancel key failed ({e})"))?;
+
+    let mut activated = gs
+        .receive_activated()
+        .await
+        .map_err(|e| format!("listening for cancel presses failed ({e})"))?;
+    let mut deactivated = gs
+        .receive_deactivated()
+        .await
+        .map_err(|e| format!("listening for cancel releases failed ({e})"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // The forwarder owns the event streams. The 200ms tick is what lets it
+    // notice a disarm: the streams never end on their own, and a parked
+    // forwarder per recording is a thread leak. KWin emits Activated and
+    // Deactivated both for one press (see hotkey_loop), and both count -
+    // raising the cancel flag twice is the same as raising it once.
+    let fwd_stop = Arc::clone(&stop);
+    let spawned = std::thread::Builder::new()
+        .name("mnvoice-cancel-fwd".into())
+        .spawn(move || {
+            futures_executor::block_on(async move {
+                loop {
+                    let tick = Box::pin(async_io::Timer::after(std::time::Duration::from_millis(
+                        200,
+                    )));
+                    let which = futures_util::future::select(
+                        // Both streams reduce to the shortcut id: an or-pattern
+                        // cannot bind Activated and Deactivated as one value.
+                        Box::pin(futures_util::future::select(
+                            Box::pin(async {
+                                activated.next().await.map(|e| e.shortcut_id().to_string())
+                            }),
+                            Box::pin(async {
+                                deactivated.next().await.map(|e| e.shortcut_id().to_string())
+                            }),
+                        )),
+                        tick,
+                    )
+                    .await;
+                    match which {
+                        futures_util::future::Either::Left((inner, _)) => match inner {
+                            futures_util::future::Either::Left((Some(id), _))
+                            | futures_util::future::Either::Right((Some(id), _)) => {
+                                if id == "cancel" && tx.send(map(HotkeyEvent::Cancel)).is_err() {
+                                    return;
+                                }
+                            }
+                            // The session is gone from the other side: nothing
+                            // left to forward.
+                            _ => return,
+                        },
+                        futures_util::future::Either::Right((_, _)) => {
+                            if fwd_stop.load(Ordering::SeqCst) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+    if spawned.is_err() {
+        return Err("could not spawn the cancel forwarder".into());
+    }
+    Ok(CancelSession { session, stop })
 }
 
 /// The Wayland typing session.

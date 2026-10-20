@@ -3,7 +3,7 @@
 Ultra-low-latency, hands-free push-to-talk dictation.  
 Press a hotkey to start and stop (Enter on Linux and macOS), speak naturally - words type directly into whatever window you are using, in real time, with zero clipboard interference.
 
-Windows is the flagship: built in native Rust using pure Win32, WASAPI, and WinHTTP, with the tray, the orb and self-update. Linux and macOS run the same engine - same capture path, same streaming protocol, same word-typing - driven from a terminal instead of the tray. No Electron, no Python, no async runtimes.
+Windows is the flagship: built in native Rust using pure Win32, WASAPI, and WinHTTP, with the tray, the orb and self-update. Linux and macOS run the same engine - same capture path, same streaming protocol, same word-typing - with the same tray-and-hotkey control surface on Linux. No Electron, no Python, no async runtimes.
 
 ```
 mnvoice.exe (~417 KB)
@@ -126,6 +126,26 @@ system tray icon
                              "Transcribing..." disabled while a session finishes)
     -> Exit
 ```
+
+On Linux the same icon carries the rows that have a Linux answer - `Dictate` /
+`Stop & transcribe`, `Restart`, `Quit`:
+
+```
+system tray icon
+    -> Dictate              (or "Stop & transcribe" while recording)
+    -> Restart              (frees the hotkey and starts fresh)
+    -> Quit
+```
+
+There is no "Start with Windows" checkbox (autostart is the desktop file the
+first launch writes) and no "Check for updates" (the updater is Windows-only),
+and no "Open config"/"Open keywords" rows (the Windows tray hands those to
+Notepad; on Linux the files are a text editor away and no editor command is
+configured here). A row that could not do the thing would be a lie.
+
+Left click opens the menu, the convention for an item with no window to raise.
+The icon is the same orb the overlay shows, painted by the same renderer, and
+its tooltip names the hotkey.
 
 ---
 
@@ -424,8 +444,8 @@ cargo build --release
 cargo test
 ```
 
-Both produce `target/release/mnvoice`, the terminal-driven dictation tool
-described in the Linux and macOS section below.
+Both produce `target/release/mnvoice`. On Linux that is the desktop app
+described below; on macOS it is the terminal build.
 
 ## Linux and macOS
 
@@ -434,7 +454,8 @@ same typing into the focused window.
 
 On Linux the desktop app is the default control surface, and it works the way
 the Windows tray does: the process runs in the background, the configured
-hotkey starts and stops a dictation from any app, a 48px fluid orb shows what
+hotkey starts and stops a dictation from any app, a tray icon carries the
+menu (Dictate / Restart / Quit), a 48px fluid orb shows what
 is happening, and the words are typed into whatever window has focus - native
 Wayland windows included. The hotkey goes through the compositor's
 GlobalShortcuts portal; typing goes through the RemoteDesktop portal.
@@ -480,9 +501,9 @@ Known limits in this release, stated rather than papered over:
   RemoteDesktop grant the compositor synthesizes the keystrokes and native
   Wayland windows receive them; without it the X11 XTest injector runs, which
   reaches X11 and XWayland windows only.
-- **No tray and no self-update on Linux yet.** The tray (StatusNotifierItem)
-  and the updater are Windows-only; the hotkey, the orb and the typing are the
-  interaction model, and they are delivered.
+- **No self-update on Linux.** The updater is Windows-only; the Linux app
+  checks the releases page by hand. The tray has no "Check for updates" row for
+  the same reason - see "The tray menu" above.
 - **macOS typing needs permission.** Grant the binary Accessibility under
   System Settings > Privacy & Security > Accessibility; without it the
   first injection fails with an error naming the exact setting. macOS has no

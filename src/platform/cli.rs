@@ -237,6 +237,12 @@ pub fn dictate_with_controls<F>(
 where
     F: FnOnce(String),
 {
+    if let Some(cancel_lines) = cancel_lines {
+        // A cancel buffered from a session that is already over must not
+        // discard this recording: the press it belonged to raced the previous
+        // session's teardown, so drain before capture begins.
+        while cancel_lines.try_recv().is_ok() {}
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let capture_done = engine.capture_to_channel(
