@@ -1171,7 +1171,6 @@ name = "mnvoice"
 version = "0.1.29"
 dependencies = [
  "ashpd",
- "async-io",
  "cpal",
  "enigo",
  "enumflags2",

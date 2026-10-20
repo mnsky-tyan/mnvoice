@@ -159,14 +159,6 @@ pub fn main() -> Result<(), String> {
     // the running dictation, Cancel lands on its own channel.
     let (toggle_tx, toggle_rx) = mpsc::channel::<()>();
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-    // The cancel key is armed per recording (see linux_portal::CancelKey): a
-    // key bound at startup is grabbed by kglobalaccel forever, and a plain
-    // Esc bound that way is dead in every other app.
-    let cancel_key = linux_portal::spawn_cancel_key(
-        &Some(Arc::clone(&cfg)),
-        event_tx.clone(),
-        AppEvent::from_hotkey,
-    );
     let mut typer: Option<linux_portal::WaylandTyper> = None;
 
     // One hotkey event at a time, forever: Toggle starts (or stops) a
@@ -182,14 +174,9 @@ pub fn main() -> Result<(), String> {
                     // "Stop & transcribe" row.
                     let _ = toggle_tx.send(());
                 } else {
-                    // Claim the cancel key BEFORE anything becomes visible, the
-                    // Windows tray's contract: the orb shows only once Esc is
-                    // already live. A failed arm is logged, not fatal - the
-                    // recording still runs, the way the Windows tip records a
-                    // failed registration.
-                    if let Err(e) = cancel_key.arm() {
-                        eprintln!("mnvoice: cancel key unavailable ({e})");
-                    }
+                    // The cancel key is bound once, with the hotkey (see
+                    // linux_portal::hotkey_loop): its default is a chord, not
+                    // a bare Esc, so grabbing it costs nothing other apps see.
                     let _ = orb_tx.send(linux_orb::OrbCommand::Show(
                         crate::orb_render::OrbState::Recording,
                     ));
@@ -198,9 +185,6 @@ pub fn main() -> Result<(), String> {
                     refresh_tray(&tray);
                     let result =
                         dictate(&cfg, &engine, &toggle_rx, &cancel_rx, &mut typer, &orb_tx);
-                    // Release Esc the moment the dictation returns, so the
-                    // key is free in every other app while nothing runs.
-                    cancel_key.disarm();
                     let _ = orb_tx.send(linux_orb::OrbCommand::Hide);
                     refresh_tray(&tray);
                     if let Err(e) = result {
@@ -211,13 +195,10 @@ pub fn main() -> Result<(), String> {
             Ok(AppEvent::Cancel) => {
                 // Cancel during a recording: raise the cancel flag, which the
                 // transcriber reads to discard the transcript. The cancel key
-                // is armed only while a dictation runs, and the flag gates the
-                // forward anyway: a press racing the disarm must never buffer
-                // into the next session's channel and discard it before it
-                // starts.
-                if RECORDING.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = cancel_tx.send(());
-                }
+                // is bound permanently, so an event racing the recording can
+                // never be discriminated here - the drain at dictate's start
+                // is what keeps a stale press from discarding the next one.
+                let _ = cancel_tx.send(());
             }
             Ok(AppEvent::Restart) => {
                 eprintln!("mnvoice: restarting");

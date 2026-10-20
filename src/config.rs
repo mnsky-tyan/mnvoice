@@ -717,9 +717,19 @@ pub fn test_config() -> Config {
     }
 }
 
-pub const DEFAULT_CANCEL_MOD: u32 = 0x4000; // MOD_NOREPEAT
+// CANCEL_KEY defaults to a chord, not a bare Escape. Measured on
+// Kubuntu/KDE 2026-10-20: a GlobalShortcuts binding on plain Esc is grabbed by
+// kglobalaccel for the process's whole life, and closing the portal session
+// does NOT release the grab (verified: after the session was closed the grab
+// stayed live until the process exited). A bare Esc could never be given up
+// from inside the app, so it is dead in every other app the whole time
+// mnvoice runs. Alt+Esc is unbound by default on KDE (checked against
+// kglobalshortcutsrc/kwinrc) and a chord remains grabbable without costing
+// Esc. Set CANCEL_KEY=none to disable cancel, or CANCEL_KEY=Alt+Escape to
+// pin this, or pick any other chord.
+pub const DEFAULT_CANCEL_MOD: u32 = 0x0001; // MOD_ALT | MOD_NOREPEAT
 pub const DEFAULT_CANCEL_VK: u32 = 0x1B; // VK_ESCAPE
-pub const DEFAULT_CANCEL_STR: &str = "Escape";
+pub const DEFAULT_CANCEL_STR: &str = "Alt+Escape";
 
 /// How long one dictation may run before it stops itself.
 pub const DEFAULT_MAX_SECONDS: u32 = 120;
@@ -1040,10 +1050,12 @@ mod tests {
     }
 
     #[test]
-    fn cancel_key_none_disables_instead_of_rearming_escape() {
+    fn cancel_key_none_disables_instead_of_rearming_the_default() {
         // The docs promise "none" disables the cancel key. The old fallback
         // silently re-registered Escape, so a user who asked for none still
-        // lost transcripts to a stray Escape press.
+        // lost transcripts to a stray Escape press - and a bare Escape
+        // registered on KDE is grabbed by kglobalaccel for the process's
+        // whole life (see DEFAULT_CANCEL_STR).
         //
         // Driven through `cancel_key_with_display`, the same function the live
         // tray and log paths call, rather than a test-only `resolve_cancel_key`
@@ -1055,7 +1067,7 @@ mod tests {
         assert_eq!(cancel_key_with_display("Escape").0, (0x4000, 0x1B));
         assert_eq!(
             cancel_key_with_display("unparseable").0,
-            (0x4000, 0x1B),
+            (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK),
             "unknown spelling falls back to the default"
         );
     }
@@ -1318,8 +1330,8 @@ mod tests {
         let cfg = load_from("API_KEY=k\nHOTKEY=Foobar\nCANCEL_KEY=AlsoNotAKey");
         assert_eq!(cfg.hotkey, (0x0001 | 0x4000, 0x20));
         assert_eq!(cfg.hotkey_str, "Alt+Space");
-        assert_eq!(cfg.cancel_key, (0x4000, 0x1B));
-        assert_eq!(cfg.cancel_key_str, "Escape");
+        assert_eq!(cfg.cancel_key, (DEFAULT_CANCEL_MOD, DEFAULT_CANCEL_VK));
+        assert_eq!(cfg.cancel_key_str, DEFAULT_CANCEL_STR);
     }
 
     /// "none" means the same thing for both keys: off. It used to disable

@@ -69,11 +69,6 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # Driving the portal futures and the orb's shm buffers without a runtime.
 futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
-# The cancel-key forwarder's tick: select over the portal signal streams and a
-# pollable timer so a disarm is noticed within 200ms and the forwarder thread
-# exits instead of parking forever. async-io is already in the tree via ashpd
-# and ksni (same 2.x line), so this adds no new crate.
-async-io = "2"
 rustix = { version = "0.38", features = ["mm", "fs"] }
 # The system tray: the StatusNotifierItem protocol Plasma's panel consumes.
 # `blocking` gives the no-async-runtime surface; `async-io` keeps tokio out of
