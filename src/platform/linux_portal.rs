@@ -170,12 +170,7 @@ where
         // journal on 2026-10-20). A failure before bind lands here.
         let err_tx = ready_tx.clone();
         let result = futures_executor::block_on(hotkey_loop(
-            hotkey_str,
-            cancel_str,
-            tx,
-            map,
-            stop_rx,
-            ready_tx,
+            hotkey_str, cancel_str, tx, map, stop_rx, ready_tx,
         ));
         if let Err(e) = result {
             let _ = err_tx.send(Err(e));
@@ -255,6 +250,11 @@ where
         .receive_activated()
         .await
         .map_err(|e| format!("listening for hotkey presses failed ({e})"))?;
+    // Deactivated (key release) is still received so the signal stream stays
+    // drained, but it must NOT toggle: counting press + release as two presses
+    // double-fires every physical tap (measured: one Alt+Space produced
+    // `stopped (0s elapsed)` immediately followed by `recording...`, leaving
+    // an unattended recording that ran to its 90s cap with the orb stuck up).
     let mut deactivated = gs
         .receive_deactivated()
         .await
@@ -282,12 +282,8 @@ where
                     return Ok(());
                 }
             }
-            futures_util::future::Either::Right((Some(event), _)) => {
-                // Deactivated mirrors Activated on KWin; both count as a press
-                // so a compositor that only emits one still toggles.
-                if event.shortcut_id() == "toggle" && tx.send(map(HotkeyEvent::Toggle)).is_err() {
-                    return Ok(());
-                }
+            futures_util::future::Either::Right((Some(_event), _)) => {
+                // Key release: drained, deliberately ignored. See above.
             }
             _ => return Ok(()),
         }
