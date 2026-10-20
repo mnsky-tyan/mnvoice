@@ -13,8 +13,21 @@ and direct keyboard event injection.
    - Do NOT touch or overwrite `C:\Users\tyanw\bin\mnvoice.exe` during tests or reviews (only during explicit release/update deployment).
 
 2. **Toolchain & Testing Scope**:
-   - The authoritative test suite is run via Windows cargo reached through the WSL mount:
-     `WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test --locked`
+   - The authoritative test suite is TWO, not one, and they answer different
+     questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
+     whole crate natively (135 tests, ~6 s) and is what an agent must run before
+     every commit. CI (`release.yml`, dispatched on `main` and on every PR,
+     building windows/linux/macos on real runners) is the gate for a change and
+     must be green for the exact head that is claimed.
+   - The Windows-cargo command recorded in the gate (`.no-mistakes.yaml`) is
+     currently UNRUNNABLE and its path is stale twice over. Measured 2026-10-20:
+     the Windows drive is mounted at `/mnt/win` (not `/mnt/c`), and no Windows
+     executable can be launched through the interop at all -
+     `/mnt/win/Users/tyanw/.cargo/bin/cargo.exe`, `/mnt/win/Windows/System32/cmd.exe`
+     and `/mnt/win/Windows/System32/wsl.exe` all fail with `MZ...: not found`
+     (no binfmt registration) and **exit code 0**, the exact trap described in
+     rule "WSL interop". So: run the local suite yourself, and let CI be the
+     Windows proof; do not report a local Windows test.
    - Target directory MUST sit on the Windows disk because WSL 9p mounts do not support Windows file locking.
    - Pure unit tests exercise code paths safely without acquiring the single-instance mutex or touching audio hardware.
    - Do NOT create scratch probe executables, live window harnesses, or kill background processes.
