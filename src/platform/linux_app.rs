@@ -181,6 +181,14 @@ pub fn main() -> Result<(), String> {
                         // the Windows hotkey's contract, and the tray's
                         // "Stop & transcribe" row. The receiver belongs to the
                         let _ = session.stop_tx.send(());
+                        // Windows sets `State::Transcribing` at this press
+                        // (`windows_app::toggle`), not when the transcript
+                        // arrives - the capture is over the moment the flag is
+                        // raised, so what is left is typing, not recording.
+                        // Leaving the row at "Stop & transcribe" through the
+                        // typing window made a second press a cancel.
+                        set_phase(PHASE_TRANSCRIBING);
+                        refresh_tray(&tray);
                     } else {
                         // Capture has ended and the transcript is still being
                         // typed: `State::Transcribing` in Windows' `toggle`,
@@ -302,9 +310,10 @@ pub fn main() -> Result<(), String> {
 /// The loop raises it to `Recording` before spawning a worker, so the repaint
 /// that follows already reads "recording" - raising it inside the new thread was
 /// a race that lost, and the row sat on "Dictate" through a live recording.
-/// `dictate` moves it to `Transcribing` when capture ends and to `Idle` when the
-/// transcript is typed; the loop's `Done` arm clears it in case a worker
-/// panicked before it could.
+/// The stop press moves it to `Transcribing` in the loop (the Windows seam:
+/// `windows_app::toggle` does this at the same moment), `dictate` moves it to
+/// `Idle` when the transcript is typed; the loop's `Done` arm clears it in case
+/// a worker panicked before it could.
 static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PHASE_IDLE);
 
 pub(crate) const PHASE_IDLE: u8 = 0;
