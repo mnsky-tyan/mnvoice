@@ -11,6 +11,16 @@
 // The surface lives on the Overlay layer, anchored to the bottom centre with a
 // small margin, with an EMPTY input region: the orb is click-through like the
 // Windows one (`WS_EX_TRANSPARENT` there, `wl_surface.set_input_region` here).
+//
+// The scope is `on-screen-display`, not an app name, and that is load-bearing.
+// KWin derives a layer surface's window TYPE from its scope
+// (layershellv1window.cpp: `scopeToType`), and an unrecognized scope falls back
+// to `WindowType::Normal` - a normal window. The decoration effects then treat
+// the orb as an app window: KDE-Rounded-Corners drew its 1px black outline and
+// 8px corner radius around the 48px surface, which the user saw as four black
+// edges boxing the orb in. `on-screen-display` is the protocol's own word for
+// exactly this kind of indicator and maps to `WindowType::OnScreenDisplay`,
+// which no decoration effect decorates.
 
 use crate::config;
 use crate::orb_render::{render_gas_fluid, OrbState, ORB_HEIGHT, ORB_WIDTH};
@@ -67,11 +77,29 @@ struct OrbState_ {
     next: usize,
     frame: u32,
     visible: bool,
+    /// The live layer surface, created per dictation and destroyed when the
+    /// dictation ends. KWin resets a layer surface's ENTIRE state on unmap -
+    /// anchor, size, margins and the configure handshake all go back to
+    /// defaults (layershell_v1.cpp: `state = LayerSurfaceV1State()` on the
+    /// unmap commit) - so a hide/show cycle on one surface cannot just
+    /// re-attach a buffer: the second dictation died with protocol error 0,
+    /// "a buffer has been attached to a layer surface prior to the first
+    /// layer_surface.configure event", and KWin kills the connection over it.
+    /// Destroying and recreating is what menus do; it needs no reset semantics.
+    surface: Option<OrbSurface>,
     state: OrbState,
     color: (f32, f32, f32),
     fluid_level: f32,
-    configured: bool,
     running: bool,
+}
+
+/// One live layer surface plus whether its configure has been acknowledged.
+/// A fresh surface is unmapped and unconfigured; the handshake is commit ->
+/// configure -> ack -> first paint.
+struct OrbSurface {
+    wl: wl_surface::WlSurface,
+    layer: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    configured: bool,
 }
 
 struct Buffer {
@@ -87,28 +115,73 @@ struct Buffer {
 unsafe impl Send for Buffer {}
 
 impl OrbState_ {
-    /// A dictation started. Only the flags move here, and `configured` is not
-    /// one of them: it belongs to the layer-shell handshake and is never
-    /// revisited, because a compositor that has already configured a surface
-    /// sends no second configure for an unchanged size. Clearing it on show
-    /// waited for an event that never arrives, so the orb never painted a
-    /// frame - `shown_after_the_handshake_can_paint` pins that.
+    /// A dictation started. The surface is created by the caller when this is
+    /// the first frame of a session.
     fn mark_visible(&mut self, state: OrbState) {
         self.state = state;
         self.visible = true;
     }
 
-    /// A dictation ended. The surface is unmapped by the caller detaching its
-    /// buffer; the flag stops the render loop spending frames on nothing.
+    /// A dictation ended. The caller destroys the surface; this flag only
+    /// stops the render loop spending frames on nothing.
     fn mark_hidden(&mut self) {
         self.visible = false;
     }
 
-    /// Whether a frame may be rendered and committed. Painting needs a
-    /// configured surface; showing needs a live dictation.
+    /// Whether a frame may be rendered and committed. Painting needs a live
+    /// dictation and a surface whose configure has been acknowledged.
     fn can_paint(&self) -> bool {
-        self.visible && self.configured
+        self.visible
+            && self
+                .surface
+                .as_ref()
+                .is_some_and(|surface| surface.configured)
     }
+}
+
+/// Creates the orb's layer surface: overlay layer, bottom-centre anchored,
+/// click-through, then an empty commit to request the configure. The caller
+/// paints once the Dispatch has acknowledged the configure.
+fn create_surface(
+    compositor: &wl_compositor::WlCompositor,
+    layer_shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+    qh: &QueueHandle<OrbState_>,
+    st: &mut OrbState_,
+) {
+    let surface = compositor.create_surface(qh, ());
+    let layer = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Overlay,
+        // A window type, not a label: see the module comment. Renaming this to
+        // something "more descriptive" gives the orb a titlebar-shaped outline.
+        "on-screen-display".into(),
+        qh,
+        (),
+    );
+    // Never take the keyboard: the orb is an indicator, and a keystroke meant
+    // for the user's editor must not land here. This is the protocol default,
+    // stated on purpose - an Overlay-layer surface that accepts focus is
+    // activated by KWin (layershellv1window.cpp: `handleAcceptsFocusChanged`
+    // calls `activateWindow` for the top and overlay layers), which would pull
+    // the caret out of whatever the user was typing in.
+    layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    layer.set_anchor(zwlr_layer_surface_v1::Anchor::Bottom);
+    layer.set_size(ORB_WIDTH, ORB_HEIGHT);
+    layer.set_margin(0, 0, BOTTOM_MARGIN, 0);
+    layer.set_exclusive_zone(-1);
+    // Click-through: an empty input region delivers pointer events to whatever
+    // is underneath, like the Windows orb's WS_EX_TRANSPARENT.
+    let region: wl_region::WlRegion = compositor.create_region(qh, ());
+    region.add(0, 0, 0, 0);
+    surface.set_input_region(Some(&region));
+    region.destroy();
+    surface.commit(); // the handshake: this asks for the configure
+    st.surface = Some(OrbSurface {
+        wl: surface,
+        layer,
+        configured: false,
+    });
 }
 
 fn run(
@@ -132,46 +205,17 @@ fn run(
             format!("layer-shell unavailable: your compositor does not support overlays ({e})")
         })?;
 
-    let surface = compositor.create_surface(&qh, ());
-    let layer = layer_shell.get_layer_surface(
-        &surface,
-        None,
-        zwlr_layer_shell_v1::Layer::Overlay,
-        "mnvoice-orb".into(),
-        &qh,
-        (),
-    );
-    layer.set_anchor(zwlr_layer_surface_v1::Anchor::Bottom);
-    layer.set_size(ORB_WIDTH, ORB_HEIGHT);
-    layer.set_margin(0, 0, BOTTOM_MARGIN, 0);
-    layer.set_exclusive_zone(-1);
-
-    // Click-through: an empty input region means the compositor delivers
-    // pointer events to whatever is underneath, exactly like the Windows
-    // orb's WS_EX_TRANSPARENT.
-    let region: wl_region::WlRegion = compositor.create_region(&qh, ());
-    region.add(0, 0, 0, 0);
-    surface.set_input_region(Some(&region));
-    region.destroy();
-
     let mut st = OrbState_ {
         buffers: [None, None],
         next: 0,
         frame: 0,
         visible: false,
+        surface: None,
         state: OrbState::Recording,
         color,
         fluid_level,
-        configured: false,
         running: true,
     };
-
-    surface.commit();
-    // Roundtrip so the first configure event arrives before the loop below;
-    // painting into an unconfigured surface is undefined.
-    queue
-        .roundtrip(&mut st)
-        .map_err(|e| format!("Wayland roundtrip failed ({e})"))?;
 
     let interval = Duration::from_millis(1000 / FPS);
     let mut last_render = std::time::Instant::now();
@@ -186,19 +230,24 @@ fn run(
         }) {
             Ok(OrbCommand::Show(s)) => {
                 st.mark_visible(s);
-                // No commit, and no configure reset: see `mark_visible`. The
-                // paint branch below is what re-maps the surface - attach,
-                // damage, commit - which is the Wayland way to show a layer
-                // surface again after a Hide detached its buffer.
+                // A fresh surface per session: KWin resets a layer surface's
+                // whole state on unmap (see `OrbState_.surface`), so the
+                // second dictation on a reused surface died with protocol
+                // error 0. Creating and destroying is what menus do.
+                if st.surface.is_none() {
+                    create_surface(&compositor, &layer_shell, &qh, &mut st);
+                }
             }
             Ok(OrbCommand::State(s)) => st.state = s,
             Ok(OrbCommand::Hide) => {
                 st.mark_hidden();
-                // Unmap by detaching: the compositor forgets the buffer and the
-                // surface stops being presented, which is the Wayland way to
-                // hide without destroying.
-                surface.attach(None, 0, 0);
-                surface.commit();
+                // Destroying the surface unmaps it and takes its state with
+                // it; the next dictation gets a fresh handshake. Keeping the
+                // surface and re-attaching is what protocol error 0 was.
+                if let Some(surface) = st.surface.take() {
+                    surface.layer.destroy();
+                    surface.wl.destroy();
+                }
             }
             Err(e) => {
                 // A timeout is the frame tick, not a shutdown. The two used to
@@ -235,7 +284,9 @@ fn run(
                 // borrow instead of two.
                 let (paint, state, frame, color, fluid) =
                     (index, st.state, st.frame, st.color, st.fluid_level);
-                if let Some(buffer) = st.buffers[paint].as_mut() {
+                if let (Some(buffer), Some(surface)) =
+                    (st.buffers[paint].as_mut(), st.surface.as_ref())
+                {
                     let pixels = unsafe {
                         std::slice::from_raw_parts_mut(
                             buffer.map as *mut u32,
@@ -243,9 +294,9 @@ fn run(
                         )
                     };
                     render_gas_fluid(frame, pixels, state, color, fluid);
-                    surface.attach(Some(&buffer.wl), 0, 0);
-                    surface.damage(0, 0, ORB_WIDTH as i32, ORB_HEIGHT as i32);
-                    surface.commit();
+                    surface.wl.attach(Some(&buffer.wl), 0, 0);
+                    surface.wl.damage(0, 0, ORB_WIDTH as i32, ORB_HEIGHT as i32);
+                    surface.wl.commit();
                     st.next = (st.next + 1) % 2;
                 }
             }
@@ -418,15 +469,16 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for OrbState_ {
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
                 // The protocol requires the configure to be acknowledged
-                // before a buffer is committed against it. The ack was never
-                // sent, which no compositor ever caught because the orb never
-                // reached a buffer commit - but the first working render
-                // would have been the place to find out.
+                // before a buffer is committed against it.
                 surface.ack_configure(serial);
-                state.configured = true;
+                if let Some(live) = state.surface.as_mut() {
+                    live.configured = true;
+                }
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                state.visible = false;
+                // The compositor took the surface (an output went away, say);
+                // the next dictation creates a fresh one.
+                state.surface = None;
             }
             _ => {}
         }
@@ -458,48 +510,31 @@ mod tests {
             next: 0,
             frame: 0,
             visible: false,
+            surface: None,
             state: OrbState::Recording,
             color: (1.0, 0.5, 0.9),
             fluid_level: 0.75,
-            configured: false,
             running: true,
         }
     }
 
-    /// The whole handshake, in order: nothing paints before the compositor
-    /// configures the surface, everything paints after.
+    /// A fresh surface has no configure yet: nothing paints until the Dispatch
+    /// acknowledges one, and `can_paint` says so.
     #[test]
-    fn nothing_paints_before_the_compositor_configures() {
+    fn no_surface_paints_nothing() {
         let mut st = state();
         st.mark_visible(OrbState::Recording);
-        assert!(!st.can_paint(), "an unconfigured surface has no size yet");
-        st.configured = true; // the configure event, acked in Dispatch
-        assert!(st.can_paint());
+        assert!(!st.can_paint(), "no surface, no paint");
     }
 
-    /// The bug this pins: a dictation's second Show, after a first one already
-    /// completed the handshake. A compositor sends no fresh configure for an
-    /// unchanged size, so if Show cleared `configured` the orb painted no frame
-    /// ever again - which is exactly how the orb came to be invisible on a
-    /// desktop where every other part of the app worked.
-    #[test]
-    fn shown_after_the_handshake_can_paint() {
-        let mut st = state();
-        st.configured = true;
-        st.mark_visible(OrbState::Recording);
-        st.mark_hidden();
-        st.mark_visible(OrbState::Recording);
-        assert!(
-            st.can_paint(),
-            "a re-shown orb must paint without waiting for a configure that never comes"
-        );
-    }
+    // Whether a configured surface paints is exercised live: a unit test
+    // cannot build the proxies (they are not constructible without a
+    // Wayland connection), and zero-initializing them is invalid.
 
-    /// Hide is what stops the frame loop spending CPU on an unmapped surface.
+    /// Hide is what stops the frame loop spending frames on nothing.
     #[test]
     fn hidden_stops_painting() {
         let mut st = state();
-        st.configured = true;
         st.mark_visible(OrbState::Recording);
         st.mark_hidden();
         assert!(!st.can_paint());
