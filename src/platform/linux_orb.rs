@@ -398,9 +398,10 @@ fn run(
     Ok(())
 }
 
-/// One double-sized shm buffer pair. The file is created unlinked (via
+/// One shm buffer holding one frame. The file is created unlinked (via
 /// memfd on Linux), so nothing touches the disk - the orb keeps the
-/// zero-audio-on-disk promise by not even putting its pixels there.
+/// zero-audio-on-disk promise by not even putting its pixels there. Each
+/// call makes one buffer; the caller holds at most two of them at a time.
 fn make_buffer(shm: &wl_shm::WlShm, qh: &QueueHandle<OrbState_>) -> Buffer {
     use std::os::fd::AsFd;
     let size = BUFFER_BYTES;
@@ -657,5 +658,815 @@ mod tests {
         let mut st = state();
         st.mark_visible(OrbState::Transcribing);
         assert_eq!(st.state, OrbState::Transcribing);
+    }
+
+    /// A scripted stand-in for the compositor, speaking just enough Wayland
+    /// wire protocol for the real `run()` to connect, configure and paint:
+    /// registry globals, the layer-shell configure handshake, and the shm
+    /// buffer objects. It exists because the paint gate under test IS the
+    /// `wl_buffer.release` protocol - the evidence has to come from a peer
+    /// that really speaks it - and because a real compositor cannot drive the
+    /// adversarial half: it hands a buffer back within a frame or two, so
+    /// "both buffers held" is a state only a scripted peer can be pinned in.
+    /// That is what the `release`/`closed` commands are for.
+    ///
+    /// Hand-rolled on std sockets rather than a new dev-dependency:
+    /// wayland-backend's own test backend is private to that crate, and
+    /// `wayland-server` would be a new crate for the dozen messages this
+    /// speaks. Every opcode below is the declaration order in wayland.xml
+    /// and wlr-layer-shell-unstable-v1.xml, the authoritative sources.
+    ///
+    /// The orb never reaches the user's session from here: the socket is a
+    /// throwaway path in the temp dir and `WAYLAND_DISPLAY` points the run
+    /// loop at it, so no real compositor is touched by these tests.
+    mod fake_compositor {
+        use super::*;
+        use std::collections::HashMap;
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::mpsc::{Receiver, Sender};
+        use std::sync::{Arc, Mutex, MutexGuard};
+
+        // Request opcodes, in declaration order (wayland.xml).
+        const DISPLAY_SYNC: u32 = 0;
+        const DISPLAY_GET_REGISTRY: u32 = 1;
+        const REGISTRY_BIND: u32 = 0;
+        const COMPOSITOR_CREATE_SURFACE: u32 = 0;
+        const COMPOSITOR_CREATE_REGION: u32 = 1;
+        const SURFACE_DESTROY: u32 = 0;
+        const SURFACE_ATTACH: u32 = 1;
+        const SURFACE_COMMIT: u32 = 6;
+        const REGION_DESTROY: u32 = 0;
+        const SHM_CREATE_POOL: u32 = 0;
+        const POOL_CREATE_BUFFER: u32 = 0;
+        const POOL_DESTROY: u32 = 1;
+        const BUFFER_DESTROY: u32 = 0;
+        // Request opcodes (wlr-layer-shell-unstable-v1.xml).
+        const LAYER_SHELL_GET_LAYER_SURFACE: u32 = 0;
+        const LAYER_SURFACE_ACK_CONFIGURE: u32 = 6;
+        const LAYER_SURFACE_DESTROY: u32 = 7;
+        // Event opcodes the fake compositor sends.
+        const REGISTRY_GLOBAL: u32 = 0;
+        const CALLBACK_DONE: u32 = 0;
+        const SHM_FORMAT: u32 = 0;
+        const BUFFER_RELEASE: u32 = 0;
+        const LAYER_SURFACE_CONFIGURE: u32 = 0;
+        const LAYER_SURFACE_CLOSED: u32 = 1;
+
+        /// One wire-level observation of what the orb's client did.
+        #[derive(Clone, Debug, PartialEq)]
+        pub enum Recorded {
+            Bind { interface: String, id: u32 },
+            CreateSurface { id: u32 },
+            CreateRegion { id: u32 },
+            GetLayerSurface { surface: u32, id: u32 },
+            AckConfigure { id: u32 },
+            CreatePool { id: u32, size: i32 },
+            CreateBuffer { pool: u32, id: u32 },
+            Attach { surface: u32, buffer: u32 },
+            Commit { surface: u32 },
+            DestroySurface { id: u32 },
+            DestroyRegion { id: u32 },
+            DestroyLayerSurface { id: u32 },
+            DestroyBuffer { id: u32 },
+            DestroyPool { id: u32 },
+        }
+
+        /// What the test wants the compositor to do to a live orb session.
+        pub enum Cmd {
+            /// Send `wl_buffer.release` for one buffer, handing it back.
+            Release(u32),
+            /// Send `zwlr_layer_surface_v1.closed` for one layer surface.
+            Closed(u32),
+        }
+
+        /// The kind of every object id the client creates, so destroy requests
+        /// can be recorded against the right interface.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Kind {
+            Registry,
+            Compositor,
+            Shm,
+            Pool,
+            Buffer,
+            Surface,
+            Region,
+            LayerShell,
+            LayerSurface,
+        }
+
+        fn put_u32(args: &mut Vec<u8>, value: u32) {
+            args.extend_from_slice(&value.to_ne_bytes());
+        }
+
+        /// A wayland wire string: length including the NUL, bytes, NUL,
+        /// padded to a multiple of four.
+        fn put_str(args: &mut Vec<u8>, text: &str) {
+            put_u32(args, text.len() as u32 + 1);
+            args.extend_from_slice(text.as_bytes());
+            args.push(0);
+            while !args.len().is_multiple_of(4) {
+                args.push(0);
+            }
+        }
+
+        /// One wire message: object id, then size-including-header and opcode
+        /// packed into one word, then the arguments.
+        fn message(object: u32, opcode: u32, args: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + args.len());
+            put_u32(&mut out, object);
+            put_u32(
+                &mut out,
+                ((args.len() as u32 + 8) << 16) | (opcode & 0xffff),
+            );
+            out.extend_from_slice(args);
+            out
+        }
+
+        /// Sequential argument cursor over one message's payload.
+        struct Args<'a> {
+            bytes: &'a [u8],
+            at: usize,
+        }
+
+        impl<'a> Args<'a> {
+            fn u32(&mut self) -> u32 {
+                let value =
+                    u32::from_ne_bytes(self.bytes[self.at..self.at + 4].try_into().unwrap());
+                self.at += 4;
+                value
+            }
+
+            fn i32(&mut self) -> i32 {
+                self.u32() as i32
+            }
+
+            fn string(&mut self) -> String {
+                let len = self.u32() as usize;
+                let text =
+                    String::from_utf8_lossy(&self.bytes[self.at..self.at + len - 1]).into_owned();
+                self.at += len;
+                while !self.at.is_multiple_of(4) {
+                    self.at += 1;
+                }
+                text
+            }
+        }
+
+        type Log = Arc<Mutex<Vec<Recorded>>>;
+
+        fn record(log: &Log, entry: Recorded) {
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(entry);
+        }
+
+        /// The globals a dictation needs. The versions are inside the ranges
+        /// `run()` binds: compositor 1..=6, shm 1..=2, layer shell 1..=5.
+        const GLOBALS: [(&str, u32); 3] = [
+            ("wl_compositor", 4),
+            ("wl_shm", 1),
+            ("zwlr_layer_shell_v1", 4),
+        ];
+
+        /// Serve one orb client until it disconnects or the test says stop.
+        fn serve(mut stream: UnixStream, log: Log, cmds: Receiver<Cmd>, stop: Receiver<()>) {
+            let mut kinds: HashMap<u32, Kind> = HashMap::new();
+            let mut registry = 0u32;
+            let mut globals_sent = false;
+            let mut next_global_name = 1u32;
+            let mut pending: Vec<u8> = Vec::with_capacity(4096);
+            // A short timeout keeps the command channel responsive while
+            // never blocking the orb's roundtrips for long.
+            stream.set_read_timeout(Some(Duration::from_millis(5))).ok();
+            loop {
+                if stop.try_recv().is_ok() {
+                    return;
+                }
+                while let Ok(cmd) = cmds.try_recv() {
+                    let event = match cmd {
+                        Cmd::Release(buffer) => message(buffer, BUFFER_RELEASE, &[]),
+                        Cmd::Closed(layer_surface) => {
+                            message(layer_surface, LAYER_SURFACE_CLOSED, &[])
+                        }
+                    };
+                    if stream.write_all(&event).is_err() {
+                        return;
+                    }
+                }
+                let mut chunk = [0u8; 4096];
+                match stream.read(&mut chunk) {
+                    // The memfd in `wl_shm.create_pool` rides in the ancillary
+                    // buffer; a plain read discards it (the kernel closes the
+                    // fd), which is fine - the pixels are never inspected.
+                    Ok(0) => return,
+                    Ok(read) => pending.extend_from_slice(&chunk[..read]),
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => return,
+                }
+                while pending.len() >= 8 {
+                    let object = u32::from_ne_bytes(pending[0..4].try_into().unwrap());
+                    let word = u32::from_ne_bytes(pending[4..8].try_into().unwrap());
+                    let size = (word >> 16) as usize;
+                    let opcode = word & 0xffff;
+                    if size < 8 || pending.len() < size {
+                        break;
+                    }
+                    // The message is taken out of the buffer before parsing,
+                    // so the payload never borrows `pending` across the drain.
+                    let mut frame: Vec<u8> = pending.drain(..size).collect();
+                    let payload = frame.split_off(8);
+                    let mut args = Args {
+                        bytes: &payload,
+                        at: 0,
+                    };
+
+                    if object == 1 {
+                        // wl_display: the sync/done pair is the roundtrip every
+                        // loop iteration relies on, and the first one is
+                        // `registry_queue_init`'s - the globals must land
+                        // before that done or the client binds nothing.
+                        if opcode == DISPLAY_SYNC {
+                            let callback = args.u32();
+                            if !globals_sent {
+                                globals_sent = true;
+                                for (interface, version) in GLOBALS {
+                                    let mut ev = Vec::new();
+                                    put_u32(&mut ev, next_global_name);
+                                    put_str(&mut ev, interface);
+                                    put_u32(&mut ev, version);
+                                    let _ =
+                                        stream.write_all(&message(registry, REGISTRY_GLOBAL, &ev));
+                                    next_global_name += 1;
+                                }
+                            }
+                            let _ = stream.write_all(&message(
+                                callback,
+                                CALLBACK_DONE,
+                                &0u32.to_ne_bytes(),
+                            ));
+                        } else if opcode == DISPLAY_GET_REGISTRY {
+                            registry = args.u32();
+                            kinds.insert(registry, Kind::Registry);
+                        }
+                        continue;
+                    }
+
+                    match kinds.get(&object) {
+                        Some(Kind::Registry) if opcode == REGISTRY_BIND => {
+                            let _name = args.u32();
+                            let interface = args.string();
+                            let _version = args.u32();
+                            let id = args.u32();
+                            let kind = match interface.as_str() {
+                                "wl_compositor" => Some(Kind::Compositor),
+                                "wl_shm" => Some(Kind::Shm),
+                                "zwlr_layer_shell_v1" => Some(Kind::LayerShell),
+                                _ => None,
+                            };
+                            if let Some(kind) = kind {
+                                kinds.insert(id, kind);
+                            }
+                            if interface == "wl_shm" {
+                                // argb8888, the only format make_buffer asks for.
+                                let _ =
+                                    stream.write_all(&message(id, SHM_FORMAT, &0u32.to_ne_bytes()));
+                            }
+                            record(&log, Recorded::Bind { interface, id });
+                        }
+                        Some(Kind::Compositor) if opcode == COMPOSITOR_CREATE_SURFACE => {
+                            let id = args.u32();
+                            kinds.insert(id, Kind::Surface);
+                            record(&log, Recorded::CreateSurface { id });
+                        }
+                        Some(Kind::Compositor) if opcode == COMPOSITOR_CREATE_REGION => {
+                            let id = args.u32();
+                            kinds.insert(id, Kind::Region);
+                            record(&log, Recorded::CreateRegion { id });
+                        }
+                        Some(Kind::Surface) if opcode == SURFACE_ATTACH => {
+                            let buffer = args.u32();
+                            record(
+                                &log,
+                                Recorded::Attach {
+                                    surface: object,
+                                    buffer,
+                                },
+                            );
+                        }
+                        Some(Kind::Surface) if opcode == SURFACE_COMMIT => {
+                            record(&log, Recorded::Commit { surface: object });
+                        }
+                        Some(Kind::Surface) if opcode == SURFACE_DESTROY => {
+                            record(&log, Recorded::DestroySurface { id: object });
+                        }
+                        Some(Kind::Region) if opcode == REGION_DESTROY => {
+                            record(&log, Recorded::DestroyRegion { id: object });
+                        }
+                        Some(Kind::Shm) if opcode == SHM_CREATE_POOL => {
+                            let id = args.u32();
+                            let size = args.i32();
+                            kinds.insert(id, Kind::Pool);
+                            record(&log, Recorded::CreatePool { id, size });
+                        }
+                        Some(Kind::Pool) if opcode == POOL_CREATE_BUFFER => {
+                            let id = args.u32();
+                            let _offset = args.i32();
+                            let _width = args.i32();
+                            let _height = args.i32();
+                            let _stride = args.i32();
+                            let _format = args.u32();
+                            kinds.insert(id, Kind::Buffer);
+                            record(&log, Recorded::CreateBuffer { pool: object, id });
+                        }
+                        Some(Kind::Pool) if opcode == POOL_DESTROY => {
+                            record(&log, Recorded::DestroyPool { id: object });
+                        }
+                        Some(Kind::Buffer) if opcode == BUFFER_DESTROY => {
+                            record(&log, Recorded::DestroyBuffer { id: object });
+                        }
+                        Some(Kind::LayerShell) if opcode == LAYER_SHELL_GET_LAYER_SURFACE => {
+                            let id = args.u32();
+                            let surface = args.u32();
+                            let _output = args.u32();
+                            let _layer = args.u32();
+                            let _namespace = args.string();
+                            kinds.insert(id, Kind::LayerSurface);
+                            record(&log, Recorded::GetLayerSurface { surface, id });
+                            // The configure the handshake needs, sent at once:
+                            // the orb paints on the first tick after its ack.
+                            let mut ev = Vec::new();
+                            put_u32(&mut ev, 1); // serial
+                            put_u32(&mut ev, ORB_WIDTH);
+                            put_u32(&mut ev, ORB_HEIGHT);
+                            let _ = stream.write_all(&message(id, LAYER_SURFACE_CONFIGURE, &ev));
+                        }
+                        Some(Kind::LayerSurface) if opcode == LAYER_SURFACE_ACK_CONFIGURE => {
+                            let _serial = args.u32();
+                            record(&log, Recorded::AckConfigure { id: object });
+                        }
+                        Some(Kind::LayerSurface) if opcode == LAYER_SURFACE_DESTROY => {
+                            record(&log, Recorded::DestroyLayerSurface { id: object });
+                        }
+                        // damage, set_input_region, the layer surface's set_*
+                        // requests: nothing the tests assert on.
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        /// The buffer ids the orb attached, in paint order - the wire-level
+        /// view of "which pixels did it write".
+        pub fn paints(log: &[Recorded]) -> Vec<u32> {
+            log.iter()
+                .filter_map(|r| match r {
+                    Recorded::Attach { buffer, .. } => Some(*buffer),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        pub fn commits(log: &[Recorded]) -> usize {
+            log.iter()
+                .filter(|r| matches!(r, Recorded::Commit { .. }))
+                .count()
+        }
+
+        pub fn buffers(log: &[Recorded]) -> Vec<u32> {
+            log.iter()
+                .filter_map(|r| match r {
+                    Recorded::CreateBuffer { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        pub fn pools(log: &[Recorded]) -> Vec<u32> {
+            log.iter()
+                .filter_map(|r| match r {
+                    Recorded::CreatePool { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        pub fn position_of(log: &[Recorded], entry: &Recorded) -> Option<usize> {
+            log.iter().position(|r| r == entry)
+        }
+
+        /// Whether the orb bound the three globals a dictation needs. The
+        /// binds sit in the client's buffer until the first command flush,
+        /// so this is only meaningful after a Show woke the loop.
+        pub fn bound_globals(log: &[Recorded]) -> bool {
+            ["wl_compositor", "wl_shm", "zwlr_layer_shell_v1"]
+                .iter()
+                .all(|iface| {
+                    log.iter().any(|r| {
+                        matches!(
+                            r,
+                            Recorded::Bind { interface, .. } if interface == iface
+                        )
+                    })
+                })
+        }
+
+        /// One orb session against the scripted compositor.
+        pub struct Fake {
+            socket: std::path::PathBuf,
+            log: Log,
+            cmds: Sender<Cmd>,
+            stop: Sender<()>,
+            server: Option<std::thread::JoinHandle<()>>,
+            tx: Option<Sender<OrbCommand>>,
+            orb: Option<std::thread::JoinHandle<Result<(), String>>>,
+            /// How the run loop ended, if it ended on its own - printed by
+            /// `wait_for` on timeout, because an orb that failed to connect
+            /// otherwise looks identical to one that connected and went
+            /// silent.
+            outcome: Arc<Mutex<Option<String>>>,
+            saved_display: Option<std::ffi::OsString>,
+            // Both orb tests set WAYLAND_DISPLAY, a process-global variable:
+            // this guard serializes them so they cannot race each other.
+            _env_guard: MutexGuard<'static, ()>,
+        }
+
+        impl Fake {
+            pub fn start() -> Self {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                static ENV_GUARD: Mutex<()> = Mutex::new(());
+                let _env_guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let socket = std::env::temp_dir()
+                    .join(format!("mnvoice-orb-wire-{}-{n}.sock", std::process::id()));
+                // A stale file from a crashed run would fail the bind.
+                let _ = std::fs::remove_file(&socket);
+                let listener =
+                    UnixListener::bind(&socket).expect("bind the fake compositor socket");
+                let log: Log = Arc::new(Mutex::new(Vec::new()));
+                let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
+                let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+                let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+                let server_log = Arc::clone(&log);
+                let server = std::thread::Builder::new()
+                    .name("fake-compositor".into())
+                    .spawn(move || {
+                        let (stream, _) = listener.accept().expect("the orb connects");
+                        // The accept proves the connect, and the connect proves
+                        // the env var was read - only after that may the test
+                        // restore it.
+                        let _ = accepted_tx.send(());
+                        serve(stream, server_log, cmd_rx, stop_rx);
+                    })
+                    .expect("spawn the fake compositor");
+
+                let saved_display = std::env::var_os("WAYLAND_DISPLAY");
+                std::env::set_var("WAYLAND_DISPLAY", &socket);
+                let (tx, rx) = std::sync::mpsc::channel::<OrbCommand>();
+                let outcome: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                let orb_outcome = Arc::clone(&outcome);
+                let orb = std::thread::Builder::new()
+                    .name("orb-under-test".into())
+                    .spawn(move || {
+                        let result = run(rx, (0.2, 0.9, 0.6), 0.75);
+                        if let Err(e) = &result {
+                            *orb_outcome.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(e.clone());
+                        }
+                        result
+                    })
+                    .expect("spawn the orb run loop");
+
+                let fake = Fake {
+                    socket,
+                    log,
+                    cmds: cmd_tx,
+                    stop: stop_tx,
+                    server: Some(server),
+                    tx: Some(tx),
+                    orb: Some(orb),
+                    outcome,
+                    saved_display,
+                    _env_guard,
+                };
+
+                // The connect happens before the first flush: `globals.bind`
+                // only buffers the bind requests, and they reach the wire at
+                // the first roundtrip - which only runs once a command wakes
+                // the loop. So the harness waits for the connection, not the
+                // binds; the binds are folded into the tests' first
+                // post-Show wait instead.
+                accepted_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the orb never connected to the fake compositor");
+                match &fake.saved_display {
+                    Some(value) => std::env::set_var("WAYLAND_DISPLAY", value),
+                    None => std::env::remove_var("WAYLAND_DISPLAY"),
+                }
+                fake
+            }
+
+            pub fn show(&self, state: OrbState) {
+                self.tx
+                    .as_ref()
+                    .expect("the orb channel is open")
+                    .send(OrbCommand::Show(state))
+                    .expect("the orb thread is running");
+            }
+
+            pub fn hide(&self) {
+                self.tx
+                    .as_ref()
+                    .expect("the orb channel is open")
+                    .send(OrbCommand::Hide)
+                    .expect("the orb thread is running");
+            }
+
+            pub fn release(&self, buffer: u32) {
+                self.cmds.send(Cmd::Release(buffer)).expect("compositor up");
+            }
+
+            pub fn closed(&self, layer_surface: u32) {
+                self.cmds
+                    .send(Cmd::Closed(layer_surface))
+                    .expect("compositor up");
+            }
+
+            pub fn snapshot(&self) -> Vec<Recorded> {
+                self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            }
+
+            /// Poll the wire log until `predicate` holds, and hand back the
+            /// snapshot it held for. A timeout fails with the whole log, so a
+            /// wire-level mismatch shows itself instead of a bare hang.
+            pub fn wait_for(
+                &self,
+                timeout: Duration,
+                predicate: impl Fn(&[Recorded]) -> bool,
+            ) -> Vec<Recorded> {
+                let started = std::time::Instant::now();
+                loop {
+                    let snapshot = self.snapshot();
+                    if predicate(&snapshot) {
+                        return snapshot;
+                    }
+                    assert!(
+                        started.elapsed() < timeout,
+                        "the fake compositor never saw the expected traffic within \
+                         {timeout:?}; wire log so far:\n{:#?}\norb outcome: {:?}",
+                        snapshot,
+                        self.outcome.lock().unwrap_or_else(|p| p.into_inner())
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            /// End the dictation channel, let the run loop observe the
+            /// disconnect and exit, then take the compositor down with it.
+            pub fn shutdown(mut self) {
+                drop(self.tx.take());
+                let orb = self.orb.take().expect("the orb thread is joinable");
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = self.stop.send(());
+                if let Some(server) = self.server.take() {
+                    let _ = server.join();
+                }
+                let outcome = orb.join().expect("the orb thread must not panic");
+                assert!(
+                    outcome.is_ok(),
+                    "the orb run loop must exit cleanly, not with {outcome:?}"
+                );
+                let _ = std::fs::remove_file(&self.socket);
+            }
+        }
+    }
+
+    use fake_compositor::{commits, paints, Fake, Recorded};
+
+    /// The paint gate: while the compositor holds both buffers the orb must
+    /// skip frames rather than write into pixels that may still be read, and
+    /// a release must resume painting into exactly the buffer it freed.
+    ///
+    /// A real compositor cannot be pinned in the adversarial state (it
+    /// releases within a frame or two), which is why the peer here is
+    /// scripted: the test decides when a `wl_buffer.release` exists at all.
+    #[test]
+    fn the_orb_paints_only_into_buffers_the_compositor_has_released() {
+        let wire = Fake::start();
+        wire.show(OrbState::Recording);
+
+        // The first Show flushes the whole startup: the three binds, the
+        // surface, the configure handshake, and then the paints. (Commits
+        // are 3 at this point: the empty one that asks for the configure,
+        // then one per paint.)
+        let two = wire.wait_for(Duration::from_secs(3), |log| {
+            fake_compositor::bound_globals(log) && paints(log).len() >= 2 && commits(log) >= 3
+        });
+        assert_eq!(paints(&two).len(), 2, "exactly two paints: {two:#?}");
+        let (first, second) = (paints(&two)[0], paints(&two)[1]);
+        assert_ne!(first, second, "the two slots are distinct buffers");
+
+        // ~7 frame ticks pass here. With the gate, no paint can happen: both
+        // buffers are held and neither was released. Pre-gate behaviour
+        // attached one of them every tick.
+        std::thread::sleep(Duration::from_millis(250));
+        let gate = wire.snapshot();
+        assert_eq!(
+            paints(&gate).len(),
+            2,
+            "while the compositor holds both buffers the orb must skip frames, \
+             not keep painting: {gate:#?}"
+        );
+        assert_eq!(commits(&gate), 3, "a skipped frame commits nothing");
+
+        // Releasing the first buffer must resume painting into exactly that
+        // buffer, exactly once: the freed slot is painted, marked in use
+        // again, and the gate closes until the next release.
+        wire.release(first);
+        let resumed = wire.wait_for(Duration::from_secs(1), |log| paints(log).len() == 3);
+        assert_eq!(
+            paints(&resumed)[2],
+            first,
+            "the resumed frame must go to the released buffer: {resumed:#?}"
+        );
+        assert_eq!(
+            commits(&resumed),
+            4,
+            "one release buys exactly one paint, not a flood"
+        );
+        assert_eq!(
+            paints(&resumed).iter().filter(|b| **b == second).count(),
+            1,
+            "the still-held buffer must not be painted into: {resumed:#?}"
+        );
+
+        // Releasing the other resumes the alternation into it.
+        wire.release(second);
+        let resumed_again = wire.wait_for(Duration::from_secs(1), |log| paints(log).len() == 4);
+        assert_eq!(
+            paints(&resumed_again)[3],
+            second,
+            "the next paint must go to the newly released buffer: {resumed_again:#?}"
+        );
+        assert_eq!(commits(&resumed_again), 5);
+
+        // Each buffer got its own shm pool (a fresh memfd per buffer, not a
+        // shared one), so two pools exist for two paints.
+        let created = wire.snapshot();
+        let pools = fake_compositor::pools(&created);
+        assert_eq!(pools.len(), 2, "one pool per buffer: {created:#?}");
+        assert_ne!(pools[0], pools[1]);
+
+        wire.shutdown();
+    }
+
+    /// Hide must take the surface and its buffers down together - the wire
+    /// requests prove the teardown, not a dropped proxy - and the surface
+    /// proxies go first, in the order the Hide arm documents. The next
+    /// dictation then paints into a fresh memfd pair.
+    #[test]
+    fn hide_takes_the_surface_and_both_buffers_with_it() {
+        let wire = Fake::start();
+        wire.show(OrbState::Recording);
+
+        let painted = wire.wait_for(Duration::from_secs(3), |log| {
+            fake_compositor::bound_globals(log) && !paints(log).is_empty() && commits(log) >= 2
+        });
+        let surface = painted
+            .iter()
+            .find_map(|r| match r {
+                Recorded::CreateSurface { id } => Some(*id),
+                _ => None,
+            })
+            .expect("a surface was created");
+        let layer = painted
+            .iter()
+            .find_map(|r| match r {
+                Recorded::GetLayerSurface { id, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("a layer surface was created");
+        let first_buffers = fake_compositor::buffers(&painted);
+        let first_pools = fake_compositor::pools(&painted);
+        assert!(!first_buffers.is_empty());
+
+        wire.hide();
+
+        let hidden = wire.wait_for(Duration::from_secs(1), |log| {
+            log.iter()
+                .any(|r| matches!(r, Recorded::DestroySurface { id } if *id == surface))
+                && log
+                    .iter()
+                    .any(|r| matches!(r, Recorded::DestroyLayerSurface { id } if *id == layer))
+                && first_buffers.iter().all(|b| {
+                    log.iter()
+                        .any(|r| matches!(r, Recorded::DestroyBuffer { id } if *id == *b))
+                })
+                && first_pools.iter().all(|p| {
+                    log.iter()
+                        .any(|r| matches!(r, Recorded::DestroyPool { id } if *id == *p))
+                })
+        });
+        // The belt-and-braces ordering the Hide arm promises: both surface
+        // proxies are destroyed before any buffer or pool goes.
+        let surface_destroys = [
+            fake_compositor::position_of(&hidden, &Recorded::DestroyLayerSurface { id: layer }),
+            fake_compositor::position_of(&hidden, &Recorded::DestroySurface { id: surface }),
+        ];
+        let first_buffer_destroy = hidden
+            .iter()
+            .position(|r| matches!(r, Recorded::DestroyBuffer { .. }))
+            .expect("a buffer was destroyed");
+        assert!(
+            surface_destroys
+                .iter()
+                .all(|p| p.unwrap() < first_buffer_destroy),
+            "surface proxies must be destroyed before the buffers: {hidden:#?}"
+        );
+
+        // The next dictation gets a fresh memfd pair: its pool ids differ
+        // from the first dictation's, whatever the orb reused.
+        wire.show(OrbState::Transcribing);
+        let second = wire.wait_for(Duration::from_secs(3), |log| {
+            fake_compositor::pools(log).len() > first_pools.len() && paints(log).len() >= 2
+        });
+        let second_pools = fake_compositor::pools(&second);
+        assert!(
+            second_pools.iter().any(|p| !first_pools.contains(p)),
+            "the second dictation must paint into fresh memfds, not the dead \
+             pools: {second:#?}"
+        );
+
+        wire.shutdown();
+    }
+
+    /// The compositor's `closed` event must destroy the surface and the
+    /// buffers on the wire - a dropped proxy is never destroyed, so without
+    /// the destroy requests the object ids would stay in the client's map
+    /// and the compositor would keep the surface for the life of the process.
+    #[test]
+    fn the_compositors_closed_event_takes_the_surface_and_buffers_with_it() {
+        let wire = Fake::start();
+        wire.show(OrbState::Recording);
+
+        let painted = wire.wait_for(Duration::from_secs(3), |log| {
+            fake_compositor::bound_globals(log) && !paints(log).is_empty() && commits(log) >= 2
+        });
+        let surface = painted
+            .iter()
+            .find_map(|r| match r {
+                Recorded::CreateSurface { id } => Some(*id),
+                _ => None,
+            })
+            .expect("a surface was created");
+        let layer = painted
+            .iter()
+            .find_map(|r| match r {
+                Recorded::GetLayerSurface { id, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("a layer surface was created");
+        let painted_buffers = fake_compositor::buffers(&painted);
+        let painted_pools = fake_compositor::pools(&painted);
+
+        wire.closed(layer);
+
+        let closed = wire.wait_for(Duration::from_secs(1), |log| {
+            log.iter()
+                .any(|r| matches!(r, Recorded::DestroySurface { id } if *id == surface))
+                && log
+                    .iter()
+                    .any(|r| matches!(r, Recorded::DestroyLayerSurface { id } if *id == layer))
+                && painted_buffers.iter().all(|b| {
+                    log.iter()
+                        .any(|r| matches!(r, Recorded::DestroyBuffer { id } if *id == *b))
+                })
+                && painted_pools.iter().all(|p| {
+                    log.iter()
+                        .any(|r| matches!(r, Recorded::DestroyPool { id } if *id == *p))
+                })
+        });
+        // The same order as the Hide arm: surface proxies first, then the
+        // buffer pair.
+        let surface_destroys = [
+            fake_compositor::position_of(&closed, &Recorded::DestroyLayerSurface { id: layer }),
+            fake_compositor::position_of(&closed, &Recorded::DestroySurface { id: surface }),
+        ];
+        let first_buffer_destroy = closed
+            .iter()
+            .position(|r| matches!(r, Recorded::DestroyBuffer { .. }))
+            .expect("a buffer was destroyed");
+        assert!(
+            surface_destroys
+                .iter()
+                .all(|p| p.unwrap() < first_buffer_destroy),
+            "surface proxies must be destroyed before the buffers: {closed:#?}"
+        );
+
+        wire.shutdown();
     }
 }

@@ -164,7 +164,7 @@ fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
         && haystack
             .bytes()
             .zip(needle.bytes())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(&b))
 }
 
 /// Whether a 200 body is a provider's error payload rather than a transcript.

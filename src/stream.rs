@@ -1034,6 +1034,78 @@ mod tests {
         );
     }
 
+    /// The other half of the boundary the cancel fix draws: the wait may be
+    /// broken by `cancelled` alone, but an ordinary stop still pays it. The
+    /// final frame here lands 500 ms after the user's stop raised `stop` -
+    /// inside the window, after the CloseStream - and the session must still
+    /// be sitting in the wait to receive it. This is the guard for the fix's
+    /// risk surface: breaking the wait on `stop` as well would hand back a
+    /// transcript without its final words, and a cancel would no longer be
+    /// the only fast path out.
+    #[test]
+    fn an_ordinary_stop_still_waits_for_the_final_transcription_frame() {
+        use std::io::{Read as _, Write as _};
+        let (port, server) = live_provider::serve(|stream| {
+            // A clause the session commits while the audio is still flowing.
+            let _ = stream.write_all(&live_provider::result_frame("hello world", true, false));
+            let _ = stream.flush();
+            // The final frame arrives after the stop has ended the send
+            // loop: 500 ms of audio, then this 1 s delay puts it 500 ms
+            // into the post-stop window.
+            std::thread::sleep(Duration::from_millis(1000));
+            let _ = stream.write_all(&live_provider::result_frame("late words", true, true));
+            let _ = stream.flush();
+            // The fixture rule: never close with the client still reading -
+            // drain until it closes the socket.
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink);
+        });
+        let cfg = live_provider::cfg_for(port);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let n = SAMPLE_RATE as usize / 10;
+        std::thread::spawn(move || {
+            // 25 packets x 20 ms = 500 ms of audio, the shape of a short
+            // ordinary dictation.
+            for _ in 0..25 {
+                if tx.send(vec![0i16; n]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // The hotkey's ordinary stop: raised at the end of the audio,
+        // with `cancelled` never touched.
+        let stop_flag = Arc::clone(&stop);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            stop_flag.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let out = run_stream(&cfg, &stop, &cancelled, rx);
+        let elapsed = started.elapsed();
+        let _ = stopper.join();
+        let _ = server.join();
+
+        let text = out.expect("the ordinary stop must end in a transcript");
+        assert!(
+            text.contains("hello world") && text.contains("late words"),
+            "the post-stop final frame must still be consumed: {text}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(950),
+            "the session must sit in the wait for the late frame, not return \
+             early: took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the wait window is bounded: took {elapsed:?}"
+        );
+    }
+
     /// The adversarial counterpart: an orderly close frame must NOT be
     /// reported as a lost connection. Round 5's `draining` flag suppressed
     /// this, round 6 narrowed it to `stop`, and round 7 (the change under
