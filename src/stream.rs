@@ -444,11 +444,20 @@ pub fn run_stream(
     // thread that sets `reader_done` (`reader_done_clone.store` at the end of
     // the reader closure), so on a cancel - where the
     // user asked to stop and the socket is being torn down on purpose - waiting
-    // on it here would stall the caller for the whole 1500ms before the
-    // `close()` below finally released the parked reader. That delay is paid
+    // on it here would stall the caller for the whole 1500ms. That delay is paid
     // in front of the user: the orb stays on screen and the tray row stays on
     // "Transcribing..." until it elapses, which is the seam `watch_recording`
     // now reaches by raising `cancelled` during capture.
+    //
+    // What ends the wait is platform-specific and must not be conflated with
+    // what breaks it. The Unix transport's `close()` shuts the socket down
+    // outright, so it releases a reader parked in `read` and the whole call
+    // returns immediately once the wait is skipped; the Windows transport's
+    // `close()` is a negotiated close that does NOT release a parked
+    // `WinHttpWebSocketReceive` (windows_impl.rs:649-656), so on Windows
+    // skipping the wait still leaves the close handshake and the reader join
+    // to bound. The `!cancelled` break shortens the wait on every platform;
+    // the bound on the whole call is the Unix transport's property alone.
     let wait_deadline = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < wait_deadline
         && !reader_done.load(Ordering::SeqCst)
@@ -955,6 +964,13 @@ mod tests {
     ///
     /// The peer here says nothing at all, so the reader is parked for the
     /// whole session and `reader_done` cannot be what releases the wait.
+    ///
+    /// "Parked in read" holds for both transports, but what releases it does
+    /// not: the Unix `close()` shuts the socket down and ends the parked read,
+    /// while the Windows `close()` is a negotiated close that leaves
+    /// `WinHttpWebSocketReceive` parked (windows_impl.rs:649-656). The bound
+    /// asserted below is therefore the Unix transport's; Windows gets a
+    /// generous one that still catches a real hang.
     #[test]
     fn a_cancel_does_not_wait_out_the_final_transcription_window() {
         use std::io::Read as _;
@@ -992,10 +1008,29 @@ mod tests {
         // The result itself is not what is under test - a cancelled session may
         // or may not have a transcript. The elapsed time is.
         let _ = result;
+        // The bound on the WHOLE call is the Unix transport's property: its
+        // `close()` shuts the socket down outright, which is what releases the
+        // reader parked in `read` and lets the join return. On Windows
+        // `close()` is a negotiated close that does NOT release a parked
+        // `WinHttpWebSocketReceive` (windows_impl.rs:649-656), so the close
+        // handshake alone can spend up to WEBSOCKET_CLOSE_TIMEOUT_MS and the
+        // join behind it can add more - the Unix bound would be false there.
+        // The fixture is still worth running on Windows: the `!cancelled`
+        // break skips the 1500 ms wait on every platform.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let bound = Duration::from_millis(1200);
+        #[cfg(target_os = "windows")]
+        let bound = Duration::from_secs(10);
         assert!(
-            elapsed < Duration::from_millis(1200),
+            elapsed < bound,
             "a cancel must not wait out the 1500ms final-transcription window \
-             (took {elapsed:?}) - the orb stays up for exactly that long"
+             on {} (bound {bound:?}, took {elapsed:?}) - the orb stays up for \
+             exactly that long",
+            if cfg!(target_os = "windows") {
+                "Windows (10s close/join bound)"
+            } else {
+                "the Unix transport (1200ms bound)"
+            }
         );
     }
 
