@@ -15,20 +15,23 @@ and direct keyboard event injection.
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (135 tests, ~6 s) and is what an agent must run before
-     every commit. CI (`release.yml`, dispatched on `main` and on every PR,
+     whole crate natively (137 tests, ~6 s), is what an agent must run before
+     every commit, and is the gate's own test command (`.no-mistakes.yaml`
+     `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
      must be green for the exact head that is claimed.
-   - The Windows-cargo command recorded in the gate (`.no-mistakes.yaml`) is
-     currently UNRUNNABLE and its path is stale twice over. Measured 2026-10-20:
-     the Windows drive is mounted at `/mnt/win` (not `/mnt/c`), and no Windows
+   - The Windows cargo reached through the WSL mount used to be the gate's
+     test command; it is dead and kept as history. Measured 2026-10-20: the
+     Windows drive is mounted at `/mnt/win` (not `/mnt/c`), no Windows
      executable can be launched through the interop at all -
      `/mnt/win/Users/tyanw/.cargo/bin/cargo.exe`, `/mnt/win/Windows/System32/cmd.exe`
      and `/mnt/win/Windows/System32/wsl.exe` all fail with `MZ...: not found`
      (no binfmt registration) and **exit code 0**, the exact trap described in
-     rule "WSL interop". So: run the local suite yourself, and let CI be the
-     Windows proof; do not report a local Windows test.
-   - Target directory MUST sit on the Windows disk because WSL 9p mounts do not support Windows file locking.
+     rule "WSL interop" - and its target dir had to sit on the Windows disk
+     because WSL 9p mounts support no Windows file locking. A gate whose test
+     command cannot run improvises a harness, so the command now points at the
+     native suite. Run the local suite yourself, and let CI be the Windows
+     proof; do not report a local Windows test.
    - Pure unit tests exercise code paths safely without acquiring the single-instance mutex or touching audio hardware.
    - Do NOT create scratch probe executables, live window harnesses, or kill background processes.
    - **A destructive probe must name a target that cannot exist.** On
@@ -204,10 +207,13 @@ and direct keyboard event injection.
      double-buffer comment promised to avoid. `wl_buffer.release` is now
      tracked per buffer (`Buffer::in_use`) and the render only paints into a
      buffer the compositor has handed back; when both are still out the frame
-     is skipped and the last committed frame stays on screen. Destroying the
-     surface ends the compositor's ownership, so `Hide` clears the flags -
-     otherwise a release that never arrives would leave one buffer unusable
-     for the rest of the process.
+     is skipped and the last committed frame stays on screen. The pair is
+     destroyed together with the surface - `Hide` and the compositor's
+     `Closed` event both drop the buffers, so the buffer/pool destroy requests
+     go out after the surface destroy, whose contract makes the compositor
+     release its saved references first - and the paint loop recreates the
+     pair lazily, one memfd+mmap pair per dictation, the same lifecycle as
+     the surface. `in_use` only tracks reuse within one dictation.
 
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
@@ -251,18 +257,16 @@ and direct keyboard event injection.
      Windows-bound work rather than letting an agent thrash. Recovery is the
      user's Windows-side call: restarting WSL kills every WSL process,
      including the agent session and herdr's panes.
-   - **Interop recovered PARTIALLY, and the recovery is per-launch-shape
-     (measured 2026-10-17).** Direct `.exe` invocation over the mount works
-     again - `/mnt/c/Users/tyanw/.cargo/bin/cargo.exe`, `tasklist.exe`,
-     `taskkill.exe` - while `cmd.exe /c echo` still returns `Permission
-     denied`. So the diagnostic above must not be read as "the whole mount is
+   - **The 2026-10-17 interop recovery did not last (re-measured 2026-10-21).**
+     It was per-launch-shape - direct `.exe` invocation over the mount worked
+     again (`/mnt/c/Users/tyanw/.cargo/bin/cargo.exe`, `tasklist.exe`,
+     `taskkill.exe`) while `cmd.exe /c echo` still returned `Permission
+     denied` - so the diagnostic above must not be read as "the whole mount is
      down": test the shape you actually need, and do not use a dead `cmd.exe`
-     to declare `cargo.exe` dead. Consequence for this project: the Windows
-     suite now runs LOCALLY with the authoritative command in rule 2 (183
-     tests, measured 61-62 s wall with a warm target dir including recompiling
-     two source files), so "CI is the only Windows compiler" is obsolete -
-     CI is still the gate, but a Windows-only edit can be compiled and tested
-     before it is pushed. `powershell.exe` was not re-tested this pass.
+     to declare `cargo.exe` dead. The recovery did not last: `/mnt/c` is gone,
+     `/mnt/win` is an empty root-owned directory, and no WSL binfmt entry is
+     registered, so no Windows executable runs from WSL today and CI is the
+     Windows proof once more (rule 2). A local Windows test is not reported.
    - **NEVER run a freshly built `mnvoice.exe` with `--restart` while the live
      instance is running.** The flag's whole job is to kill other mnvoice
      processes and free the hotkey, so it terminates the user's running app -
@@ -367,7 +371,7 @@ mnvoice/
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from orb_render
-│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, scope=on-screen-display (window type, not a label), buffer released before reuse
+│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)
 │       └── windows_impl.rs the SendInput injector

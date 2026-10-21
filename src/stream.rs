@@ -438,7 +438,8 @@ pub fn run_stream(
     // Wait up to 1500ms for Deepgram to return the final transcription
     //
     // `cancelled` breaks the wait as well as `reader_done`. The reader is the
-    // thread that sets `reader_done` (line 373), so on a cancel - where the
+    // thread that sets `reader_done` (`reader_done_clone.store` at the end of
+    // the reader closure), so on a cancel - where the
     // user asked to stop and the socket is being torn down on purpose - waiting
     // on it here would stall the caller for the whole 1500ms before the
     // `close()` below finally released the parked reader. That delay is paid

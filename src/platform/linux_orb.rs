@@ -73,6 +73,12 @@ struct OrbState_ {
     /// The two shm buffers, swapped per frame so the compositor never reads
     /// pixels the render is writing (a single buffer would tear or, worse,
     /// block the render on a busy compositor).
+    ///
+    /// The pair lives exactly as long as the surface it is attached to:
+    /// created lazily on the first paint of a dictation and destroyed with
+    /// the surface when the dictation ends (`Hide` and the compositor's
+    /// `Closed` event both take the slots), so every dictation paints into
+    /// fresh memfds.
     buffers: [Option<Buffer>; 2],
     next: usize,
     frame: u32,
@@ -115,7 +121,9 @@ struct Buffer {
     /// are the compositor's to read, and writing them again is a data race on
     /// the buffer - the "tear" the double-buffer comment above promises to
     /// avoid. `release` is tracked per buffer, so the render can only ever
-    /// write into a buffer the compositor has handed back.
+    /// write into a buffer the compositor has handed back. Buffers never
+    /// outlive the surface, so the flag only tracks reuse within one
+    /// dictation.
     in_use: bool,
 }
 
@@ -280,15 +288,18 @@ fn run(
                     surface.layer.destroy();
                     surface.wl.destroy();
                 }
-                // The compositor's ownership of the buffers ends with the
-                // surface it was reading them for. Without this a release
-                // that never arrives (the surface went away first) would
-                // leave that buffer marked in use for the rest of the
-                // process, and the render would be down to one buffer for
-                // every later dictation.
+                // The buffers die with the surface: their destroy requests
+                // follow the surface destroy on the wire, and destroying the
+                // surface releases the compositor's references to its buffers,
+                // so a release that never arrives cannot leave a buffer marked
+                // in use for the rest of the process. The next dictation's
+                // paint loop recreates the pair lazily - one memfd+mmap pair
+                // per dictation, like the surface.
                 for slot in st.buffers.iter_mut().flatten() {
-                    slot.in_use = false;
+                    slot.wl.destroy();
+                    slot._pool.destroy();
                 }
+                st.buffers = [None, None];
             }
             Err(e) => {
                 // A timeout is the frame tick, not a shutdown. The two used to
@@ -331,9 +342,11 @@ fn run(
                     // one borrow instead of two.
                     let (paint, state, frame, color, fluid) =
                         (index, st.state, st.frame, st.color, st.fluid_level);
-                    if let (Some(buffer), Some(surface)) =
-                        (st.buffers[paint].as_mut(), st.surface.as_ref())
-                    {
+                    let surface = st
+                        .surface
+                        .as_ref()
+                        .expect("can_paint guarantees a configured surface");
+                    if let Some(buffer) = st.buffers[paint].as_mut() {
                         let pixels = unsafe {
                             std::slice::from_raw_parts_mut(
                                 buffer.map as *mut u32,
@@ -346,9 +359,7 @@ fn run(
                         surface.wl.commit();
                         // The buffer now belongs to the compositor until it
                         // releases it.
-                        if let Some(buffer) = st.buffers[paint].as_mut() {
-                            buffer.in_use = true;
-                        }
+                        buffer.in_use = true;
                         st.next = (st.next + 1) % 2;
                     }
                 }
@@ -546,8 +557,14 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for OrbState_ {
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 // The compositor took the surface (an output went away, say);
-                // the next dictation creates a fresh one.
+                // the next dictation creates a fresh one. The buffers die
+                // with it, exactly like the Hide arm.
                 state.surface = None;
+                for slot in state.buffers.iter_mut().flatten() {
+                    slot.wl.destroy();
+                    slot._pool.destroy();
+                }
+                state.buffers = [None, None];
             }
             _ => {}
         }
