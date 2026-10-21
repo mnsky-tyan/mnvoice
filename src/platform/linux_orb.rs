@@ -574,10 +574,16 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for OrbState_ {
                 }
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                // The compositor took the surface (an output went away, say);
-                // the next dictation creates a fresh one. The buffers die
-                // with it, exactly like the Hide arm.
-                state.surface = None;
+                // The compositor took the surface (an output went away, say).
+                // The protocol asks the client to destroy the resource here,
+                // and a proxy that is only dropped is never destroyed, so its
+                // object ID would stay in the client's map for the life of
+                // the process. The surface proxies go first and the buffers
+                // with them, in the same order as the Hide arm.
+                if let Some(surface) = state.surface.take() {
+                    surface.layer.destroy();
+                    surface.wl.destroy();
+                }
                 for slot in state.buffers.iter_mut().flatten() {
                     slot.wl.destroy();
                     slot._pool.destroy();
