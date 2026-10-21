@@ -185,6 +185,30 @@ and direct keyboard event injection.
      typer, not to drop the final pass. Do not "fix the double typing" again
      without measuring which injector reaches the user's actual windows.
 
+   - **A cancel must not wait out the provider's final-transcription window.**
+     The streaming loop waited up to 1500 ms for Deepgram's last frame, and
+     the only thing that could end that wait early was the reader thread -
+     which on a cancel is parked inside `read()`, waiting for a frame a
+     cancelled session never gets. So a cancel paid the full 1500 ms before
+     the socket closed, and that wait sat between the user's Alt+Esc and the
+     orb coming down. Measured 2026-10-21 with the negative control: 1.759 s
+     before the fix, 0.25 s after. The wait now also ends on `cancelled`,
+     which is set only by an explicit cancel (never by a normal stop), so the
+     ordinary end still waits for the final transcript. The regression test is
+     `a_cancel_does_not_wait_out_the_final_transcription_window`.
+
+   - **A layer-shell buffer is the compositor's until it releases it.**
+     The orb swapped between two shm buffers on every frame and the
+     `wl_buffer.release` event was discarded, so the render wrote into
+     pixels the compositor could still be reading - the "tear" the
+     double-buffer comment promised to avoid. `wl_buffer.release` is now
+     tracked per buffer (`Buffer::in_use`) and the render only paints into a
+     buffer the compositor has handed back; when both are still out the frame
+     is skipped and the last committed frame stays on screen. Destroying the
+     surface ends the compositor's ownership, so `Hide` clears the flags -
+     otherwise a release that never arrives would leave one buffer unusable
+     for the rest of the process.
+
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
      at the sizing site and `nBlockAlign > 0 ? nBlockAlign : channels *
@@ -343,7 +367,7 @@ mnvoice/
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from orb_render
-│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, scope=on-screen-display (window type, not a label)
+│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)
 │       └── windows_impl.rs the SendInput injector

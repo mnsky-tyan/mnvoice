@@ -253,12 +253,13 @@ pub fn run_stream(
                     // the send loop first - is the case the marker is for.
                     //
                     // `cancelled` is deliberately NOT a third condition here,
-                    // though the send-side predicate names it: the one place
-                    // that sets `cancelled` (windows_app::cancel) sets `stop`
-                    // on the very next line, so `!stop` already implies
-                    // `!cancelled` and a clause testing it could never change
-                    // the outcome. Adding one would read as protection the
-                    // predicate does not have.
+                    // though the send-side predicate names it. The place
+                    // that sets `cancelled` sets `stop` as well - on Windows
+                    // (`windows_app::cancel`) on the very next line, and on
+                    // Linux (`watch_recording`) in the same breath - so
+                    // `!stop` already implies `!cancelled` and a clause
+                    // testing it could never change the outcome. Adding one
+                    // would read as protection the predicate does not have.
                     if !reader_done_clone.load(Ordering::SeqCst)
                         && !stop_clone.load(Ordering::SeqCst)
                     {
@@ -435,8 +436,20 @@ pub fn run_stream(
     let _ = ws.send_text("{\"type\": \"CloseStream\"}");
 
     // Wait up to 1500ms for Deepgram to return the final transcription
+    //
+    // `cancelled` breaks the wait as well as `reader_done`. The reader is the
+    // thread that sets `reader_done` (line 373), so on a cancel - where the
+    // user asked to stop and the socket is being torn down on purpose - waiting
+    // on it here would stall the caller for the whole 1500ms before the
+    // `close()` below finally released the parked reader. That delay is paid
+    // in front of the user: the orb stays on screen and the tray row stays on
+    // "Transcribing..." until it elapses, which is the seam `watch_recording`
+    // now reaches by raising `cancelled` during capture.
     let wait_deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < wait_deadline && !reader_done.load(Ordering::SeqCst) {
+    while Instant::now() < wait_deadline
+        && !reader_done.load(Ordering::SeqCst)
+        && !cancelled.load(Ordering::SeqCst)
+    {
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -924,6 +937,61 @@ mod tests {
         assert!(
             !crate::test_hooks::drain_backlog_exhausted(),
             "the drain must not walk the whole backlog after a failed send - if this fails, the break is gone but the record is not"
+        );
+    }
+
+    /// A cancel must not wait out the provider's final-transcription window.
+    ///
+    /// The seam waited up to 1500 ms for the provider's last frame, and the
+    /// only thing that could end that wait early was the reader thread - which
+    /// on a cancel is parked inside `read()`, waiting for a frame that a
+    /// cancelled session will never get. So a cancel paid the full 1500 ms
+    /// before the socket was closed, and that wait sits between the user's
+    /// keypress and the orb coming down.
+    ///
+    /// The peer here says nothing at all, so the reader is parked for the
+    /// whole session and `reader_done` cannot be what releases the wait.
+    #[test]
+    fn a_cancel_does_not_wait_out_the_final_transcription_window() {
+        use std::io::Read as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // Read once so the handshake lands, then stay silent: the reader
+            // parks in `read` with no frame ever coming.
+            let mut sink = [0u8; 64];
+            let _ = std::io::Read::read(stream, &mut sink);
+            // Hold the socket open until the client closes it.
+            let _ = stream.read(&mut sink);
+        });
+        let cfg = live_provider::cfg_for(port);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let n = SAMPLE_RATE as usize / 10;
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // The cancel lands while the session is live and the peer is silent.
+        let cancel_flag = Arc::clone(&cancelled);
+        let stop_flag = Arc::clone(&stop);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            cancel_flag.store(true, Ordering::SeqCst);
+            stop_flag.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let result = run_stream(&cfg, &stop, &cancelled, rx);
+        let elapsed = started.elapsed();
+        let _ = canceller.join();
+        let _ = tx.send(vec![0i16; n]);
+        let _ = server.join();
+
+        // The result itself is not what is under test - a cancelled session may
+        // or may not have a transcript. The elapsed time is.
+        let _ = result;
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "a cancel must not wait out the 1500ms final-transcription window \
+             (took {elapsed:?}) - the orb stays up for exactly that long"
         );
     }
 

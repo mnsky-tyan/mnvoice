@@ -27,7 +27,7 @@ use crate::orb_render::{render_gas_fluid, OrbState, ORB_HEIGHT, ORB_WIDTH};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use wayland_client::protocol::{wl_compositor, wl_region, wl_shm, wl_shm_pool, wl_surface};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// Frames per second while the orb is visible. The Windows orb animates via
@@ -108,6 +108,15 @@ struct Buffer {
     /// the buffer; the file backs the shm pool and is unlinked immediately.
     map: *mut u8,
     _pool: wayland_client::protocol::wl_shm_pool::WlShmPool,
+    /// Whether the compositor is still reading this buffer.
+    ///
+    /// The protocol hands the buffer to the compositor on commit and gives it
+    /// back with `wl_buffer.release`. Until that release arrives the pixels
+    /// are the compositor's to read, and writing them again is a data race on
+    /// the buffer - the "tear" the double-buffer comment above promises to
+    /// avoid. `release` is tracked per buffer, so the render can only ever
+    /// write into a buffer the compositor has handed back.
+    in_use: bool,
 }
 
 // The mapped pixels are only ever reached through the render's `&mut [u32]`,
@@ -136,6 +145,29 @@ impl OrbState_ {
                 .surface
                 .as_ref()
                 .is_some_and(|surface| surface.configured)
+    }
+
+    /// Picks the buffer the next frame may be rendered into, or `None` when
+    /// the compositor still holds both.
+    ///
+    /// `st.next` is the preferred one so the render alternates and the
+    /// compositor is not reading the buffer being written; the other is used
+    /// when the preferred one has not been released yet. A slot with no
+    /// buffer yet is free by definition - the compositor has not seen it, and
+    /// the render creates it on the spot.
+    fn free_buffer(&self) -> Option<usize> {
+        let free = |idx: usize| {
+            self.buffers[idx]
+                .as_ref()
+                .is_none_or(|buffer| !buffer.in_use)
+        };
+        if free(self.next) {
+            Some(self.next)
+        } else if free((self.next + 1) % 2) {
+            Some((self.next + 1) % 2)
+        } else {
+            None
+        }
     }
 }
 
@@ -248,6 +280,15 @@ fn run(
                     surface.layer.destroy();
                     surface.wl.destroy();
                 }
+                // The compositor's ownership of the buffers ends with the
+                // surface it was reading them for. Without this a release
+                // that never arrives (the surface went away first) would
+                // leave that buffer marked in use for the rest of the
+                // process, and the render would be down to one buffer for
+                // every later dictation.
+                for slot in st.buffers.iter_mut().flatten() {
+                    slot.in_use = false;
+                }
             }
             Err(e) => {
                 // A timeout is the frame tick, not a shutdown. The two used to
@@ -274,30 +315,42 @@ fn run(
             let now = std::time::Instant::now();
             if now.duration_since(last_render) >= interval {
                 last_render = now;
-                st.frame += 1;
-                let index = st.next;
-                if st.buffers[index].is_none() {
-                    st.buffers[index] = Some(make_buffer(&shm, &qh));
-                }
-                // The render writes into the buffer's map, and the frame
-                // counter advances once per paint, so both happen through one
-                // borrow instead of two.
-                let (paint, state, frame, color, fluid) =
-                    (index, st.state, st.frame, st.color, st.fluid_level);
-                if let (Some(buffer), Some(surface)) =
-                    (st.buffers[paint].as_mut(), st.surface.as_ref())
-                {
-                    let pixels = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            buffer.map as *mut u32,
-                            (ORB_WIDTH * ORB_HEIGHT) as usize,
-                        )
-                    };
-                    render_gas_fluid(frame, pixels, state, color, fluid);
-                    surface.wl.attach(Some(&buffer.wl), 0, 0);
-                    surface.wl.damage(0, 0, ORB_WIDTH as i32, ORB_HEIGHT as i32);
-                    surface.wl.commit();
-                    st.next = (st.next + 1) % 2;
+                // Only paint into a buffer the compositor has released. If
+                // both are still out, this frame is skipped and the last
+                // committed frame stays on screen - a still orb beats writing
+                // into pixels the compositor is reading.
+                let paint = st.free_buffer();
+                if let Some(paint) = paint {
+                    st.frame += 1;
+                    let index = paint;
+                    if st.buffers[index].is_none() {
+                        st.buffers[index] = Some(make_buffer(&shm, &qh));
+                    }
+                    // The render writes into the buffer's map, and the frame
+                    // counter advances once per paint, so both happen through
+                    // one borrow instead of two.
+                    let (paint, state, frame, color, fluid) =
+                        (index, st.state, st.frame, st.color, st.fluid_level);
+                    if let (Some(buffer), Some(surface)) =
+                        (st.buffers[paint].as_mut(), st.surface.as_ref())
+                    {
+                        let pixels = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                buffer.map as *mut u32,
+                                (ORB_WIDTH * ORB_HEIGHT) as usize,
+                            )
+                        };
+                        render_gas_fluid(frame, pixels, state, color, fluid);
+                        surface.wl.attach(Some(&buffer.wl), 0, 0);
+                        surface.wl.damage(0, 0, ORB_WIDTH as i32, ORB_HEIGHT as i32);
+                        surface.wl.commit();
+                        // The buffer now belongs to the compositor until it
+                        // releases it.
+                        if let Some(buffer) = st.buffers[paint].as_mut() {
+                            buffer.in_use = true;
+                        }
+                        st.next = (st.next + 1) % 2;
+                    }
                 }
             }
         }
@@ -353,6 +406,9 @@ fn make_buffer(shm: &wl_shm::WlShm, qh: &QueueHandle<OrbState_>) -> Buffer {
         wl,
         map: map as *mut u8,
         _pool: pool,
+        // A buffer that has never been committed is not in use: the
+        // compositor has not seen it yet.
+        in_use: false,
     }
 }
 
@@ -423,13 +479,26 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for OrbState_ {
 
 impl Dispatch<wayland_client::protocol::wl_buffer::WlBuffer, ()> for OrbState_ {
     fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_buffer::WlBuffer,
-        _: wayland_client::protocol::wl_buffer::Event,
+        state: &mut Self,
+        buffer: &wayland_client::protocol::wl_buffer::WlBuffer,
+        event: wayland_client::protocol::wl_buffer::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // `release` is the compositor handing the buffer back: until it
+        // arrives the pixels are the compositor's to read, and the render must
+        // not write them again. The event used to be discarded, which is how
+        // the double-buffer swap went unvalidated.
+        if let wayland_client::protocol::wl_buffer::Event::Release = event {
+            let id = buffer.id();
+            for slot in state.buffers.iter_mut().flatten() {
+                if slot.wl.id() == id {
+                    slot.in_use = false;
+                    break;
+                }
+            }
+        }
     }
 }
 
