@@ -2,13 +2,12 @@
 # has: without it the step improvises a harness from scratch.
 #
 # The test command runs the NATIVE toolchain, not the Windows cargo through
-# the WSL mount. The Windows path was stale twice over and is unrunnable:
-# measured 2026-10-21, `/mnt/c` does not exist (the Windows drive is mounted
-# at `/mnt/win`), and no Windows executable can be launched through the
-# interop at all - `/mnt/win/Windows/System32/cmd.exe` fails to exec with
-# "No such file or directory (os error 2)" and there is no WSLInterop binfmt
-# entry. A gate that cannot run its own test command improvises a harness
-# instead, which is exactly what this file exists to prevent.
+# the WSL mount. The Windows path is unrunnable: `/proc/sys/fs/binfmt_misc`
+# contains only `python3.14` - there is no WSLInterop entry, so no PE binary
+# can be exec'd from this Linux (the exec fails with ENOEXEC, "Exec format
+# error", when the drive is mounted). A gate that cannot run its own test
+# command improvises a harness instead, which is exactly what this file
+# exists to prevent.
 #
 # The native crate builds and tests in ~6 s and is the authoritative local
 # suite (AGENTS.md, "Toolchain & Testing Scope"). Windows proof is CI's job:

@@ -21,17 +21,15 @@ and direct keyboard event injection.
      building windows/linux/macos on real runners) is the gate for a change and
      must be green for the exact head that is claimed.
    - The Windows cargo reached through the WSL mount used to be the gate's
-     test command; it is dead and kept as history. Measured 2026-10-20: the
-     Windows drive is mounted at `/mnt/win` (not `/mnt/c`), no Windows
-     executable can be launched through the interop at all -
-     `/mnt/win/Users/tyanw/.cargo/bin/cargo.exe`, `/mnt/win/Windows/System32/cmd.exe`
-     and `/mnt/win/Windows/System32/wsl.exe` all fail with `MZ...: not found`
-     (no binfmt registration) and **exit code 0**, the exact trap described in
-     rule "WSL interop" - and its target dir had to sit on the Windows disk
-     because WSL 9p mounts support no Windows file locking. A gate whose test
-     command cannot run improvises a harness, so the command now points at the
-     native suite. Run the local suite yourself, and let CI be the Windows
-     proof; do not report a local Windows test.
+     test command; it is dead and kept as history. The durable evidence:
+     `/proc/sys/fs/binfmt_misc` contains only `python3.14` - there is no
+     WSLInterop entry, so no PE binary can be exec'd from this Linux (the
+     exec fails with ENOEXEC, "Exec format error", when the drive is
+     mounted) - and its target dir had to sit on the Windows disk because
+     WSL 9p mounts support no Windows file locking. A gate whose test
+     command cannot run improvises a harness, so the command now points at
+     the native suite. Run the local suite yourself, and let CI be the
+     Windows proof; do not report a local Windows test.
    - Pure unit tests exercise code paths safely without acquiring the single-instance mutex or touching audio hardware.
    - Do NOT create scratch probe executables, live window harnesses, or kill background processes.
    - **A destructive probe must name a target that cannot exist.** On
@@ -209,11 +207,16 @@ and direct keyboard event injection.
      buffer the compositor has handed back; when both are still out the frame
      is skipped and the last committed frame stays on screen. The pair is
      destroyed together with the surface - `Hide` and the compositor's
-     `Closed` event both drop the buffers, so the buffer/pool destroy requests
-     go out after the surface destroy, whose contract makes the compositor
-     release its saved references first - and the paint loop recreates the
-     pair lazily, one memfd+mmap pair per dictation, the same lifecycle as
-     the surface. `in_use` only tracks reuse within one dictation.
+     `Closed` event both drop the buffers, and each `Buffer`'s `Drop` munmaps
+     its mapping - and the paint loop recreates the pair lazily, one fresh
+     memfd+mmap pair per dictation, the same lifecycle as the surface. Safety
+     does not come from the surface destroy (`wl_surface.destroy` only
+     deletes the surface and invalidates its object ID): the destroyed
+     buffer's storage is never reused, which is exactly the case
+     `wl_surface.attach` permits for destroying a `wl_buffer` before
+     `wl_buffer.release` arrives; the buffer/pool destroy requests follow the
+     surface destroy on the wire as belt-and-braces. `in_use` only tracks
+     reuse within one dictation.
 
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
@@ -263,10 +266,11 @@ and direct keyboard event injection.
      `taskkill.exe`) while `cmd.exe /c echo` still returned `Permission
      denied` - so the diagnostic above must not be read as "the whole mount is
      down": test the shape you actually need, and do not use a dead `cmd.exe`
-     to declare `cargo.exe` dead. The recovery did not last: `/mnt/c` is gone,
-     `/mnt/win` is an empty root-owned directory, and no WSL binfmt entry is
-     registered, so no Windows executable runs from WSL today and CI is the
-     Windows proof once more (rule 2). A local Windows test is not reported.
+     to declare `cargo.exe` dead. The recovery did not last:
+     `/proc/sys/fs/binfmt_misc` now contains only `python3.14` - no
+     WSLInterop entry - so no Windows executable runs from WSL today and CI
+     is the Windows proof once more (rule 2). A local Windows test is not
+     reported.
    - **NEVER run a freshly built `mnvoice.exe` with `--restart` while the live
      instance is running.** The flag's whole job is to kill other mnvoice
      processes and free the hotkey, so it terminates the user's running app -

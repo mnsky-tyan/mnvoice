@@ -253,13 +253,16 @@ pub fn run_stream(
                     // the send loop first - is the case the marker is for.
                     //
                     // `cancelled` is deliberately NOT a third condition here,
-                    // though the send-side predicate names it. The place
-                    // that sets `cancelled` sets `stop` as well - on Windows
-                    // (`windows_app::cancel`) on the very next line, and on
-                    // Linux (`watch_recording`) in the same breath - so
-                    // `!stop` already implies `!cancelled` and a clause
-                    // testing it could never change the outcome. Adding one
-                    // would read as protection the predicate does not have.
+                    // though the send-side predicate names it. The direction
+                    // that actually holds is "`cancelled` implies `stop`
+                    // (eventually)", not the contrapositive: both setters
+                    // (`watch_recording` and `windows_app::cancel`) store
+                    // `cancelled` first and `stop` second, so there is a
+                    // narrow window where `cancelled` is true and `stop` is
+                    // still false - a read error arriving there is recorded,
+                    // not suppressed. A cancelled session's result is
+                    // discarded before typing, so the window costs nothing;
+                    // that is why the predicate omits `cancelled`.
                     if !reader_done_clone.load(Ordering::SeqCst)
                         && !stop_clone.load(Ordering::SeqCst)
                     {

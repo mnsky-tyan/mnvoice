@@ -108,10 +108,14 @@ struct OrbSurface {
     configured: bool,
 }
 
+/// The byte size of one frame's pixels, shared by the mapping and its
+/// teardown so the two cannot disagree.
+const BUFFER_BYTES: usize = (ORB_WIDTH * ORB_HEIGHT * 4) as usize;
+
 struct Buffer {
     wl: wayland_client::protocol::wl_buffer::WlBuffer,
-    /// The mmap'd pixels the render writes into. Kept mapped for the life of
-    /// the buffer; the file backs the shm pool and is unlinked immediately.
+    /// The mmap'd pixels the render writes into, munmapped when the buffer
+    /// drops. The file backs the shm pool and is unlinked immediately.
     map: *mut u8,
     _pool: wayland_client::protocol::wl_shm_pool::WlShmPool,
     /// Whether the compositor is still reading this buffer.
@@ -130,6 +134,17 @@ struct Buffer {
 // The mapped pixels are only ever reached through the render's `&mut [u32]`,
 // one buffer at a time, on the one thread that owns the connection.
 unsafe impl Send for Buffer {}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        // The destroyed buffer's storage is never written again (a fresh
+        // memfd is created per dictation), and the compositor maps the pool
+        // through its own fd, so unmapping our mapping cannot pull storage
+        // from under it.
+        unsafe { rustix::mm::munmap(self.map as *mut core::ffi::c_void, BUFFER_BYTES) }
+            .expect("munmap orb shm");
+    }
+}
 
 impl OrbState_ {
     /// A dictation started. The surface is created by the caller when this is
@@ -289,12 +304,15 @@ fn run(
                     surface.wl.destroy();
                 }
                 // The buffers die with the surface: their destroy requests
-                // follow the surface destroy on the wire, and destroying the
-                // surface releases the compositor's references to its buffers,
-                // so a release that never arrives cannot leave a buffer marked
-                // in use for the rest of the process. The next dictation's
-                // paint loop recreates the pair lazily - one memfd+mmap pair
-                // per dictation, like the surface.
+                // follow the surface destroy on the wire, and the destroyed
+                // buffer's storage is never reused - the next dictation's
+                // paint loop recreates the pair lazily, one fresh memfd+mmap
+                // pair per dictation. wl_surface.attach permits destroying a
+                // wl_buffer before wl_buffer.release as long as the
+                // underlying buffer storage isn't re-used, so a release that
+                // never arrives cannot leave a buffer marked in use for the
+                // rest of the process; the surface-destroy-first ordering is
+                // belt-and-braces, not the guarantee.
                 for slot in st.buffers.iter_mut().flatten() {
                     slot.wl.destroy();
                     slot._pool.destroy();
@@ -385,7 +403,7 @@ fn run(
 /// zero-audio-on-disk promise by not even putting its pixels there.
 fn make_buffer(shm: &wl_shm::WlShm, qh: &QueueHandle<OrbState_>) -> Buffer {
     use std::os::fd::AsFd;
-    let size = (ORB_WIDTH * ORB_HEIGHT * 4) as usize;
+    let size = BUFFER_BYTES;
     let memfd = rustix::fs::memfd_create(
         rustix::cstr!("mnvoice-orb"),
         rustix::fs::MemfdFlags::CLOEXEC,
