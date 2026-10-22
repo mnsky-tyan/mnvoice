@@ -311,9 +311,13 @@ pub fn main() -> Result<(), String> {
 /// that follows already reads "recording" - raising it inside the new thread was
 /// a race that lost, and the row sat on "Dictate" through a live recording.
 /// The stop press moves it to `Transcribing` in the loop (the Windows seam:
-/// `windows_app::toggle` does this at the same moment), `dictate` moves it to
-/// `Idle` when the transcript is typed; the loop's `Done` arm clears it in case
-/// a worker panicked before it could.
+/// `windows_app::toggle` does this at the same moment), `dictate`'s wrapper
+/// moves it back to `Idle` once the transcript is typed, and the loop's
+/// `Done` arm clears it to `Idle` when the worker is collected.
+/// `RecordingGuard` is not the fallback for a dead worker: it only fires on
+/// a debug-build unwind that skips `dictate`'s own clear, and the `Done` arm
+/// overwrites it immediately (release builds abort on panic, so it never
+/// runs at all).
 static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PHASE_IDLE);
 
 pub(crate) const PHASE_IDLE: u8 = 0;
@@ -328,11 +332,14 @@ fn set_phase(phase: u8) {
     PHASE.store(phase, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Clears the phase when the worker's capture ends, however it ends - return,
-/// `?`, or panic. The same reason the worker's `Done` event uses a guard: a
-/// phase stuck at `Recording` makes the loop send stop signals to a session that
-/// is already over, so a press during the next transcription would "stop"
-/// nothing instead of dropping the transcript.
+/// Clears the phase when the worker drops it, so a stuck `Recording` phase
+/// cannot make the loop send stop signals to a session that is already over.
+/// In the ordinary flow this is a no-op: `dictate`'s wrapper sets the phase
+/// to `Idle` before the worker drops the guard, and the loop's `Done` arm
+/// clears it again. The guard only fires on a debug-build unwind that skips
+/// `dictate`'s own clear - and there the loop's `Done` arm immediately
+/// overwrites it; release builds set `panic = "abort"`, so no unwind runs it
+/// at all.
 struct RecordingGuard;
 
 impl Drop for RecordingGuard {

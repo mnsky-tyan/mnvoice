@@ -253,12 +253,16 @@ pub fn run_stream(
                     // the send loop first - is the case the marker is for.
                     //
                     // `cancelled` is deliberately NOT a third condition here,
-                    // though the send-side predicate names it: the one place
-                    // that sets `cancelled` (windows_app::cancel) sets `stop`
-                    // on the very next line, so `!stop` already implies
-                    // `!cancelled` and a clause testing it could never change
-                    // the outcome. Adding one would read as protection the
-                    // predicate does not have.
+                    // though the send-side predicate names it. The direction
+                    // that actually holds is "`cancelled` implies `stop`
+                    // (eventually)", not the contrapositive: both setters
+                    // (`watch_recording` and `windows_app::cancel`) store
+                    // `cancelled` first and `stop` second, so there is a
+                    // narrow window where `cancelled` is true and `stop` is
+                    // still false - a read error arriving there is recorded,
+                    // not suppressed. A cancelled session's result is
+                    // discarded before typing, so the window costs nothing;
+                    // that is why the predicate omits `cancelled`.
                     if !reader_done_clone.load(Ordering::SeqCst)
                         && !stop_clone.load(Ordering::SeqCst)
                     {
@@ -435,8 +439,30 @@ pub fn run_stream(
     let _ = ws.send_text("{\"type\": \"CloseStream\"}");
 
     // Wait up to 1500ms for Deepgram to return the final transcription
+    //
+    // `cancelled` breaks the wait as well as `reader_done`. The reader is the
+    // thread that sets `reader_done` (`reader_done_clone.store` at the end of
+    // the reader closure), so on a cancel - where the
+    // user asked to stop and the socket is being torn down on purpose - waiting
+    // on it here would stall the caller for the whole 1500ms. That delay is paid
+    // in front of the user: the orb stays on screen and the tray row stays on
+    // "Transcribing..." until it elapses, which is the seam `watch_recording`
+    // now reaches by raising `cancelled` during capture.
+    //
+    // What ends the wait is platform-specific and must not be conflated with
+    // what breaks it. The Unix transport's `close()` shuts the socket down
+    // outright, so it releases a reader parked in `read` and the whole call
+    // returns immediately once the wait is skipped; the Windows transport's
+    // `close()` is a negotiated close that does NOT release a parked
+    // `WinHttpWebSocketReceive` (windows_impl.rs:649-656), so on Windows
+    // skipping the wait still leaves the close handshake and the reader join
+    // to bound. The `!cancelled` break shortens the wait on every platform;
+    // the bound on the whole call is the Unix transport's property alone.
     let wait_deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < wait_deadline && !reader_done.load(Ordering::SeqCst) {
+    while Instant::now() < wait_deadline
+        && !reader_done.load(Ordering::SeqCst)
+        && !cancelled.load(Ordering::SeqCst)
+    {
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -924,6 +950,159 @@ mod tests {
         assert!(
             !crate::test_hooks::drain_backlog_exhausted(),
             "the drain must not walk the whole backlog after a failed send - if this fails, the break is gone but the record is not"
+        );
+    }
+
+    /// A cancel must not wait out the provider's final-transcription window.
+    ///
+    /// The seam waited up to 1500 ms for the provider's last frame, and the
+    /// only thing that could end that wait early was the reader thread - which
+    /// on a cancel is parked inside `read()`, waiting for a frame that a
+    /// cancelled session will never get. So a cancel paid the full 1500 ms
+    /// before the socket was closed, and that wait sits between the user's
+    /// keypress and the orb coming down.
+    ///
+    /// The peer here says nothing at all, so the reader is parked for the
+    /// whole session and `reader_done` cannot be what releases the wait.
+    ///
+    /// "Parked in read" holds for both transports, but what releases it does
+    /// not: the Unix `close()` shuts the socket down and ends the parked read,
+    /// while the Windows `close()` is a negotiated close that leaves
+    /// `WinHttpWebSocketReceive` parked (windows_impl.rs:649-656). The bound
+    /// asserted below is therefore the Unix transport's; Windows gets a
+    /// generous one that still catches a real hang.
+    #[test]
+    fn a_cancel_does_not_wait_out_the_final_transcription_window() {
+        use std::io::Read as _;
+        let (port, server) = live_provider::serve(|stream| {
+            // Read once so the handshake lands, then stay silent: the reader
+            // parks in `read` with no frame ever coming.
+            let mut sink = [0u8; 64];
+            let _ = std::io::Read::read(stream, &mut sink);
+            // Hold the socket open until the client closes it.
+            let _ = stream.read(&mut sink);
+        });
+        let cfg = live_provider::cfg_for(port);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let n = SAMPLE_RATE as usize / 10;
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // The cancel lands while the session is live and the peer is silent.
+        let cancel_flag = Arc::clone(&cancelled);
+        let stop_flag = Arc::clone(&stop);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            cancel_flag.store(true, Ordering::SeqCst);
+            stop_flag.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let result = run_stream(&cfg, &stop, &cancelled, rx);
+        let elapsed = started.elapsed();
+        let _ = canceller.join();
+        let _ = tx.send(vec![0i16; n]);
+        let _ = server.join();
+
+        // The result itself is not what is under test - a cancelled session may
+        // or may not have a transcript. The elapsed time is.
+        let _ = result;
+        // The bound on the WHOLE call is the Unix transport's property: its
+        // `close()` shuts the socket down outright, which is what releases the
+        // reader parked in `read` and lets the join return. On Windows
+        // `close()` is a negotiated close that does NOT release a parked
+        // `WinHttpWebSocketReceive` (windows_impl.rs:649-656), so the close
+        // handshake alone can spend up to WEBSOCKET_CLOSE_TIMEOUT_MS and the
+        // join behind it can add more - the Unix bound would be false there.
+        // The fixture is still worth running on Windows: the `!cancelled`
+        // break skips the 1500 ms wait on every platform.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let bound = Duration::from_millis(1200);
+        #[cfg(target_os = "windows")]
+        let bound = Duration::from_secs(10);
+        assert!(
+            elapsed < bound,
+            "a cancel must not wait out the 1500ms final-transcription window \
+             on {} (bound {bound:?}, took {elapsed:?}) - the orb stays up for \
+             exactly that long",
+            if cfg!(target_os = "windows") {
+                "Windows (10s close/join bound)"
+            } else {
+                "the Unix transport (1200ms bound)"
+            }
+        );
+    }
+
+    /// The other half of the boundary the cancel fix draws: the wait may be
+    /// broken by `cancelled` alone, but an ordinary stop still pays it. The
+    /// final frame here lands 500 ms after the user's stop raised `stop` -
+    /// inside the window, after the CloseStream - and the session must still
+    /// be sitting in the wait to receive it. This is the guard for the fix's
+    /// risk surface: breaking the wait on `stop` as well would hand back a
+    /// transcript without its final words, and a cancel would no longer be
+    /// the only fast path out.
+    #[test]
+    fn an_ordinary_stop_still_waits_for_the_final_transcription_frame() {
+        use std::io::{Read as _, Write as _};
+        let (port, server) = live_provider::serve(|stream| {
+            // A clause the session commits while the audio is still flowing.
+            let _ = stream.write_all(&live_provider::result_frame("hello world", true, false));
+            let _ = stream.flush();
+            // The final frame arrives after the stop has ended the send
+            // loop: 500 ms of audio, then this 1 s delay puts it 500 ms
+            // into the post-stop window.
+            std::thread::sleep(Duration::from_millis(1000));
+            let _ = stream.write_all(&live_provider::result_frame("late words", true, true));
+            let _ = stream.flush();
+            // The fixture rule: never close with the client still reading -
+            // drain until it closes the socket.
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink);
+        });
+        let cfg = live_provider::cfg_for(port);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let n = SAMPLE_RATE as usize / 10;
+        std::thread::spawn(move || {
+            // 25 packets x 20 ms = 500 ms of audio, the shape of a short
+            // ordinary dictation.
+            for _ in 0..25 {
+                if tx.send(vec![0i16; n]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // The hotkey's ordinary stop: raised at the end of the audio,
+        // with `cancelled` never touched.
+        let stop_flag = Arc::clone(&stop);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            stop_flag.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let out = run_stream(&cfg, &stop, &cancelled, rx);
+        let elapsed = started.elapsed();
+        let _ = stopper.join();
+        let _ = server.join();
+
+        let text = out.expect("the ordinary stop must end in a transcript");
+        assert!(
+            text.contains("hello world") && text.contains("late words"),
+            "the post-stop final frame must still be consumed: {text}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(950),
+            "the session must sit in the wait for the late frame, not return \
+             early: took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the wait window is bounded: took {elapsed:?}"
         );
     }
 

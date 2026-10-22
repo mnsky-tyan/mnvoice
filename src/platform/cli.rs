@@ -674,7 +674,6 @@ mod tests {
             let _ = cancel_tx.send(());
         });
 
-        let opened = Instant::now();
         let (outcome, recorded) =
             watch_recording(&stop, &line_rx, &done_rx, Some(&cancel_rx), &cancelled);
 

@@ -15,20 +15,21 @@ and direct keyboard event injection.
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (135 tests, ~6 s) and is what an agent must run before
-     every commit. CI (`release.yml`, dispatched on `main` and on every PR,
+     whole crate natively (141 tests, ~6 s), is what an agent must run before
+     every commit, and is the gate's own test command (`.no-mistakes.yaml`
+     `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
      must be green for the exact head that is claimed.
-   - The Windows-cargo command recorded in the gate (`.no-mistakes.yaml`) is
-     currently UNRUNNABLE and its path is stale twice over. Measured 2026-10-20:
-     the Windows drive is mounted at `/mnt/win` (not `/mnt/c`), and no Windows
-     executable can be launched through the interop at all -
-     `/mnt/win/Users/tyanw/.cargo/bin/cargo.exe`, `/mnt/win/Windows/System32/cmd.exe`
-     and `/mnt/win/Windows/System32/wsl.exe` all fail with `MZ...: not found`
-     (no binfmt registration) and **exit code 0**, the exact trap described in
-     rule "WSL interop". So: run the local suite yourself, and let CI be the
+   - The Windows cargo reached through the WSL mount used to be the gate's
+     test command; it is dead and kept as history. The durable evidence:
+     `/proc/sys/fs/binfmt_misc` contains only `python3.14` - there is no
+     WSLInterop entry, so no PE binary can be exec'd from this Linux (the
+     exec fails with ENOEXEC, "Exec format error", when the drive is
+     mounted) - and its target dir had to sit on the Windows disk because
+     WSL 9p mounts support no Windows file locking. A gate whose test
+     command cannot run improvises a harness, so the command now points at
+     the native suite. Run the local suite yourself, and let CI be the
      Windows proof; do not report a local Windows test.
-   - Target directory MUST sit on the Windows disk because WSL 9p mounts do not support Windows file locking.
    - Pure unit tests exercise code paths safely without acquiring the single-instance mutex or touching audio hardware.
    - Do NOT create scratch probe executables, live window harnesses, or kill background processes.
    - **A destructive probe must name a target that cannot exist.** On
@@ -185,6 +186,38 @@ and direct keyboard event injection.
      typer, not to drop the final pass. Do not "fix the double typing" again
      without measuring which injector reaches the user's actual windows.
 
+   - **A cancel must not wait out the provider's final-transcription window.**
+     The streaming loop waited up to 1500 ms for Deepgram's last frame, and
+     the only thing that could end that wait early was the reader thread -
+     which on a cancel is parked inside `read()`, waiting for a frame a
+     cancelled session never gets. So a cancel paid the full 1500 ms before
+     the socket closed, and that wait sat between the user's Alt+Esc and the
+     orb coming down. Measured 2026-10-21 with the negative control: 1.759 s
+     before the fix, 0.25 s after. The wait now also ends on `cancelled`,
+     which is set only by an explicit cancel (never by a normal stop), so the
+     ordinary end still waits for the final transcript. The regression test is
+     `a_cancel_does_not_wait_out_the_final_transcription_window`.
+
+   - **A layer-shell buffer is the compositor's until it releases it.**
+     The orb swapped between two shm buffers on every frame and the
+     `wl_buffer.release` event was discarded, so the render wrote into
+     pixels the compositor could still be reading - the "tear" the
+     double-buffer comment promised to avoid. `wl_buffer.release` is now
+     tracked per buffer (`Buffer::in_use`) and the render only paints into a
+     buffer the compositor has handed back; when both are still out the frame
+     is skipped and the last committed frame stays on screen. The pair is
+     destroyed together with the surface - `Hide` and the compositor's
+     `Closed` event both drop the buffers, and each `Buffer`'s `Drop` munmaps
+     its mapping - and the paint loop recreates the pair lazily, one fresh
+     memfd+mmap pair per dictation, the same lifecycle as the surface. Safety
+     does not come from the surface destroy (`wl_surface.destroy` only
+     deletes the surface and invalidates its object ID): the destroyed
+     buffer's storage is never reused, which is exactly the case
+     `wl_surface.attach` permits for destroying a `wl_buffer` before
+     `wl_buffer.release` arrives; the buffer/pool destroy requests follow the
+     surface destroy on the wire as belt-and-braces. `in_use` only tracks
+     reuse within one dictation.
+
    - **Two spellings of one derived constant will disagree exactly where the
      derivation can fail.** The capture frame stride was `nBlockAlign.max(1)`
      at the sizing site and `nBlockAlign > 0 ? nBlockAlign : channels *
@@ -227,18 +260,17 @@ and direct keyboard event injection.
      Windows-bound work rather than letting an agent thrash. Recovery is the
      user's Windows-side call: restarting WSL kills every WSL process,
      including the agent session and herdr's panes.
-   - **Interop recovered PARTIALLY, and the recovery is per-launch-shape
-     (measured 2026-10-17).** Direct `.exe` invocation over the mount works
-     again - `/mnt/c/Users/tyanw/.cargo/bin/cargo.exe`, `tasklist.exe`,
-     `taskkill.exe` - while `cmd.exe /c echo` still returns `Permission
-     denied`. So the diagnostic above must not be read as "the whole mount is
+   - **The 2026-10-17 interop recovery did not last (re-measured 2026-10-21).**
+     It was per-launch-shape - direct `.exe` invocation over the mount worked
+     again (`/mnt/c/Users/tyanw/.cargo/bin/cargo.exe`, `tasklist.exe`,
+     `taskkill.exe`) while `cmd.exe /c echo` still returned `Permission
+     denied` - so the diagnostic above must not be read as "the whole mount is
      down": test the shape you actually need, and do not use a dead `cmd.exe`
-     to declare `cargo.exe` dead. Consequence for this project: the Windows
-     suite now runs LOCALLY with the authoritative command in rule 2 (183
-     tests, measured 61-62 s wall with a warm target dir including recompiling
-     two source files), so "CI is the only Windows compiler" is obsolete -
-     CI is still the gate, but a Windows-only edit can be compiled and tested
-     before it is pushed. `powershell.exe` was not re-tested this pass.
+     to declare `cargo.exe` dead. The recovery did not last:
+     `/proc/sys/fs/binfmt_misc` now contains only `python3.14` - no
+     WSLInterop entry - so no Windows executable runs from WSL today and CI
+     is the Windows proof once more (rule 2). A local Windows test is not
+     reported.
    - **NEVER run a freshly built `mnvoice.exe` with `--restart` while the live
      instance is running.** The flag's whole job is to kill other mnvoice
      processes and free the hotkey, so it terminates the user's running app -
@@ -343,7 +375,7 @@ mnvoice/
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from orb_render
-│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, scope=on-screen-display (window type, not a label)
+│       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)
 │       └── windows_impl.rs the SendInput injector

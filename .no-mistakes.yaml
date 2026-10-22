@@ -1,10 +1,20 @@
 # Gate settings for mnvoice. commands.test is the only baseline the Test step
-# has: without it the step improvises a harness from scratch. The Windows cargo
-# reached through the WSL mount is the only toolchain that can build this
-# crate on this machine, and its target dir must sit on Windows disk because
-# the 9p mount supports no Windows file locking.
+# has: without it the step improvises a harness from scratch.
+#
+# The test command runs the NATIVE toolchain, not the Windows cargo through
+# the WSL mount. The Windows path is unrunnable: `/proc/sys/fs/binfmt_misc`
+# contains only `python3.14` - there is no WSLInterop entry, so no PE binary
+# can be exec'd from this Linux (the exec fails with ENOEXEC, "Exec format
+# error", when the drive is mounted). A gate that cannot run its own test
+# command improvises a harness instead, which is exactly what this file
+# exists to prevent.
+#
+# The native crate builds and tests in ~6 s and is the authoritative local
+# suite (AGENTS.md, "Toolchain & Testing Scope"). Windows proof is CI's job:
+# release.yml runs the crate's tests on real windows/linux/macos runners for
+# every pull request, and the pipeline waits on those real checks.
 commands:
-  test: WSLENV=CARGO_TARGET_DIR CARGO_TARGET_DIR=C:/Users/tyanw/AppData/Local/Temp/mnvoice-gate-target /mnt/c/Users/tyanw/.cargo/bin/cargo.exe test --locked
+  test: cargo test --locked
 
 # The Test step is an agent, so it also reads AGENTS.md. The user's live
 # mnvoice.exe holds the `mnvoice-single-instance` mutex, so it must never be
