@@ -162,10 +162,12 @@ impl Tray for MnvoiceTray {
     }
 
     /// The tray icon is the brand mark, not the orb: this is the surface a
-    /// Linux desktop identifies the app by, and it is the same artwork the
-    /// Windows tray and the exe carry. The orb stays on screen as the live
-    /// indicator, where motion carries the state; a still of it in the panel
-    /// said nothing and was not the product's icon.
+    /// Linux desktop identifies the app by. The mark is mark-only at every
+    /// size - the wordmark card lives in the launcher icon instead - because
+    /// the tray is drawn small (Plasma's status popup measured at ~94 device
+    /// px), where the wordmark is unreadable mush. The orb stays on screen as
+    /// the live indicator, where motion carries the state; a still of it in
+    /// the panel said nothing and was not the product's icon.
     ///
     /// A still rather than an animation either way: driving a 30 fps timer
     /// through D-Bus to move a 22px tray icon costs far more than the motion
@@ -447,8 +449,8 @@ mod tests {
             "every baked frame is served"
         );
         // A panel asks for ~22px; the baked set's nearest frame is 24px, and
-        // handing the host only the 256px card would make it resample a
-        // wordmark it cannot resolve.
+        // handing the host only the 256px mark would make it resample down
+        // instead of getting the drawing made for its size.
         let icon = &pixmap[2];
         assert_eq!((icon.width, icon.height), (24, 24), "the 24px frame");
         assert_eq!(
@@ -465,8 +467,8 @@ mod tests {
             opaque > 300,
             "the tray icon must be visible, got {opaque} opaque pixels"
         );
-        // And it must be the *card*, not the orb: the orb's palette is the
-        // configured accent colour, while the brand card is near-white.
+        // And it must be the mark, not the orb: the orb's palette is the
+        // configured accent colour, while the brand mark is near-white.
         let pale = icon
             .data
             .chunks(4)
@@ -507,7 +509,7 @@ mod tests {
                 let opaque = icon.data.chunks(4).filter(|px| px[0] > 40).count();
                 assert!(
                     opaque > 40_000,
-                    "the 256px card must be dense, got {opaque}"
+                    "the 256px mark must be dense, got {opaque}"
                 );
             }
         }

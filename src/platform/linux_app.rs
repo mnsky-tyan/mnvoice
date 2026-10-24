@@ -577,10 +577,12 @@ pub fn ensure_autostart() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "mnvoice".into());
-    // The icon line is conditional on the mark actually being baked in: naming
-    // a file this build cannot write would be worse than no Icon= at all, since
-    // the desktop then draws its generic application placeholder.
-    let icon = if crate::platform::linux_icon::available() {
+    // The icon line is conditional on the launcher card actually being
+    // baked in: naming a file this build cannot write would be worse than no
+    // Icon= at all, since the desktop then draws its generic application
+    // placeholder. The card store is the one `ensure_icon` reads, so it is the
+    // one this asks about.
+    let icon = if crate::platform::linux_icon::card_available() {
         "Icon=mnvoice\n"
     } else {
         ""
@@ -693,7 +695,7 @@ fn ensure_icon() {
     let Ok(home) = std::env::var("HOME") else {
         return;
     };
-    let Some((width, height, rgba)) = crate::platform::linux_icon::card_frame(256) else {
+    let Some((width, height, rgba)) = crate::platform::linux_icon::card_frame() else {
         return;
     };
     let Some(dir) = std::path::Path::new(&home)

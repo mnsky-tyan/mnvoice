@@ -72,30 +72,29 @@ fn main() {
         // includes both unconditionally, and a reused target dir keeps a
         // previous build's pixels unless they are overwritten here, so an
         // unwriteable .ico would otherwise fail the compile outright or
-        // silently ship the wrong artwork.
+        // silently ship the wrong artwork. What a failed card does cost is the
+        // launcher: `card_available` reports the empty store, the entry gets no
+        // `Icon=` line at all, and the desktop falls back to its generic
+        // placeholder rather than to a name that resolves to nothing.
         let tray = bake_brand_frames(tray_icon);
-        let app = bake_brand_frames(app_icon);
+        let app = extract_card_frame(app_icon);
+        // Warned one file at a time rather than through one common type: the
+        // two results carry different payloads, and "some icon failed"
+        // without naming the file is not actionable.
         for (path, result, note) in [
-            (tray_icon, &tray, "the tray falls back to the orb"),
-            (app_icon, &app, "the desktop entry gets no Icon="),
+            (tray_icon, tray.as_ref().err(), "the tray falls back to the orb"),
+            (
+                app_icon,
+                app.as_ref().err(),
+                "the desktop entry gets no Icon=",
+            ),
         ] {
-            if let Err(e) = result {
+            if let Some(e) = result {
                 println!("cargo:warning=no brand icon baked in ({path}: {e}); {note}");
             }
         }
         let (sizes, pixels) = tray.unwrap_or_default();
-        let (app_sizes, app_pixels) = app.unwrap_or_default();
-        // The launcher card is sliced with the tray's size list, so the two
-        // files must name the same frames in the same order: a drift would not
-        // be visible until card_frame() handed the launcher a misaligned
-        // slice. Checked here, where it is a loud warning, instead of a
-        // silently wrong launcher icon.
-        if !sizes.is_empty() && !app_sizes.is_empty() && sizes != app_sizes {
-            println!(
-                "cargo:warning={tray_icon} and {app_icon} disagree on frame sizes \
-                 ({sizes:?} vs {app_sizes:?}); the launcher icon would be garbled"
-            );
-        }
+        let app_pixels = app.unwrap_or_default();
         // The pixels travel as a file in OUT_DIR, not as an env var:
         // `cargo:rustc-env` lands on rustc's command line, and a few
         // hundred kilobytes of comma-separated bytes overflowed it
@@ -115,7 +114,11 @@ fn main() {
         );
         std::fs::write(out.join("brand_icon_sizes.rs"), sizes_rs)
             .expect("write the baked brand sizes");
-        // The launcher card, same sizes, wordmark included at 64px+.
+        // Only the launcher's card frame: the launcher PNG is written into
+        // `hicolor/256x256/apps` and nothing else reads the card, so the other
+        // eight frames of `assets/mnvoice.ico` would be baked pixels nobody
+        // ever looks at. It still goes through the same decoder as the tray, so
+        // a non-PNG or non-RGBA8 frame is refused the same way.
         std::fs::write(out.join("brand_card.rgba"), &app_pixels)
             .expect("write the baked launcher card");
         println!("cargo:rerun-if-changed={tray_icon}");
@@ -151,9 +154,34 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
 }
 
+/// Decodes the launcher card's 256px frame out of a brand .ico as straight
+/// RGBA. The tray icon is baked as its whole responsive set by
+/// [`bake_brand_frames`]; the launcher card needs exactly one frame, because
+/// the launcher PNG is written into `hicolor/256x256/apps` and nothing else
+/// reads it.
+///
+/// Expressed through `bake_brand_frames` rather than as a second decoder:
+/// one place then owns the directory parse, the PNG-frame refusal and the
+/// RGBA8 check, and a card frame is validated exactly as strictly as a tray
+/// frame is. The slice cannot run off the buffer because that function
+/// returns a buffer that is exactly the sum of the squares it names.
+fn extract_card_frame(path: &str) -> Result<Vec<u8>, String> {
+    let (sizes, pixels) = bake_brand_frames(path)?;
+    let index = sizes
+        .iter()
+        .position(|&side| side == 256)
+        .ok_or("no 256x256 frame; the launcher card needs one")?;
+    let offset: usize = sizes.iter().take(index).map(|s| s * s * 4).sum();
+    let len = 256 * 256 * 4;
+    pixels
+        .get(offset..offset + len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| "the 256px frame is not a whole square of RGBA".to_string())
+}
+
 /// Decodes every frame of a brand .ico into straight RGBA and returns its size
-/// list plus the concatenated pixels. Called once per file: the tray icon and
-/// the launcher card are baked separately, each from its own .ico.
+/// list plus the concatenated pixels. Called for the tray icon alone; the
+/// launcher card takes only its 256px frame through [`extract_card_frame`].
 ///
 /// The pixels travel as a binary file in `OUT_DIR` (read with `include_bytes!`)
 /// and the sizes as a small Rust source file (read with `include!`): a
@@ -162,8 +190,8 @@ fn main() {
 ///
 /// The ICO directory is parsed here rather than trusted from a hardcoded table:
 /// a frame count that disagreed with the file would bake a truncated buffer and
-/// the icon would be garbage rather than missing. Every frame in both of this
-/// repo's icons is a PNG (checked: all nine in each), so the PNG decoder is the
+/// the icon would be garbage rather than missing. Every frame in the tray
+/// icon is a PNG (checked: all nine), so the PNG decoder is the
 /// only format handled; an embedded BMP frame is refused by name instead of
 /// decoded wrongly.
 fn bake_brand_frames(path: &str) -> Result<(Vec<usize>, Vec<u8>), String> {

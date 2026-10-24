@@ -11,24 +11,29 @@
 // - the thing the Windows app and the README show - appeared nowhere on a
 // Linux desktop.
 //
-// One source of truth. The pixels are not a second copy of the artwork: the
-// build script decodes `assets/mnvoice.ico` (the same file winres bakes into
-// the exe) and writes the frames into `OUT_DIR`, and this module includes them.
-// A re-render of the brand asset therefore reaches every platform from one
-// file, and the two platforms cannot drift.
+// Two files, two surfaces, deliberately different artwork. The tray's frames
+// come from `assets/mnvoice-tray.ico`, which is the mark ALONE at every size;
+// the launcher card is the 256px frame of `assets/mnvoice.ico`, the exe's own
+// icon, which carries the wordmark. They are not the same drawing on purpose:
+// Plasma's status popup draws the tray at ~94 device px, where a wordmark is
+// unreadable mush, while the launcher icon is drawn at 256px, where the
+// wordmark is what tells a user which app it belongs to. `build.rs` bakes each
+// file on its own, so an unreadable `mnvoice.ico` costs the launcher its
+// `Icon=` and leaves the tray's mark alone - which is why each store carries
+// its own availability check below rather than one shared one.
 //
-// The responsive set is preserved. The ICO carries a mark-only drawing at tray
-// sizes and the full card with the wordmark at large sizes; both are kept and
-// `frame_index` picks the nearest one, exactly as Windows does at the same
-// sizes. A single downscaled 256px card would put an illegible wordmark in the
-// panel.
+// The tray keeps its responsive set. All nine frames of the tray ICO are baked
+// and served, and `frame_index` picks the nearest, so a 22px panel icon gets
+// the 24px drawing instead of a host upscale of the 256px mark. The card side
+// carries one frame, because the launcher PNG is written at exactly one size
+// (`hicolor/256x256/apps`).
 //
 // The colours are not recoloured. A StatusNotifierItem host may ask for
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
 // as-is and the host is expected to draw it like the Windows tray does.
 
-/// Frame sizes, smallest first, as baked from `assets/mnvoice-tray.ico`
-/// (`assets/mnvoice.ico` carries the same nine sizes).
+/// The tray's frame sizes, smallest first, as baked from
+/// `assets/mnvoice-tray.ico`.
 pub const SIZES: &[u32] = include!(concat!(env!("OUT_DIR"), "/brand_icon_sizes.rs"));
 
 /// Every tray frame's straight (non-premultiplied) RGBA pixels, concatenated
@@ -36,12 +41,16 @@ pub const SIZES: &[u32] = include!(concat!(env!("OUT_DIR"), "/brand_icon_sizes.r
 /// at the small sizes a panel and its status popup draw.
 const PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_icon.rgba"));
 
-/// The launcher card's pixels, same sizes and order, with the wordmark
-/// included from 64px up. Used for the desktop entry's PNG, where the icon is
-/// drawn large enough for the wordmark to read.
+/// The launcher card: one 256x256 frame of straight RGBA, the wordmark-bearing
+/// artwork from `assets/mnvoice.ico`. Empty when that file could not be baked,
+/// which is the one condition [`card_available`] reports.
 const CARD_PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_card.rgba"));
 
-/// Every baked frame, in the size order [`SIZES`] names (smallest first).
+/// The card's side in pixels. The launcher PNG is written into
+/// `hicolor/256x256/apps`, so 256 is the only size the card is ever asked for.
+const CARD_SIDE: u32 = 256;
+
+/// Every baked tray frame, in the size order [`SIZES`] names (smallest first).
 ///
 /// This is what a StatusNotifierItem host is supposed to be handed: the spec's
 /// `IconPixmap` is an *array* of (width, height, pixels) precisely so the host
@@ -53,23 +62,20 @@ pub fn all_frames() -> Vec<(u32, u32, Vec<u8>)> {
     SIZES.iter().filter_map(|size| frame(*size)).collect()
 }
 
-/// The launcher card at `size`: the wordmark-bearing artwork, for the desktop
-/// entry's icon file. Same nearest-size rule as [`frame`].
-pub fn card_frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    frame_from(CARD_PIXELS, size)
+/// The launcher card: the 256px wordmark-bearing artwork, for the desktop
+/// entry's icon file. `None` when the build baked no card, which is exactly
+/// when [`card_available`] is false.
+pub fn card_frame() -> Option<(u32, u32, Vec<u8>)> {
+    if CARD_PIXELS.is_empty() {
+        return None;
+    }
+    Some((CARD_SIDE, CARD_SIDE, CARD_PIXELS.to_vec()))
 }
 
-/// The brand mark as RGBA for one frame, or `None` when the build baked no
-/// icon (a checkout whose `.ico` was missing: the build script warns instead
-/// of failing, and callers fall back to the orb).
+/// The tray's brand mark as RGBA for one frame, or `None` when the build baked
+/// no tray icon (a checkout whose `mnvoice-tray.ico` was missing: the build
+/// script warns instead of failing, and callers fall back to the orb).
 pub fn frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    frame_from(PIXELS, size)
-}
-
-/// Cut one frame out of a concatenated store. Both stores are laid out the same
-/// way (same sizes, same order), so the slicing lives here once: a copy that
-/// drifted would hand the launcher a tray frame or vice versa.
-fn frame_from(store: &[u8], size: u32) -> Option<(u32, u32, Vec<u8>)> {
     let index = frame_index(size)?;
     let side = *SIZES.get(index)? as usize;
     let offset: usize = SIZES
@@ -77,16 +83,17 @@ fn frame_from(store: &[u8], size: u32) -> Option<(u32, u32, Vec<u8>)> {
         .take(index)
         .map(|s| (*s as usize) * (*s as usize) * 4)
         .sum();
-    let pixels = store.get(offset..offset + side * side * 4)?;
+    let pixels = PIXELS.get(offset..offset + side * side * 4)?;
     Some((side as u32, side as u32, pixels.to_vec()))
 }
 
-/// The nearest baked frame to `size`, preferring the larger one on a tie.
+/// The nearest baked tray frame to `size`, preferring the larger one on a tie.
 ///
-/// Nearest rather than "always the biggest" for the reason the ICO carries nine
-/// sizes: a panel asks for 16 or 22px, and handing it the 256px card makes the
-/// host resample a wordmark it cannot resolve. Nearest rather than "smallest
-/// that fits" so a 24px request does not get the 16px drawing blown up.
+/// Nearest rather than "always the biggest" so a 22px panel icon is handed the
+/// 24px drawing rather than the 256px one, which the host would scale down
+/// itself. Nearest rather than "smallest that fits" so a 24px request does not
+/// get the 16px drawing blown up. Every frame is mark-only, so whichever one is
+/// picked is the same drawing at its native resolution.
 fn frame_index(size: u32) -> Option<usize> {
     if SIZES.is_empty() {
         return None;
@@ -103,9 +110,13 @@ fn frame_index(size: u32) -> Option<usize> {
     Some(best)
 }
 
-/// Whether a build carries the brand mark at all.
-pub fn available() -> bool {
-    !SIZES.is_empty()
+/// Whether this build carries the launcher card, which is the only thing the
+/// desktop entry's `Icon=` line needs: naming a file this build cannot write
+/// would leave the desktop drawing its generic placeholder, which is worse
+/// than no `Icon=` at all. The tray's own fallback is keyed on
+/// [`all_frames`] instead, because the two stores are baked independently.
+pub fn card_available() -> bool {
+    !CARD_PIXELS.is_empty()
 }
 
 #[cfg(test)]
@@ -137,6 +148,13 @@ mod tests {
             assert_eq!((w, h), (*size, *size));
             assert_eq!(pixels.len(), (w * h * 4) as usize);
         }
+        // The card store is checked too. It is not sliced through SIZES, so a
+        // short card would otherwise pass every length assertion above.
+        assert_eq!(
+            CARD_PIXELS.len(),
+            (CARD_SIDE * CARD_SIDE * 4) as usize,
+            "the launcher card is not one whole 256px square"
+        );
     }
 
     /// A tray request lands on the nearest frame, and both ends of the range
@@ -193,15 +211,26 @@ mod tests {
     }
 
     /// The launcher card keeps the wordmark: at 256px it is legible, and it is
-    /// what tells a user which app an icon in the app grid belongs to.
+    /// what tells a user which app an icon in the app grid belongs to. Feeding
+    /// the mark-only drawing in its place fails this, which is the negative
+    /// control for the property the tray test pins.
     #[test]
     fn the_launcher_card_still_carries_the_wordmark() {
-        let (w, _, pixels) = card_frame(256).expect("the card resolves");
+        let (w, h, pixels) = card_frame().expect("the card resolves");
+        assert_eq!((w, h), (CARD_SIDE, CARD_SIDE));
         let dark = wordmark_ink(w, &pixels);
         assert!(
             dark > 200,
             "the 256px launcher card must keep legible wordmark ink, got {dark}"
         );
+    }
+
+    /// The `Icon=` gate and the file it points at are the same condition. A
+    /// gate that claimed availability the launcher PNG could not back would
+    /// name an icon the desktop cannot resolve.
+    #[test]
+    fn the_icon_gate_agrees_with_the_card_it_points_at() {
+        assert_eq!(card_available(), card_frame().is_some());
     }
 
     /// The mark must be visible: an all-transparent or all-one-colour frame
