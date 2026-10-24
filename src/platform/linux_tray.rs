@@ -449,9 +449,10 @@ mod tests {
             (24 * 24 * 4) as usize,
             "ARGB32, one word per pixel"
         );
-        // ksni wants A,R,G,B. The mark is drawn on a light card, so the tray
-        // frame must be mostly opaque - a fully transparent buffer would pass
-        // the length check and ship an invisible icon.
+        // The mark is drawn on a light card, so the tray frame must be mostly
+        // opaque - a fully transparent buffer would pass the length check and
+        // ship an invisible icon. The A,R,G,B layout these counts read is
+        // pinned byte for byte by every_served_frame_matches_the_size_it_declares.
         let opaque = icon.data.chunks(4).filter(|px| px[0] > 40).count();
         assert!(
             opaque > 300,
@@ -471,9 +472,9 @@ mod tests {
     }
 
     /// Every served frame is well-formed: its own declared size, a whole
-    /// number of pixels, and its first byte is alpha (a pixmap that put alpha
-    /// last would render as noise in every host). Serving the set is what lets
-    /// a HiDPI panel pick 48px instead of upscaling 24px.
+    /// number of pixels, and every pixel in A,R,G,B order - a pixmap that put
+    /// alpha last would render as noise in every host. Serving the set is what
+    /// lets a HiDPI panel pick 48px instead of upscaling 24px.
     #[test]
     fn every_served_frame_matches_the_size_it_declares() {
         let (t, _) = tray(PHASE_RECORDING);
@@ -483,6 +484,15 @@ mod tests {
         for (icon, expected) in pixmap.iter().zip(sizes) {
             assert_eq!(icon.width as u32, expected, "{expected}px frame");
             assert_eq!(icon.data.len(), (expected * expected * 4) as usize);
+            let (_, _, rgba) =
+                crate::platform::linux_icon::frame(expected).expect("the baked frame resolves");
+            for (served, source) in icon.data.chunks(4).zip(rgba.chunks(4)) {
+                assert_eq!(
+                    served,
+                    [source[3], source[0], source[1], source[2]].as_slice(),
+                    "{expected}px pixel is not A,R,G,B"
+                );
+            }
             // The largest frame is the full card: a host that picks it gets the
             // wordmark, and it must still be opaque enough to see.
             if expected == 256 {

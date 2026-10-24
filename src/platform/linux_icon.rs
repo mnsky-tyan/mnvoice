@@ -27,7 +27,7 @@
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
 // as-is and the host is expected to draw it like the Windows tray does.
 
-/// Frame sizes, largest last, as baked from `assets/mnvoice.ico`.
+/// Frame sizes, smallest first, as baked from `assets/mnvoice.ico`.
 pub const SIZES: &[u32] = include!(concat!(env!("OUT_DIR"), "/brand_icon_sizes.rs"));
 
 /// Every frame's straight (non-premultiplied) RGBA pixels, concatenated in the
