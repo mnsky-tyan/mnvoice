@@ -566,7 +566,9 @@ fn claim_single_instance(restarting: bool) -> Option<std::fs::File> {
 ///     xdg-desktop-portal).
 ///
 /// Both carry the same id, `mnvoice`; a different name on either side silently
-/// breaks the hotkey. An existing file is left alone.
+/// breaks the hotkey. An existing file is left alone, and the icon it names is
+/// written separately (see `ensure_icon`) because a launcher whose `Icon=` does
+/// not resolve falls back to a generic placeholder rather than to the orb.
 pub fn ensure_autostart() {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -575,9 +577,17 @@ pub fn ensure_autostart() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "mnvoice".into());
+    // The icon line is conditional on the mark actually being baked in: naming
+    // a file this build cannot write would be worse than no Icon= at all, since
+    // the desktop then draws its generic application placeholder.
+    let icon = if crate::platform::linux_icon::available() {
+        "Icon=mnvoice\n"
+    } else {
+        ""
+    };
     let contents = format!(
         "[Desktop Entry]\nType=Application\nName=mnvoice\nComment=Push-to-talk dictation\n\
-         Exec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+         Exec={}\n{icon}Terminal=false\nX-GNOME-Autostart-enabled=true\n",
         exe
     );
     let targets = [
@@ -588,6 +598,12 @@ pub fn ensure_autostart() {
     ];
     for path in targets {
         if path.exists() {
+            // An entry written by an older build predates `Icon=`, and leaving
+            // it alone would leave the launcher showing the desktop's generic
+            // placeholder forever. Only that one line is added - every other
+            // line is the user's (they may have edited Exec or the comment),
+            // so this is not a rewrite.
+            add_missing_icon_line(&path, icon);
             continue;
         }
         if let Some(parent) = path.parent() {
@@ -597,6 +613,144 @@ pub fn ensure_autostart() {
         }
         let _ = std::fs::write(&path, &contents);
     }
+    ensure_icon();
+}
+
+/// Adds `Icon=mnvoice` to an existing entry that lacks it, leaving every other
+/// line exactly as it was.
+///
+/// Rewriting the whole file would discard edits the user made (a different
+/// `Exec`, a renamed entry), and `ensure_autostart`'s contract is that an
+/// existing file is the user's. Appending one missing key is the smallest edit
+/// that makes the launcher show the right icon, and it is skipped when the
+/// build carries no icon to point at.
+fn add_missing_icon_line(path: &std::path::Path, icon: &str) {
+    if icon.is_empty() {
+        return;
+    }
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if existing.lines().any(|line| line.starts_with("Icon=")) {
+        return;
+    }
+    // A missing trailing newline would otherwise glue the new key onto the
+    // last line and silently corrupt it.
+    let mut updated = existing.clone();
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(icon);
+    let _ = std::fs::write(path, updated);
+}
+
+/// Writes the brand mark where the desktop's icon lookup finds `Icon=mnvoice`.
+///
+/// The size is 256px: the largest baked frame, which is what a launcher grid,
+/// a task switcher and a dock all scale down from. A smaller file would be
+/// visibly soft in the launcher, and the whole point of the ICO's responsive set
+/// is that the panel gets a drawing made for the panel - this file is the
+/// launcher's copy, so it wants resolution, not the mark-only variant.
+///
+/// Best effort by design: an icon is not worth failing a startup over, and a
+/// read-only home is a legitimate state (a live session, a test run).
+fn ensure_icon() {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let Some((width, height, rgba)) = crate::platform::linux_icon::frame(256) else {
+        return;
+    };
+    let Some(dir) = std::path::Path::new(&home)
+        .join(".local/share/icons/hicolor/256x256/apps")
+        .to_str()
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = std::path::Path::new(&dir).join("mnvoice.png");
+    // Rewritten on every start, unlike the desktop entry: the icon is a build
+    // artifact of the binary that is running, so an updated build must not keep
+    // the previous release's artwork on disk. It is a single 256px PNG, so the
+    // write is cheap, and a torn write is prevented by writing beside it first.
+    if let Some(png) = encode_png(width, height, &rgba) {
+        let staging = path.with_extension("png.tmp");
+        if std::fs::write(&staging, png).is_ok() {
+            let _ = std::fs::rename(&staging, &path);
+        }
+    }
+}
+
+/// Encodes straight RGBA as a PNG. Hand-rolled rather than pulling an image
+/// crate into the app: every row here is a fixed filter byte plus raw pixels,
+/// the image is a single square, and the deflate stream can be stored
+/// (uncompressed) blocks - which keeps this dependency-free and obviously
+/// correct. The file is ~256 KB, which is a one-off cost on a launcher icon and
+/// never read by mnvoice itself.
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    // Filter type 0 (None) per scanline, then one zlib stream over the lot.
+    let mut raw = Vec::with_capacity(rgba.len() + height as usize);
+    for row in rgba.chunks_exact((width as usize) * 4) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    let mut zlib = vec![0x78, 0x01]; // deflate, 32K window, no preset dictionary
+    for (index, chunk) in raw.chunks(65_535).enumerate() {
+        let last = (index + 1) * 65_535 >= raw.len();
+        zlib.push(u8::from(last)); // stored block, byte-aligned
+        let len = chunk.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(chunk);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut chunk = |kind: &[u8; 4], body: &[u8]| {
+        png.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        png.extend_from_slice(kind);
+        png.extend_from_slice(body);
+        let mut crc_input = kind.to_vec();
+        crc_input.extend_from_slice(body);
+        png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    };
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &zlib);
+    chunk(b"IEND", &[]);
+    Some(png)
+}
+
+/// The zlib checksum over the uncompressed scanlines.
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in data {
+        a = (a + *byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+/// The PNG chunk checksum.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in data {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]
@@ -610,6 +764,57 @@ mod tests {
         // the branch is where one of them stops working.
         assert_eq!(AppEvent::from_hotkey(HotkeyEvent::Toggle), AppEvent::Toggle);
         assert_eq!(AppEvent::from_hotkey(HotkeyEvent::Cancel), AppEvent::Cancel);
+    }
+
+    /// An entry written by a build that predates `Icon=` must gain the line
+    /// without losing the lines the user owns. This is the upgrade path every
+    /// existing install takes, and a rewrite would silently discard an edited
+    /// `Exec` or a renamed entry.
+    #[test]
+    fn an_older_desktop_entry_gains_the_icon_and_keeps_its_own_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "mnvoice-entry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("mnvoice.desktop");
+        // Deliberately no trailing newline, and a user-edited Exec.
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=mnvoice\nExec=/opt/custom/mnvoice",
+        )
+        .expect("write");
+
+        add_missing_icon_line(&path, "Icon=mnvoice\n");
+
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("Icon=mnvoice"),
+            "the icon line is added: {after:?}"
+        );
+        assert!(
+            after.contains("Exec=/opt/custom/mnvoice"),
+            "the user's own Exec survives: {after:?}"
+        );
+        assert!(
+            !after.contains("mnvoice.desktopIcon"),
+            "the key is not glued onto a line that lacked a newline: {after:?}"
+        );
+
+        // Idempotent: a second pass changes nothing.
+        add_missing_icon_line(&path, "Icon=mnvoice\n");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), after);
+
+        // A build with no baked icon leaves the file untouched.
+        std::fs::write(&path, "[Desktop Entry]\nType=Application\n").expect("write");
+        add_missing_icon_line(&path, "");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "[Desktop Entry]\nType=Application\n",
+            "no icon to point at means no edit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

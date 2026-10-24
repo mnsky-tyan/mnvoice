@@ -43,6 +43,9 @@ pub mod unix_http;
 pub mod linux_impl;
 
 #[cfg(target_os = "linux")]
+pub mod linux_icon;
+
+#[cfg(target_os = "linux")]
 pub mod linux_orb;
 
 #[cfg(target_os = "linux")]

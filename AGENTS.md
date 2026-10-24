@@ -7,15 +7,15 @@ and direct keyboard event injection.
 ## Critical Test & Running Instance Rules
 
 1. **NEVER KILL THE RUNNING `mnvoice.exe` PROCESS**:
-   - The user runs a live `mnvoice.exe` instance continuously on this machine (`C:\Users\tyanw\bin\mnvoice.exe`).
+   - The user runs a live `mnvoice.exe` instance continuously on this machine (the user's installed `mnvoice.exe`).
    - It holds a single-instance named mutex (`mnvoice-single-instance`, session-local; see `MUTEX_NAME` in `src/windows_app.rs`).
    - Automated tests and test-step agents MUST NEVER kill, terminate, or replace any running `mnvoice.exe` process.
-   - Do NOT touch or overwrite `C:\Users\tyanw\bin\mnvoice.exe` during tests or reviews (only during explicit release/update deployment).
+   - Do NOT touch or overwrite the user's installed `mnvoice.exe` during tests or reviews (only during explicit release/update deployment).
 
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (141 tests, ~6 s), is what an agent must run before
+     whole crate natively (146 tests, ~6 s), is what an agent must run before
      every commit, and is the gate's own test command (`.no-mistakes.yaml`
      `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
@@ -60,7 +60,7 @@ and direct keyboard event injection.
    - Verify success by re-reading `Get-Process mnvoice` for the new version, and confirm the
      installed exe's `sha256sum` matches the published `mnvoice.exe` checksum.
    - WSL `/tmp` is not visible to `powershell.exe -File`; copy helpers under
-     `C:\Users\tyanw\AppData\Local\Temp\` (reachable as `/mnt/c/Users/tyanw/AppData/Local/Temp/`)
+     a Windows temp directory (reachable from WSL through the mount)
      and delete them afterwards.
    - A green no-mistakes lint/test step describes the head it ran against, which may
      precede later fix commits. After a gate run finishes, re-run
@@ -262,7 +262,7 @@ and direct keyboard event injection.
      including the agent session and herdr's panes.
    - **The 2026-10-17 interop recovery did not last (re-measured 2026-10-21).**
      It was per-launch-shape - direct `.exe` invocation over the mount worked
-     again (`/mnt/c/Users/tyanw/.cargo/bin/cargo.exe`, `tasklist.exe`,
+     again (a `cargo.exe` under the Windows user profile, `tasklist.exe`,
      `taskkill.exe`) while `cmd.exe /c echo` still returned `Permission
      denied` - so the diagnostic above must not be read as "the whole mount is
      down": test the shape you actually need, and do not use a dead `cmd.exe`
@@ -276,7 +276,7 @@ and direct keyboard event injection.
      processes and free the hotkey, so it terminates the user's running app -
      and because the built binary then becomes the one that launches, the live
      session is left running an unreleased build from the target dir instead of
-     `C:\Users\tyanw\bin\mnvoice.exe`. Verified 2026-10-14: a probe of a temp
+     the user's installed `mnvoice.exe`. Verified 2026-10-14: a probe of a temp
      release build killed the live instance (PID 17272) and replaced it with the
      temp binary; recovery was stopping that PID and relaunching the installed
      exe. To smoke-test a build, start it from a directory with no env file and
@@ -325,6 +325,17 @@ and direct keyboard event injection.
      `cfg(windows)` dev-dependency so the Windows test build can compute
      `Sec-WebSocket-Accept` with `derive_accept_key` instead of ~95 lines of
      hand-rolled SHA-1/base64. The release binary is unchanged (dev-only).
+   - **One icon file serves both platforms; on Linux it is baked in at build
+     time.** `assets/mnvoice.ico` is the only brand asset: winres embeds it in
+     the exe, and the Linux build script decodes its PNG frames into `OUT_DIR`
+     so `platform::linux_icon` can serve the tray's `IconPixmap` and write the
+     launcher PNG the desktop entry names with `Icon=mnvoice`. Before this, the
+     Linux tray painted the orb from `orb_render` and the entry had no `Icon=`
+     at all, so the brand mark appeared nowhere on a Linux desktop - the orb is
+     a live status indicator, not the product icon. Pixels travel through
+     `OUT_DIR` files, not `cargo:rustc-env`: a 256KB env var overflowed rustc's
+     command line ("Argument list too long", measured). A checkout whose `.ico`
+     is missing warns and falls back to the orb instead of failing the build.
    - **The exe/tray icon is generated artwork, not a hand-editable asset.**
      `assets/mnvoice.ico` is built from the mn-brand master
      `~/mnsky/mn-brand/icons/mnvoice.svg` with librsvg (the brand renderer,
@@ -375,6 +386,7 @@ mnvoice/
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from orb_render
+│       ├── linux_icon.rs  the brand mark on Linux: ICO frames baked by build.rs, tray pixmap + launcher PNG
 │       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)

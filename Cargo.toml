@@ -17,6 +17,7 @@ CompanyName = "mnvoice"
 LegalCopyright = "MIT License"
 
 [build-dependencies]
+png = "0.17"
 winres = "0.1"
 
 [dependencies]
