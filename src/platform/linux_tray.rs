@@ -413,7 +413,6 @@ mod tests {
     #[test]
     fn a_row_and_the_command_it_sends_are_the_same_pair() {
         // The defect this prevents is the menu being edited so the label says
-        // The defect this prevents is the menu being edited so the label says
         // one thing and the click sends another: `label` and `event` are the
         // one place each is named, and this walks the menu comparing what the
         // label produced to what the callback delivered.

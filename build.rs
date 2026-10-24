@@ -168,7 +168,8 @@ fn main() {
 /// one place then owns the directory parse, the PNG-frame refusal and the
 /// RGBA8 check, and a card frame is validated exactly as strictly as a tray
 /// frame is. The slice cannot run off the buffer because that function
-/// returns a buffer that is exactly the sum of the squares it names.
+/// refuses a non-square frame and then returns a buffer that is exactly the
+/// sum of the squares it names.
 fn extract_card_frame(path: &str) -> Result<Vec<u8>, String> {
     let (sizes, pixels) = bake_brand_frames(path)?;
     let index = sizes
@@ -252,6 +253,13 @@ fn bake_brand_frames(path: &str) -> Result<(Vec<usize>, Vec<u8>), String> {
                 "{width}x{height} frame is {:?}/{:?}, expected RGBA8",
                 info.color_type, info.bit_depth
             ));
+        }
+        // Every consumer slices these pixels with a square-side calculation,
+        // so a non-square frame would shift every offset after it and hand a
+        // caller the wrong bytes with no error. Refused here, where the shape
+        // is known, rather than after a caller has already been mis-sliced.
+        if width != height {
+            return Err(format!("{width}x{height} frame is not square"));
         }
         let mut buf = vec![0u8; decoded.output_buffer_size()];
         let info = decoded

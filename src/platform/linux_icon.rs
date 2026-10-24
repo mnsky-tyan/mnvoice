@@ -22,11 +22,13 @@
 // `Icon=` and leaves the tray's mark alone - which is why each store carries
 // its own availability check below rather than one shared one.
 //
-// The tray keeps its responsive set. All nine frames of the tray ICO are baked
-// and served, and `frame_index` picks the nearest, so a 22px panel icon gets
-// the 24px drawing instead of a host upscale of the 256px mark. The card side
-// carries one frame, because the launcher PNG is written at exactly one size
-// (`hicolor/256x256/apps`).
+// The tray keeps its responsive set: all nine frames of the tray ICO are baked
+// and served together, so the host - not us - picks the one matching the size
+// it actually draws at, and a 22px panel icon gets the 24px drawing instead of
+// a host upscale of the 256px mark. `frame_index` exists only for the single
+// frame a caller asks for by size, which in production is the card. The card
+// side carries one frame, because the launcher PNG is written at exactly one
+// size (`hicolor/256x256/apps`).
 //
 // The colours are not recoloured. A StatusNotifierItem host may ask for
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
@@ -66,7 +68,7 @@ pub fn all_frames() -> Vec<(u32, u32, Vec<u8>)> {
 /// entry's icon file. `None` when the build baked no card, which is exactly
 /// when [`card_available`] is false.
 pub fn card_frame() -> Option<(u32, u32, Vec<u8>)> {
-    if CARD_PIXELS.is_empty() {
+    if !card_available() {
         return None;
     }
     Some((CARD_SIDE, CARD_SIDE, CARD_PIXELS.to_vec()))
@@ -116,7 +118,12 @@ fn frame_index(size: u32) -> Option<usize> {
 /// than no `Icon=` at all. The tray's own fallback is keyed on
 /// [`all_frames`] instead, because the two stores are baked independently.
 pub fn card_available() -> bool {
-    !CARD_PIXELS.is_empty()
+    // Not a bare emptiness test: the store must be the whole square
+    // `card_frame` is about to label it as. Otherwise a store of the wrong
+    // length passes here, `ensure_autostart` writes `Icon=mnvoice`, and
+    // `ensure_icon`'s encoder then returns `None` on its own length check -
+    // a desktop entry naming an icon file that was never written.
+    CARD_PIXELS.len() == CARD_SIDE as usize * CARD_SIDE as usize * 4
 }
 
 #[cfg(test)]

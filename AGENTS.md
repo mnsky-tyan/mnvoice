@@ -331,10 +331,10 @@ and direct keyboard event injection.
      decodes its 256px frame into `OUT_DIR` so `platform::linux_icon` writes the
      launcher PNG the desktop entry names with `Icon=mnvoice`), and
      `assets/mnvoice-tray.ico` is the tray's mark-only set, baked as its nine
-     frames for the tray's `IconPixmap`. Before the second file the Linux tray
-     painted the orb from `orb_render` and the entry had no `Icon=` at all, so
-     the brand mark appeared nowhere on a Linux desktop - the orb is a live
-     status indicator, not the product icon.
+     frames for the tray's `IconPixmap`. Before the brand mark was baked in at
+     all the Linux tray painted the orb from `orb_render` and the entry had no
+     `Icon=`, so the brand mark appeared nowhere on a Linux desktop - the orb
+     is a live status indicator, not the product icon.
      There is a second asset for a measured reason: `assets/mnvoice-tray.ico`
      is mark-only at EVERY size (wordmark dropped, 16..256), and the tray is
      baked from it, while `assets/mnvoice.ico` keeps the wordmark card at
@@ -383,7 +383,7 @@ and direct keyboard event injection.
 mnvoice/
 ├── AGENTS.md              this file: test rules, release discipline, repo wiki
 ├── Cargo.toml             deps: windows (Win32), cpal+enigo (Unix), ashpd+wayland (Linux desktop)
-├── build.rs               winres: bakes the version resource + icon into mnvoice.exe
+├── build.rs               winres for the exe version+icon; on Linux decodes both brand .ico files into OUT_DIR
 ├── assets/                brand artwork: mnvoice.ico (exe resource + launcher card), mnvoice-tray.ico (tray, mark-only), the 2 source SVGs, orb-512.png
 ├── src/
 │   ├── main.rs            entry: Windows -> windows_app; Linux -> linux_app (or --terminal); macOS -> cli
