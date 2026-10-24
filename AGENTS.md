@@ -15,7 +15,7 @@ and direct keyboard event injection.
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (150 tests, ~6 s), is what an agent must run before
+     whole crate natively (151 tests, ~6 s), is what an agent must run before
      every commit, and is the gate's own test command (`.no-mistakes.yaml`
      `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
