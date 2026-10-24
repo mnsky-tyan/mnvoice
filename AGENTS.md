@@ -353,13 +353,14 @@ and direct keyboard event injection.
      never by downscaling one render, which would blur the small frames.
      Pixels travel through `OUT_DIR` files, not `cargo:rustc-env`: a 256KB env
      var overflowed rustc's command line ("Argument list too long", measured).
-     A checkout whose `.ico` is missing warns and falls back to the orb
-     instead of failing the build.
+     A checkout with a missing `.ico` warns per file instead of failing the
+     build: a missing `mnvoice-tray.ico` leaves the tray on the orb fallback,
+     a missing `mnvoice.ico` leaves the entry without an `Icon=` line.
    - **The exe and tray icons are generated artwork, not a hand-editable asset.**
      `assets/mnvoice.ico` is built from the mn-brand master
      `~/mnsky/mnbrand/icons/mnvoice.svg` with librsvg (the brand renderer,
      `~/mnsky/mnbrand/svg_render.py`), never from a screenshot or an upscale. The two
-     source SVGs next to it record exactly what the ICO contains:
+     source SVGs next to it record exactly what the two ICOs contain:
      `mnvoice-icon.svg` is the master minus the full-square page background
      (transparent corners, so the card floats), and `mnvoice-mark.svg` is that
      plus the wordmark paths dropped and the remaining artwork scaled 1.15x
@@ -383,6 +384,7 @@ mnvoice/
 ├── AGENTS.md              this file: test rules, release discipline, repo wiki
 ├── Cargo.toml             deps: windows (Win32), cpal+enigo (Unix), ashpd+wayland (Linux desktop)
 ├── build.rs               winres: bakes the version resource + icon into mnvoice.exe
+├── assets/                brand artwork: mnvoice.ico (exe resource + launcher card), mnvoice-tray.ico (tray, mark-only), the 2 source SVGs, orb-512.png
 ├── src/
 │   ├── main.rs            entry: Windows -> windows_app; Linux -> linux_app (or --terminal); macOS -> cli
 │   ├── windows_app.rs     the Windows tray app: window, tray, hotkey, message loop (2,982 lines)

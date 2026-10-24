@@ -82,7 +82,11 @@ fn main() {
         // two results carry different payloads, and "some icon failed"
         // without naming the file is not actionable.
         for (path, result, note) in [
-            (tray_icon, tray.as_ref().err(), "the tray falls back to the orb"),
+            (
+                tray_icon,
+                tray.as_ref().err(),
+                "the tray falls back to the orb",
+            ),
             (
                 app_icon,
                 app.as_ref().err(),

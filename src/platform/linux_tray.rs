@@ -187,8 +187,8 @@ impl Tray for MnvoiceTray {
         // reported blur.
         let frames = crate::platform::linux_icon::all_frames();
         if frames.is_empty() {
-            // No baked brand mark (a checkout whose .ico was missing - the
-            // build script warns and continues): the orb is still a better
+            // No baked brand mark (a checkout whose tray `.ico` was missing -
+            // the build script warns and continues): the orb is still a better
             // tray icon than nothing, so the app keeps identifying itself.
             return orb_pixmap((self.phase)(), self.frame, self.color, self.fluid_level);
         }

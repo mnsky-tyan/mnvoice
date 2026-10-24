@@ -123,7 +123,7 @@ pub fn card_available() -> bool {
 mod tests {
     use super::*;
 
-    /// The baked set is the ICO's documented nine sizes. A build that lost
+    /// The baked set is the tray ICO's documented nine sizes. A build that lost
     /// frames would still serve *an* icon, which is why the count is pinned.
     #[test]
     fn the_baked_set_has_the_nine_documented_sizes() {
@@ -196,7 +196,7 @@ mod tests {
     /// the ~94 device px box Plasma's status popup draws at is unreadable - the
     /// reported blurry tray icon was exactly that: the panel picked the 128px
     /// wordmark card and squeezed "mnvoice" into a smudge. This test pins the
-    /// property that fixes it, at the sizes large enough for a card to fit.
+    /// property that fixes it, at every size the set serves.
     #[test]
     fn no_tray_frame_carries_the_wordmark() {
         for size in SIZES {
