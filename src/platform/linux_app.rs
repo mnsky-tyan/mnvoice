@@ -693,7 +693,7 @@ fn ensure_icon() {
     let Ok(home) = std::env::var("HOME") else {
         return;
     };
-    let Some((width, height, rgba)) = crate::platform::linux_icon::frame(256) else {
+    let Some((width, height, rgba)) = crate::platform::linux_icon::card_frame(256) else {
         return;
     };
     let Some(dir) = std::path::Path::new(&home)

@@ -44,12 +44,30 @@ fn main() {
     // Only the Linux build pays for this: macOS has no tray icon and Windows
     // gets its icon from winres above.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
-        const ICON: &str = "assets/mnvoice.ico";
+        // Two files, because the two surfaces need different artwork at the
+        // same size. Both are mark-only/card renders of the same brand source,
+        // and the split exists for a measured reason:
+        //
+        // `assets/mnvoice-tray.ico` draws the MARK ALONE at every size. The tray
+        // is displayed small - Plasma's status popup drew it at ~94 device px
+        // (a 47px logical icon) - and a wordmark rendered into a 94px box is
+        // unreadable mush. Serving the wordmark card at tray sizes was the
+        // reported "blurry" icon: the panel picked the 128px frame and squeezed
+        // "mnvoice" into a smudge. Mark-only stays crisp at every size.
+        //
+        // `assets/mnvoice.ico` carries the full card WITH the wordmark at 64px
+        // and above, and mark-only below. That is right for the launcher, where
+        // the icon is drawn at 256px and the wordmark is legible - the icon a
+        // user reads the app name from in the dock or app grid.
+        let tray_icon = "assets/mnvoice-tray.ico";
+        let app_icon = "assets/mnvoice.ico";
         let out = std::path::PathBuf::from(
             std::env::var("OUT_DIR").expect("OUT_DIR is always set for a build script"),
         );
-        match bake_brand_frames(ICON) {
-            Ok((sizes, pixels)) => {
+        match bake_brand_frames(tray_icon)
+            .and_then(|tray| bake_brand_frames(app_icon).map(|app| (tray, app)))
+        {
+            Ok(((sizes, pixels), (_, app_pixels))) => {
                 // The pixels travel as a file in OUT_DIR, not as an env var:
                 // `cargo:rustc-env` lands on rustc's command line, and a few
                 // hundred kilobytes of comma-separated bytes overflowed it
@@ -70,6 +88,9 @@ fn main() {
                 );
                 std::fs::write(out.join("brand_icon_sizes.rs"), sizes_rs)
                     .expect("write the baked brand sizes");
+                // The launcher card, same sizes, wordmark included at 64px+.
+                std::fs::write(out.join("brand_card.rgba"), &app_pixels)
+                    .expect("write the baked launcher card");
             }
             // A brand icon that cannot be read must not turn into a build
             // failure: the app still dictates without it. Saying so loudly is
@@ -81,16 +102,18 @@ fn main() {
             // silently ship the wrong artwork.
             Err(e) => {
                 println!(
-                    "cargo:warning=no brand icon baked in ({ICON}: {e}); the tray \
-                     falls back to the orb and the desktop entry gets no Icon="
+                    "cargo:warning=no brand icon baked in ({tray_icon} / {app_icon}: {e}); \
+                     the tray falls back to the orb and the desktop entry gets no Icon="
                 );
-                std::fs::write(out.join("brand_icon.rgba"), b"")
-                    .expect("write the empty brand pixels");
+                for name in ["brand_icon.rgba", "brand_card.rgba"] {
+                    std::fs::write(out.join(name), b"").expect("write the empty brand pixels");
+                }
                 std::fs::write(out.join("brand_icon_sizes.rs"), "&[]")
                     .expect("write the empty brand sizes");
             }
         }
-        println!("cargo:rerun-if-changed={ICON}");
+        println!("cargo:rerun-if-changed={tray_icon}");
+        println!("cargo:rerun-if-changed={app_icon}");
     }
 
     // The release tag is the source of truth for the app version, and it is

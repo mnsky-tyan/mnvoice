@@ -27,12 +27,19 @@
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
 // as-is and the host is expected to draw it like the Windows tray does.
 
-/// Frame sizes, smallest first, as baked from `assets/mnvoice.ico`.
+/// Frame sizes, smallest first, as baked from `assets/mnvoice-tray.ico`
+/// (`assets/mnvoice.ico` carries the same nine sizes).
 pub const SIZES: &[u32] = include!(concat!(env!("OUT_DIR"), "/brand_icon_sizes.rs"));
 
-/// Every frame's straight (non-premultiplied) RGBA pixels, concatenated in the
-/// same order as [`SIZES`].
+/// Every tray frame's straight (non-premultiplied) RGBA pixels, concatenated
+/// in the same order as [`SIZES`]. Mark-only: no wordmark, so it stays legible
+/// at the small sizes a panel and its status popup draw.
 const PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_icon.rgba"));
+
+/// The launcher card's pixels, same sizes and order, with the wordmark
+/// included from 64px up. Used for the desktop entry's PNG, where the icon is
+/// drawn large enough for the wordmark to read.
+const CARD_PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_card.rgba"));
 
 /// Every baked frame, in the size order [`SIZES`] names (smallest first).
 ///
@@ -46,19 +53,31 @@ pub fn all_frames() -> Vec<(u32, u32, Vec<u8>)> {
     SIZES.iter().filter_map(|size| frame(*size)).collect()
 }
 
+/// The launcher card at `size`: the wordmark-bearing artwork, for the desktop
+/// entry's icon file. Same nearest-size rule as [`frame`].
+pub fn card_frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    frame_from(CARD_PIXELS, size)
+}
+
 /// The brand mark as RGBA for one frame, or `None` when the build baked no
 /// icon (a checkout whose `.ico` was missing: the build script warns instead
 /// of failing, and callers fall back to the orb).
 pub fn frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    frame_from(PIXELS, size)
+}
+
+/// Cut one frame out of a concatenated store. Both stores are laid out the same
+/// way (same sizes, same order), so the slicing lives here once: a copy that
+/// drifted would hand the launcher a tray frame or vice versa.
+fn frame_from(store: &[u8], size: u32) -> Option<(u32, u32, Vec<u8>)> {
     let index = frame_index(size)?;
-    let offset = SIZES
+    let side = *SIZES.get(index)? as usize;
+    let offset: usize = SIZES
         .iter()
         .take(index)
         .map(|s| (*s as usize) * (*s as usize) * 4)
-        .sum::<usize>();
-    let side = SIZES[index] as usize;
-    let end = offset + side * side * 4;
-    let pixels = PIXELS.get(offset..end)?;
+        .sum();
+    let pixels = store.get(offset..offset + side * side * 4)?;
     Some((side as u32, side as u32, pixels.to_vec()))
 }
 
@@ -130,6 +149,59 @@ mod tests {
         assert_eq!(frame_index(1000), Some(8), "above the largest clamps down");
         let (w, _, _) = frame(22).expect("resolves");
         assert_eq!(w, 24, "the 24px drawing, not the 16px one upscaled");
+    }
+
+    /// Dark, opaque pixels in the band the wordmark occupies on a card: the
+    /// lower-centre. Zero for mark-only artwork, plenty for a card.
+    fn wordmark_ink(width: u32, pixels: &[u8]) -> usize {
+        let w = width as usize;
+        let (top, bottom) = (w * 62 / 100, w * 82 / 100);
+        let (left, right) = (w * 25 / 100, w * 78 / 100);
+        let mut dark = 0;
+        for y in top..bottom {
+            for x in left..right {
+                let i = (y * w + x) * 4;
+                // Ink is dark and opaque; the card's own background is pale.
+                if pixels[i + 3] > 128
+                    && pixels[i] < 150
+                    && pixels[i + 1] < 150
+                    && pixels[i + 2] < 150
+                {
+                    dark += 1;
+                }
+            }
+        }
+        dark
+    }
+
+    /// The tray set must be MARK-ONLY at every size. A wordmark rendered into
+    /// the ~94 device px box Plasma's status popup draws at is unreadable - the
+    /// reported blurry tray icon was exactly that: the panel picked the 128px
+    /// wordmark card and squeezed "mnvoice" into a smudge. This test pins the
+    /// property that fixes it, at the sizes large enough for a card to fit.
+    #[test]
+    fn no_tray_frame_carries_the_wordmark() {
+        for size in SIZES {
+            let (w, _, pixels) = frame(*size).expect("frame resolves");
+            let dark = wordmark_ink(w, &pixels);
+            assert!(
+                dark < 4,
+                "the {size}px tray frame carries wordmark ink ({dark} dark px in the \
+                 lower band); the tray must be mark-only"
+            );
+        }
+    }
+
+    /// The launcher card keeps the wordmark: at 256px it is legible, and it is
+    /// what tells a user which app an icon in the app grid belongs to.
+    #[test]
+    fn the_launcher_card_still_carries_the_wordmark() {
+        let (w, _, pixels) = card_frame(256).expect("the card resolves");
+        let dark = wordmark_ink(w, &pixels);
+        assert!(
+            dark > 200,
+            "the 256px launcher card must keep legible wordmark ink, got {dark}"
+        );
     }
 
     /// The mark must be visible: an all-transparent or all-one-colour frame
