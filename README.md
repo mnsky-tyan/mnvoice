@@ -495,9 +495,12 @@ GlobalShortcuts portal; typing goes through the RemoteDesktop portal.
   (`~/.local/share/applications/mnvoice.desktop`, which the GlobalShortcuts
   portal reads the app id from) and the logon task
   (`~/.config/autostart/mnvoice.desktop`), so the app is running by the time
-  you sit down, the same way the Windows logon task works. The compositor
-  shows one confirmation dialog for the hotkey binding and one for keyboard
-  access on the first dictation; both grants persist.
+  you sit down, the same way the Windows logon task works. Both entries name the
+  launcher icon with `Icon=mnvoice`, and the icon they name is written to
+  `~/.local/share/icons/hicolor/256x256/apps/mnvoice.png` (refreshed on each
+  start), so the app is identified by its brand mark rather than a generic
+  placeholder. The compositor shows one confirmation dialog for the hotkey
+  binding and one for keyboard access on the first dictation; both grants persist.
 
 Known limits in this release, stated rather than papered over:
 

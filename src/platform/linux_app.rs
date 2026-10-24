@@ -9,10 +9,10 @@
 // transport, word typing - is the same seam code the CLI and the Windows tray
 // share.
 //
-// What this module does NOT have yet, stated rather than papered over: a tray
-// icon (the StatusNotifierItem surface) and the self-updater. Both are
-// Windows-only in this release; the hotkey, the orb and the typing are the
-// interaction model, and they are what this module delivers.
+// What this module does NOT have yet, stated rather than papered over: the
+// self-updater. It is Windows-only in this release; the hotkey, the tray, the
+// orb and the typing are the interaction model, and they are what this module
+// delivers.
 
 use crate::config;
 use crate::platform::linux_portal::HotkeyEvent;

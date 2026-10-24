@@ -19,7 +19,7 @@
 //
 // The responsive set is preserved. The ICO carries a mark-only drawing at tray
 // sizes and the full card with the wordmark at large sizes; both are kept and
-// `frame_for` picks the nearest one, exactly as Windows does at the same
+// `frame_index` picks the nearest one, exactly as Windows does at the same
 // sizes. A single downscaled 256px card would put an illegible wordmark in the
 // panel.
 //
