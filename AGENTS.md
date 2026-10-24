@@ -325,8 +325,16 @@ and direct keyboard event injection.
      `cfg(windows)` dev-dependency so the Windows test build can compute
      `Sec-WebSocket-Accept` with `derive_accept_key` instead of ~95 lines of
      hand-rolled SHA-1/base64. The release binary is unchanged (dev-only).
-   - **One icon file serves both platforms; on Linux it is baked in at build
-     time - and the tray gets a second, wordmark-free file.**
+   - **Two icon files serve the two platforms' surfaces; on Linux both are
+     baked in at build time.** `assets/mnvoice.ico` is the exe resource and the
+     launcher artwork (winres embeds it in the exe; the Linux build script
+     decodes its 256px frame into `OUT_DIR` so `platform::linux_icon` writes the
+     launcher PNG the desktop entry names with `Icon=mnvoice`), and
+     `assets/mnvoice-tray.ico` is the tray's mark-only set, baked as its nine
+     frames for the tray's `IconPixmap`. Before the second file the Linux tray
+     painted the orb from `orb_render` and the entry had no `Icon=` at all, so
+     the brand mark appeared nowhere on a Linux desktop - the orb is a live
+     status indicator, not the product icon.
      There is a second asset for a measured reason: `assets/mnvoice-tray.ico`
      is mark-only at EVERY size (wordmark dropped, 16..256), and the tray is
      baked from it, while `assets/mnvoice.ico` keeps the wordmark card at
@@ -343,7 +351,11 @@ and direct keyboard event injection.
      `mnvoice-mark.svg` natively at each of the nine sizes, then pack those
      PNGs into a PNG-compressed ICO (one directory entry per size, 32 bpp) -
      never by downscaling one render, which would blur the small frames.
-   - **The exe/tray icon is generated artwork, not a hand-editable asset.**
+     Pixels travel through `OUT_DIR` files, not `cargo:rustc-env`: a 256KB env
+     var overflowed rustc's command line ("Argument list too long", measured).
+     A checkout whose `.ico` is missing warns and falls back to the orb
+     instead of failing the build.
+   - **The exe and tray icons are generated artwork, not a hand-editable asset.**
      `assets/mnvoice.ico` is built from the mn-brand master
      `~/mnsky/mnbrand/icons/mnvoice.svg` with librsvg (the brand renderer,
      `~/mnsky/mnbrand/svg_render.py`), never from a screenshot or an upscale. The two
@@ -351,12 +363,14 @@ and direct keyboard event injection.
      `mnvoice-icon.svg` is the master minus the full-square page background
      (transparent corners, so the card floats), and `mnvoice-mark.svg` is that
      plus the wordmark paths dropped and the remaining artwork scaled 1.15x
-     about the mark's own centre. Sizes 16-48 use the mark-only file, 64-256
-     the full card: at tray sizes the wordmark collapses into mush and the mark
-     stroke is sub-pixel, so a responsive set is the only version that stays
-     legible. 1.15x is the measured maximum before the mark clips the card edge
-     (1.25x puts ink outside the rounded rect). Do not "fix" the small sizes by
-     thickening or redrawing the signature - the brand forbids it.
+     about the mark's own centre. Inside `assets/mnvoice.ico` the wordmark
+     appears at 64px and above and the mark alone below, which is what the exe
+     resource and the launcher want; the tray's file drops the wordmark at
+     every size instead, because the tray is drawn small and the mark stroke
+     is sub-pixel there. 1.15x is the measured maximum before the mark clips
+     the card edge (1.25x puts ink outside the rounded rect). Do not "fix"
+     the small sizes by thickening or redrawing the signature - the brand
+     forbids it.
      Regenerate with the recipe in the commit that introduced them, and verify
      a rebuild by extracting the RT_ICON PNG frames from the exe and comparing
      pixels against the source renders (`rc.exe` re-encodes, so byte equality

@@ -683,11 +683,12 @@ fn add_missing_icon_line(path: &std::path::Path, icon: &str) {
 
 /// Writes the brand mark where the desktop's icon lookup finds `Icon=mnvoice`.
 ///
-/// The size is 256px: the largest baked frame, which is what a launcher grid,
-/// a task switcher and a dock all scale down from. A smaller file would be
-/// visibly soft in the launcher, and the whole point of the ICO's responsive set
-/// is that the panel gets a drawing made for the panel - this file is the
-/// launcher's copy, so it wants resolution, not the mark-only variant.
+/// The size is 256px, the one size `card_frame` bakes: the wordmark card at the
+/// size a launcher grid, a task switcher and a dock draw it at, where the
+/// wordmark is legible. It comes from the card store (`assets/mnvoice.ico`)
+/// rather than the tray's mark-only set (`assets/mnvoice-tray.ico`), because
+/// the two surfaces are drawn at different sizes and each wants the drawing
+/// made for its own - the tray is read small, the launcher is read large.
 ///
 /// Best effort by design: an icon is not worth failing a startup over, and a
 /// read-only home is a legitimate state (a live session, a test run).
