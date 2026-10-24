@@ -7,7 +7,7 @@
 // choice arrives at the control loop over a plain `std::sync::mpsc` channel,
 // as the same `AppEvent` the hotkey produces. One channel, one message loop.
 //
-// Two differences from the Windows tray are deliberate and stated rather than
+// One difference from the Windows tray is deliberate and stated rather than
 // papered over:
 //
 //   - No "Check for updates" and no "Start with Windows" checkbox. The
@@ -15,9 +15,11 @@
 //     it), and autostart on Linux is the desktop file the app writes at
 //     startup (`linux_app::ensure_autostart`), not a checkbox that can flip a
 //     task. A menu item that could not do the thing would be a lie.
-//   - The icon is the orb, not a separate asset: `orb_render` paints the same
-//     pixels and the tray blits them, so one render serves both surfaces. It is
-//     a still, not an animation - see `icon_pixmap`.
+//
+// The icon is the brand mark, baked from `assets/mnvoice.ico` by `build.rs`
+// and served by `linux_icon` - the same artwork the Windows exe carries, so
+// the two platforms do not drift. The orb survives only as the fallback a
+// build without a baked mark serves; see `icon_pixmap`.
 
 use crate::orb_render::{render_gas_fluid, OrbState, ORB_HEIGHT, ORB_WIDTH};
 use crate::platform::linux_app::AppEvent;
@@ -82,14 +84,15 @@ pub struct MnvoiceTray {
     /// A `fn`-shaped read rather than a copy of the value because the panel
     /// asks for these at any moment, not when we last knew.
     phase: Arc<dyn Fn() -> u8 + Send + Sync>,
-    /// The orb's look, from the config: the tray icon IS the orb.
+    /// The orb's look, from the config: what the fallback icon paints with
+    /// when the build carries no brand mark.
     color: (f32, f32, f32),
     fluid_level: f32,
     /// The hotkey's display spelling, for the tooltip that says what to press.
     hotkey_str: String,
-    /// Which still of the breathing orb the icon shows. Advanced on refresh
-    /// (see `TrayHandle::refresh`) so a repaint is not a no-op to a compositor
-    /// that compares pixmaps.
+    /// Which still of the breathing orb the fallback icon shows. Advanced on
+    /// refresh (see `TrayHandle::refresh`); the brand pixmap is identical on
+    /// every call, so this only matters while there is no baked mark.
     frame: u32,
 }
 
@@ -155,21 +158,16 @@ impl Tray for MnvoiceTray {
         }
     }
 
-    /// The tray icon is the orb: the indicator the user watches is the one that
-    /// already means "recording" in the overlay, painted by the same renderer.
+    /// The tray icon is the brand mark, not the orb: this is the surface a
+    /// Linux desktop identifies the app by, and it is the same artwork the
+    /// Windows tray and the exe carry. The orb stays on screen as the live
+    /// indicator, where motion carries the state; a still of it in the panel
+    /// said nothing and was not the product's icon.
     ///
-    /// `ksni` wants the bytes A,R,G,B per pixel, which is the big-endian
-    /// spelling of the `u32` the shared renderer packs, so no re-packing - just
-    /// a byte order. A still rather than an animation: driving a 30 fps timer
-    /// through D-Bus to move a 22px tray icon costs far more than the motion is
-    /// worth when the full-size orb on screen already breathes.
+    /// A still rather than an animation either way: driving a 30 fps timer
+    /// through D-Bus to move a 22px tray icon costs far more than the motion
+    /// is worth when the full-size orb on screen already breathes.
     fn icon_pixmap(&self) -> Vec<Icon> {
-        // The brand mark, not the orb: this is the surface a Linux desktop
-        // identifies the app by, and it is the same artwork the Windows tray
-        // and the exe carry. The orb stays on screen as the live indicator,
-        // where motion carries the state; a still of it in the panel said
-        // nothing and was not the product's icon.
-        //
         // 22px is what a Plasma panel asks for; `frame` picks the nearest
         // baked size and keeps the ICO's responsive set (mark-only at tray
         // sizes, card plus wordmark at large ones).
@@ -241,8 +239,6 @@ impl Tray for MnvoiceTray {
     }
 }
 
-/// A handle to the running tray service, kept alive by the app for as long as
-/// the item should exist.
 /// The pre-brand tray icon: the orb, painted by the shared renderer.
 ///
 /// Kept as the fallback `icon_pixmap` calls, so a build without the brand asset
@@ -274,6 +270,8 @@ fn orb_pixmap(phase: u8, frame: u32, color: (f32, f32, f32), fluid_level: f32) -
     }]
 }
 
+/// A handle to the running tray service, kept alive by the app for as long as
+/// the item should exist.
 pub struct TrayHandle {
     inner: ksni::blocking::Handle<MnvoiceTray>,
 }
@@ -284,8 +282,10 @@ impl TrayHandle {
     /// emits the property-change and layout-change signals, so the menu label,
     /// the title and the icon follow the recording.
     ///
-    /// The frame counter moves with it: a compositor that compares pixmaps
-    /// would otherwise see identical bytes and skip the repaint.
+    /// The frame counter moves with it for the fallback icon's sake: a
+    /// compositor that compares pixmaps would otherwise see identical bytes
+    /// and skip the repaint. The brand pixmap is identical on every refresh,
+    /// and the label and title - what a refresh is really for - still follow.
     pub fn refresh(&self) {
         let _ = self
             .inner

@@ -146,8 +146,8 @@ Notepad; on Linux the files are a text editor away and no editor command is
 configured here). A row that could not do the thing would be a lie.
 
 Left click opens the menu, the convention for an item with no window to raise.
-The icon is the same orb the overlay shows, painted by the same renderer, and
-its tooltip names the hotkey.
+The icon is the mnvoice brand mark, the same artwork the Windows exe carries,
+and its tooltip names the hotkey.
 
 The Linux orb is a Wayland layer-shell overlay (the protocol panels and OSDs
 use): above every window, click-through, no focus. It is 48 logical pixels on

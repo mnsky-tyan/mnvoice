@@ -15,7 +15,7 @@ and direct keyboard event injection.
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (146 tests, ~6 s), is what an agent must run before
+     whole crate natively (150 tests, ~6 s), is what an agent must run before
      every commit, and is the gate's own test command (`.no-mistakes.yaml`
      `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
@@ -385,7 +385,7 @@ mnvoice/
 │       ├── unix_http.rs   ureq + tungstenite transport (Linux, macOS)
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
-│       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from orb_render
+│       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from linux_icon (orb fallback)
 │       ├── linux_icon.rs  the brand mark on Linux: ICO frames baked by build.rs, tray pixmap + launcher PNG
 │       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)

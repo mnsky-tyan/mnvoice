@@ -621,9 +621,17 @@ pub fn ensure_autostart() {
 ///
 /// Rewriting the whole file would discard edits the user made (a different
 /// `Exec`, a renamed entry), and `ensure_autostart`'s contract is that an
-/// existing file is the user's. Appending one missing key is the smallest edit
-/// that makes the launcher show the right icon, and it is skipped when the
-/// build carries no icon to point at.
+/// existing file is the user's. One missing key is the smallest edit that
+/// makes the launcher show the right icon, and it is skipped when the build
+/// carries no icon to point at.
+///
+/// The line goes at the end of the `[Desktop Entry]` group, ahead of any later
+/// group header: a key belongs to the group header above it, so an append at
+/// EOF would land inside a trailing `[Desktop Action ...]` group and leave the
+/// group the launcher actually reads without an icon. The key check tolerates
+/// leading whitespace the way GLib's reader does, so an indented `Icon=` is
+/// recognised rather than duplicated, and a file without a `[Desktop Entry]`
+/// group at all is left alone - there is no group to amend without guessing.
 fn add_missing_icon_line(path: &std::path::Path, icon: &str) {
     if icon.is_empty() {
         return;
@@ -631,16 +639,43 @@ fn add_missing_icon_line(path: &std::path::Path, icon: &str) {
     let Ok(existing) = std::fs::read_to_string(path) else {
         return;
     };
-    if existing.lines().any(|line| line.starts_with("Icon=")) {
+    let mut in_entry = false;
+    let mut insert_at = existing.len();
+    let mut offset = 0usize;
+    for piece in existing.split_inclusive('\n') {
+        let start = offset;
+        offset += piece.len();
+        let line = piece.trim_end();
+        if line.trim_start().starts_with('[') {
+            if in_entry {
+                // The group ends where the next group header begins.
+                insert_at = start;
+                break;
+            }
+            in_entry = line.trim() == "[Desktop Entry]";
+            if in_entry {
+                insert_at = offset;
+            }
+        } else if in_entry {
+            if line.trim_start().starts_with("Icon=") {
+                return;
+            }
+            insert_at = offset;
+        }
+    }
+    if !in_entry {
         return;
     }
+    let mut updated = String::with_capacity(existing.len() + icon.len());
+    updated.push_str(&existing[..insert_at]);
     // A missing trailing newline would otherwise glue the new key onto the
     // last line and silently corrupt it.
-    let mut updated = existing.clone();
     if !updated.ends_with('\n') {
         updated.push('\n');
     }
-    updated.push_str(icon);
+    updated.push_str(icon.trim_end());
+    updated.push('\n');
+    updated.push_str(&existing[insert_at..]);
     let _ = std::fs::write(path, updated);
 }
 
@@ -815,6 +850,185 @@ mod tests {
             "no icon to point at means no edit"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key belongs to the group header above it: when the entry carries
+    /// later groups (`[Desktop Action ...]` is a legitimate user edit), the
+    /// icon line must close the `[Desktop Entry]` group, or the launcher -
+    /// which reads only that group - keeps its generic placeholder while the
+    /// write still reported success. An indented `Icon=` is one GLib's reader
+    /// accepts, so it is recognised rather than duplicated.
+    #[test]
+    fn the_icon_line_lands_inside_the_desktop_entry_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "mnvoice-entry-group-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("mnvoice.desktop");
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nExec=/opt/custom/mnvoice\n\n\
+             [Desktop Action window]\nExec=mnvoice --window\nName=New window",
+        )
+        .expect("write");
+
+        add_missing_icon_line(&path, "Icon=mnvoice\n");
+
+        let after = std::fs::read_to_string(&path).expect("read");
+        let entry = after
+            .split("[Desktop Action window]")
+            .next()
+            .expect("the entry group is first");
+        assert!(
+            entry.contains("Icon=mnvoice"),
+            "the entry group gains the key: {after:?}"
+        );
+        assert_eq!(
+            after.matches("Icon=").count(),
+            1,
+            "one key, in the entry group, none in the action: {after:?}"
+        );
+        assert!(
+            after.contains("Name=New window"),
+            "the action group survives untouched: {after:?}"
+        );
+
+        // Idempotent: a second pass changes nothing.
+        add_missing_icon_line(&path, "Icon=mnvoice\n");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), after);
+
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\n Icon=old\nExec=mnvoice",
+        )
+        .expect("write");
+        add_missing_icon_line(&path, "Icon=mnvoice\n");
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after.matches("Icon=").count(),
+            1,
+            "an indented Icon= is not duplicated: {after:?}"
+        );
+        assert!(
+            after.contains(" Icon=old"),
+            "the indented key survives: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The launcher icon is a hand-rolled encoder whose consumer is the
+    /// desktop's PNG loader, which a test cannot run; walking the emitted
+    /// bytes by the format's own rules - signature, per-chunk CRC, IHDR
+    /// fields, stored-block reassembly, adler32 - is the check that keeps an
+    /// edit here from shipping an undecodable `mnvoice.png`. The size
+    /// straddles the 65,535-byte stored-block limit, so the block split and
+    /// the final-block flag are exercised too.
+    #[test]
+    fn the_encoded_png_parses_back_by_the_formats_own_rules() {
+        let (width, height) = (256u32, 64u32);
+        let rgba: Vec<u8> = (0..(width as usize) * (height as usize) * 4)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let png = encode_png(width, height, &rgba).expect("a whole square encodes");
+
+        assert_eq!(
+            &png[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "the PNG signature"
+        );
+
+        let mut zlib = None;
+        let mut at = 8usize;
+        while at < png.len() {
+            let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+            let kind = &png[at + 4..at + 8];
+            assert!(
+                at + 12 + len <= png.len(),
+                "chunk {} runs past the file",
+                String::from_utf8_lossy(kind)
+            );
+            let body = &png[at + 8..at + 8 + len];
+            let mut crc_input = kind.to_vec();
+            crc_input.extend_from_slice(body);
+            assert_eq!(
+                u32::from_be_bytes(png[at + 8 + len..at + 12 + len].try_into().unwrap()),
+                crc32(&crc_input),
+                "chunk {} carries a CRC its own bytes verify",
+                String::from_utf8_lossy(kind)
+            );
+            match kind {
+                b"IHDR" => {
+                    assert_eq!(len, 13, "IHDR is 13 bytes");
+                    assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), width);
+                    assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), height);
+                    assert_eq!(&body[8..], &[8, 6, 0, 0, 0], "8-bit RGBA, no interlace");
+                }
+                b"IDAT" => zlib = Some(body),
+                b"IEND" => {
+                    assert_eq!(len, 0, "IEND carries no body");
+                    assert_eq!(at + 12 + len, png.len(), "IEND is the last chunk");
+                    assert_eq!(
+                        u32::from_be_bytes(png[at + 8 + len..at + 12 + len].try_into().unwrap()),
+                        0xAE42_6082,
+                        "the IEND chunk's well-known CRC"
+                    );
+                }
+                other => panic!("unexpected chunk {}", String::from_utf8_lossy(other)),
+            }
+            at += 12 + len;
+        }
+
+        // The zlib stream is stored blocks: a header byte (BFINAL in bit 0,
+        // BTYPE 00 for stored), a little-endian LEN and its one's complement,
+        // then LEN raw bytes, ended by the adler32 of everything decompressed.
+        let zlib = zlib.expect("the image data is one IDAT");
+        assert_eq!(&zlib[..2], &[0x78, 0x01], "deflate, 32K window, no dict");
+        let mut raw = Vec::new();
+        let mut at = 2usize;
+        loop {
+            assert!(at + 5 <= zlib.len(), "block header truncated");
+            let header = zlib[at];
+            assert_eq!((header >> 1) & 0b11, 0b00, "stored, not compressed");
+            let len = u16::from_le_bytes(zlib[at + 1..at + 3].try_into().unwrap()) as usize;
+            assert_eq!(
+                u16::from_le_bytes(zlib[at + 3..at + 5].try_into().unwrap()),
+                !len as u16,
+                "LEN and NLEN are complements"
+            );
+            assert!(at + 5 + len <= zlib.len(), "block body truncated");
+            raw.extend_from_slice(&zlib[at + 5..at + 5 + len]);
+            at += 5 + len;
+            if header & 0x01 != 0 {
+                break;
+            }
+        }
+        assert_eq!(at + 4, zlib.len(), "the stream ends after the final block");
+        assert_eq!(
+            u32::from_be_bytes(zlib[at..at + 4].try_into().unwrap()),
+            adler32(&raw),
+            "the stored checksum matches the bytes it follows"
+        );
+
+        // What the blocks reassemble to is the scanlines the encoder was
+        // given: one filter byte (type 0, None) per row ahead of that row's
+        // pixels, rows in order.
+        let mut expected = Vec::with_capacity(rgba.len() + height as usize);
+        for row in rgba.chunks_exact((width as usize) * 4) {
+            expected.push(0);
+            expected.extend_from_slice(row);
+        }
+        assert_eq!(raw, expected, "filter 0, rows in order, pixels unharmed");
+    }
+
+    #[test]
+    fn a_buffer_that_is_not_a_whole_square_does_not_encode() {
+        assert!(encode_png(2, 2, &[0u8; 15]).is_none());
+        // Known answers, so the checksums are not just the encoder agreeing
+        // with itself.
+        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
+        assert_eq!(crc32(b"IEND"), 0xAE42_6082);
     }
 
     #[test]

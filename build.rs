@@ -45,6 +45,9 @@ fn main() {
     // gets its icon from winres above.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         const ICON: &str = "assets/mnvoice.ico";
+        let out = std::path::PathBuf::from(
+            std::env::var("OUT_DIR").expect("OUT_DIR is always set for a build script"),
+        );
         match bake_brand_frames(ICON) {
             Ok((sizes, pixels)) => {
                 // The pixels travel as a file in OUT_DIR, not as an env var:
@@ -52,9 +55,6 @@ fn main() {
                 // hundred kilobytes of comma-separated bytes overflowed it
                 // ("Argument list too long", measured). `include_bytes!` has no
                 // such limit and costs one read at compile time.
-                let out = std::path::PathBuf::from(
-                    std::env::var("OUT_DIR").expect("OUT_DIR is always set for a build script"),
-                );
                 std::fs::write(out.join("brand_icon.rgba"), &pixels)
                     .expect("write the baked brand pixels");
                 // Only the expression: linux_icon.rs declares the const and
@@ -73,11 +73,22 @@ fn main() {
             }
             // A brand icon that cannot be read must not turn into a build
             // failure: the app still dictates without it. Saying so loudly is
-            // the difference between a missing icon and a mystery.
-            Err(e) => println!(
-                "cargo:warning=no brand icon baked in ({ICON}: {e}); the tray \
-                 falls back to the orb and the desktop entry gets no Icon="
-            ),
+            // the difference between a missing icon and a mystery. The files
+            // are still written, empty: linux_icon.rs includes both
+            // unconditionally, and a reused target dir keeps a previous
+            // build's pixels unless they are overwritten here, so an
+            // unwriteable .ico would otherwise fail the compile outright or
+            // silently ship the wrong artwork.
+            Err(e) => {
+                println!(
+                    "cargo:warning=no brand icon baked in ({ICON}: {e}); the tray \
+                     falls back to the orb and the desktop entry gets no Icon="
+                );
+                std::fs::write(out.join("brand_icon.rgba"), b"")
+                    .expect("write the empty brand pixels");
+                std::fs::write(out.join("brand_icon_sizes.rs"), "&[]")
+                    .expect("write the empty brand sizes");
+            }
         }
         println!("cargo:rerun-if-changed={ICON}");
     }
