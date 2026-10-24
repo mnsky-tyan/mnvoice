@@ -16,9 +16,12 @@
 //     startup (`linux_app::ensure_autostart`), not a checkbox that can flip a
 //     task. A menu item that could not do the thing would be a lie.
 //
-// The icon is the brand mark, baked from `assets/mnvoice.ico` by `build.rs`
-// and served by `linux_icon` - the same artwork the Windows exe carries, so
-// the two platforms do not drift. The orb survives only as the fallback a
+// The icon is the brand MARK, mark-only at every size, baked from
+// `assets/mnvoice-tray.ico` by `build.rs` and served by `linux_icon`. The
+// wordmark card is deliberately NOT in this set: the tray is drawn small
+// (Plasma's status popup measured at ~94 device px), where a wordmark is
+// unreadable mush - the mark alone stays legible. The card with the wordmark
+// lives in the launcher icon instead. The orb survives only as the fallback a
 // build without a baked mark serves; see `icon_pixmap`.
 
 use crate::orb_render::{render_gas_fluid, OrbState, ORB_HEIGHT, ORB_WIDTH};
@@ -174,11 +177,12 @@ impl Tray for MnvoiceTray {
         // the content actually changes (it hashes it), so the whole set costs
         // one send at registration rather than one per refresh.
         //
-        // The result is the ICO's responsive set doing its job: a 22px panel
-        // icon gets the 24px mark-only drawing, a 44px HiDPI one gets 48px,
-        // and a large context (notification, tray-details view) gets the full
-        // card at 256px. Before this only the 24px frame was served, so any
-        // larger render upscaled it and the icon looked low-resolution.
+        // The result is the responsive set doing its job: a 22px panel icon
+        // gets the 24px drawing, a 44px HiDPI one gets 48px, and a large
+        // context such as the status popup gets the 128px or 256px frame
+        // instead of an upscale. Every frame is mark-only, so the largest one
+        // is still a clean mark rather than a shrunk wordmark - that was the
+        // reported blur.
         let frames = crate::platform::linux_icon::all_frames();
         if frames.is_empty() {
             // No baked brand mark (a checkout whose .ico was missing - the
@@ -191,11 +195,14 @@ impl Tray for MnvoiceTray {
             .map(|(width, height, rgba)| {
                 // ksni wants A,R,G,B per pixel; the baked frames are straight
                 // RGBA. `as_chunks` states the four-byte pixel width in the
-                // type, so a buffer that is not a whole number of pixels
-                // cannot be silently truncated the way `chunks_exact` would
-                // (it drops the remainder).
+                // type. It still excludes a trailing partial pixel from the
+                // slices, so the assertion is what actually guards the
+                // invariant - and it is an `assert!`, not a debug-only one,
+                // because a short buffer would otherwise be truncated
+                // silently in a release build. The store is compile-time
+                // baked, so the check costs one comparison at start-up.
                 let (pixels, remainder) = rgba.as_chunks::<4>();
-                debug_assert!(remainder.is_empty(), "RGBA buffer is not whole pixels");
+                assert!(remainder.is_empty(), "RGBA buffer is not whole pixels");
                 Icon {
                     width: width as i32,
                     height: height as i32,
@@ -493,8 +500,9 @@ mod tests {
                     "{expected}px pixel is not A,R,G,B"
                 );
             }
-            // The largest frame is the full card: a host that picks it gets the
-            // wordmark, and it must still be opaque enough to see.
+            // The largest frame is still the mark, not the wordmark card (that
+            // is the launcher's artwork, `card_frame`); it must be opaque
+            // enough to see.
             if expected == 256 {
                 let opaque = icon.data.chunks(4).filter(|px| px[0] > 40).count();
                 assert!(

@@ -33,11 +33,12 @@ fn main() {
     }
 
     // The brand mark reaches the Linux tray and the desktop entry as pixels,
-    // not as a second asset: `assets/mnvoice.ico` is the one brand file this
-    // repo owns (the Windows resource section, the tray icon and the desktop
-    // icon all come from it), so it is decoded here and the frames are baked
-    // in as bytes. The alternative - shipping the .ico as a runtime data file
-    // and parsing it on every start - would make a released binary depend on a
+    // not as runtime data files: the exe resource and the launcher card come
+    // from `assets/mnvoice.ico`, the tray from the mark-only
+    // `assets/mnvoice-tray.ico` (the reason for two files is below), so both
+    // are decoded here and their frames are baked in as bytes. The
+    // alternative - shipping the .ico files as runtime data and parsing them
+    // on every start - would make a released binary depend on a
     // path beside it, which is exactly what the single-file release asset does
     // not have.
     //
@@ -64,54 +65,59 @@ fn main() {
         let out = std::path::PathBuf::from(
             std::env::var("OUT_DIR").expect("OUT_DIR is always set for a build script"),
         );
-        match bake_brand_frames(tray_icon)
-            .and_then(|tray| bake_brand_frames(app_icon).map(|app| (tray, app)))
-        {
-            Ok(((sizes, pixels), (_, app_pixels))) => {
-                // The pixels travel as a file in OUT_DIR, not as an env var:
-                // `cargo:rustc-env` lands on rustc's command line, and a few
-                // hundred kilobytes of comma-separated bytes overflowed it
-                // ("Argument list too long", measured). `include_bytes!` has no
-                // such limit and costs one read at compile time.
-                std::fs::write(out.join("brand_icon.rgba"), &pixels)
-                    .expect("write the baked brand pixels");
-                // Only the expression: linux_icon.rs declares the const and
-                // includes this, so a `pub const` here would be a declaration
-                // inside an expression.
-                let sizes_rs = format!(
-                    "&[{}]",
-                    sizes
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                std::fs::write(out.join("brand_icon_sizes.rs"), sizes_rs)
-                    .expect("write the baked brand sizes");
-                // The launcher card, same sizes, wordmark included at 64px+.
-                std::fs::write(out.join("brand_card.rgba"), &app_pixels)
-                    .expect("write the baked launcher card");
-            }
-            // A brand icon that cannot be read must not turn into a build
-            // failure: the app still dictates without it. Saying so loudly is
-            // the difference between a missing icon and a mystery. The files
-            // are still written, empty: linux_icon.rs includes both
-            // unconditionally, and a reused target dir keeps a previous
-            // build's pixels unless they are overwritten here, so an
-            // unwriteable .ico would otherwise fail the compile outright or
-            // silently ship the wrong artwork.
-            Err(e) => {
-                println!(
-                    "cargo:warning=no brand icon baked in ({tray_icon} / {app_icon}: {e}); \
-                     the tray falls back to the orb and the desktop entry gets no Icon="
-                );
-                for name in ["brand_icon.rgba", "brand_card.rgba"] {
-                    std::fs::write(out.join(name), b"").expect("write the empty brand pixels");
-                }
-                std::fs::write(out.join("brand_icon_sizes.rs"), "&[]")
-                    .expect("write the empty brand sizes");
+        // Each file is baked on its own, so one unreadable .ico costs only its
+        // own surface: the tray keeps its mark if the launcher's card cannot be
+        // read, and the warning names the file, because "some icon failed" is
+        // not actionable. An empty store is written all the same - linux_icon
+        // includes both unconditionally, and a reused target dir keeps a
+        // previous build's pixels unless they are overwritten here, so an
+        // unwriteable .ico would otherwise fail the compile outright or
+        // silently ship the wrong artwork.
+        let tray = bake_brand_frames(tray_icon);
+        let app = bake_brand_frames(app_icon);
+        for (path, result, note) in [
+            (tray_icon, &tray, "the tray falls back to the orb"),
+            (app_icon, &app, "the desktop entry gets no Icon="),
+        ] {
+            if let Err(e) = result {
+                println!("cargo:warning=no brand icon baked in ({path}: {e}); {note}");
             }
         }
+        let (sizes, pixels) = tray.unwrap_or_default();
+        let (app_sizes, app_pixels) = app.unwrap_or_default();
+        // The launcher card is sliced with the tray's size list, so the two
+        // files must name the same frames in the same order: a drift would not
+        // be visible until card_frame() handed the launcher a misaligned
+        // slice. Checked here, where it is a loud warning, instead of a
+        // silently wrong launcher icon.
+        if !sizes.is_empty() && !app_sizes.is_empty() && sizes != app_sizes {
+            println!(
+                "cargo:warning={tray_icon} and {app_icon} disagree on frame sizes \
+                 ({sizes:?} vs {app_sizes:?}); the launcher icon would be garbled"
+            );
+        }
+        // The pixels travel as a file in OUT_DIR, not as an env var:
+        // `cargo:rustc-env` lands on rustc's command line, and a few
+        // hundred kilobytes of comma-separated bytes overflowed it
+        // ("Argument list too long", measured). `include_bytes!` has no
+        // such limit and costs one read at compile time.
+        std::fs::write(out.join("brand_icon.rgba"), &pixels).expect("write the baked brand pixels");
+        // Only the expression: linux_icon.rs declares the const and
+        // includes this, so a `pub const` here would be a declaration
+        // inside an expression.
+        let sizes_rs = format!(
+            "&[{}]",
+            sizes
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::fs::write(out.join("brand_icon_sizes.rs"), sizes_rs)
+            .expect("write the baked brand sizes");
+        // The launcher card, same sizes, wordmark included at 64px+.
+        std::fs::write(out.join("brand_card.rgba"), &app_pixels)
+            .expect("write the baked launcher card");
         println!("cargo:rerun-if-changed={tray_icon}");
         println!("cargo:rerun-if-changed={app_icon}");
     }
@@ -145,15 +151,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
 }
 
-/// Decodes every frame of `assets/mnvoice.ico` into straight RGBA and returns
-/// the size list plus the concatenated pixels, both as decimal strings the
-/// crate can read back with `env!` and `include!`-free arithmetic.
+/// Decodes every frame of a brand .ico into straight RGBA and returns its size
+/// list plus the concatenated pixels. Called once per file: the tray icon and
+/// the launcher card are baked separately, each from its own .ico.
+///
+/// The pixels travel as a binary file in `OUT_DIR` (read with `include_bytes!`)
+/// and the sizes as a small Rust source file (read with `include!`): a
+/// `cargo:rustc-env` var would put the bytes on rustc's command line, and a few
+/// hundred kilobytes of them overflowed it ("Argument list too long", measured).
 ///
 /// The ICO directory is parsed here rather than trusted from a hardcoded table:
 /// a frame count that disagreed with the file would bake a truncated buffer and
-/// the icon would be garbage rather than missing. Every frame in this repo's
-/// icon is a PNG (checked: all nine), so the PNG decoder is the only format
-/// handled; an embedded BMP frame is refused by name instead of decoded wrongly.
+/// the icon would be garbage rather than missing. Every frame in both of this
+/// repo's icons is a PNG (checked: all nine in each), so the PNG decoder is the
+/// only format handled; an embedded BMP frame is refused by name instead of
+/// decoded wrongly.
 fn bake_brand_frames(path: &str) -> Result<(Vec<usize>, Vec<u8>), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     if data.len() < 6 || &data[0..4] != b"\0\0\x01\0" {
@@ -193,10 +205,10 @@ fn bake_brand_frames(path: &str) -> Result<(Vec<usize>, Vec<u8>), String> {
         let mut decoded = png::Decoder::new(frame)
             .read_info()
             .map_err(|e| format!("{width}x{height}: {e}"))?;
-        let mut buf = vec![0u8; decoded.output_buffer_size()];
-        let info = decoded
-            .next_frame(&mut buf)
-            .map_err(|e| format!("{width}x{height}: {e}"))?;
+        // The header is available before any buffer is allocated, so a frame
+        // that disagrees with its own directory entry is refused without
+        // first sizing a buffer from it.
+        let info = decoded.info();
         if info.width as usize != width || info.height as usize != height {
             return Err(format!(
                 "{width}x{height} frame decodes as {}x{}",
@@ -209,6 +221,10 @@ fn bake_brand_frames(path: &str) -> Result<(Vec<usize>, Vec<u8>), String> {
                 info.color_type, info.bit_depth
             ));
         }
+        let mut buf = vec![0u8; decoded.output_buffer_size()];
+        let info = decoded
+            .next_frame(&mut buf)
+            .map_err(|e| format!("{width}x{height}: {e}"))?;
         buf.truncate(info.buffer_size());
         sizes.push(width);
         all.extend_from_slice(&buf);
