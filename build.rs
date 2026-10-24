@@ -73,8 +73,8 @@ fn main() {
         // previous build's pixels unless they are overwritten here, so an
         // unwriteable .ico would otherwise fail the compile outright or
         // silently ship the wrong artwork. What a failed card does cost is the
-        // launcher: `card_available` reports the empty store, the entry gets no
-        // `Icon=` line at all, and the desktop falls back to its generic
+        // launcher: `card_available` reports the store as unavailable, the entry
+        // gets no `Icon=` line at all, and the desktop falls back to its generic
         // placeholder rather than to a name that resolves to nothing.
         let tray = bake_brand_frames(tray_icon);
         let app = extract_card_frame(app_icon);
@@ -196,10 +196,10 @@ fn extract_card_frame(path: &str) -> Result<Vec<u8>, String> {
 ///
 /// The ICO directory is parsed here rather than trusted from a hardcoded table:
 /// a frame count that disagreed with the file would bake a truncated buffer and
-/// the icon would be garbage rather than missing. Every frame in the tray
-/// icon is a PNG (checked: all nine), so the PNG decoder is the
-/// only format handled; an embedded BMP frame is refused by name instead of
-/// decoded wrongly.
+/// the icon would be garbage rather than missing. Every frame in both files is
+/// a PNG (checked: all nine each), so the PNG decoder is the only format
+/// handled; an embedded BMP frame is refused by name instead of decoded
+/// wrongly.
 fn bake_brand_frames(path: &str) -> Result<(Vec<usize>, Vec<u8>), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     if data.len() < 6 || &data[0..4] != b"\0\0\x01\0" {

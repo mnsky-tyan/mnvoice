@@ -44,8 +44,8 @@ pub const SIZES: &[u32] = include!(concat!(env!("OUT_DIR"), "/brand_icon_sizes.r
 const PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_icon.rgba"));
 
 /// The launcher card: one 256x256 frame of straight RGBA, the wordmark-bearing
-/// artwork from `assets/mnvoice.ico`. Empty when that file could not be baked,
-/// which is the one condition [`card_available`] reports.
+/// artwork from `assets/mnvoice.ico`. Empty when that file could not be baked;
+/// [`card_available`] reports whether it is one whole square.
 const CARD_PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_card.rgba"));
 
 /// The card's side in pixels. The launcher PNG is written into
@@ -65,8 +65,8 @@ pub fn all_frames() -> Vec<(u32, u32, Vec<u8>)> {
 }
 
 /// The launcher card: the 256px wordmark-bearing artwork, for the desktop
-/// entry's icon file. `None` when the build baked no card, which is exactly
-/// when [`card_available`] is false.
+/// entry's icon file. `None` when the store is not one whole 256px square,
+/// which is exactly when [`card_available`] is false.
 pub fn card_frame() -> Option<(u32, u32, Vec<u8>)> {
     if !card_available() {
         return None;
