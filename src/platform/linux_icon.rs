@@ -24,11 +24,11 @@
 //
 // The tray keeps its responsive set: all nine frames of the tray ICO are baked
 // and served together, so the host - not us - picks the one matching the size
-// it actually draws at, and a 22px panel icon gets the 24px drawing instead of
-// a host upscale of the 256px mark. `frame_index` exists only for the single
-// frame a caller asks for by size, which in production is the card. The card
-// side carries one frame, because the launcher PNG is written at exactly one
-// size (`hicolor/256x256/apps`).
+// it actually draws at. `frame` maps a requested size to the nearest baked
+// frame through `frame_index`; in production both are reached only from
+// `all_frames`, which asks for each baked size exactly. The card side carries
+// one frame, because the launcher PNG is written at exactly one size
+// (`hicolor/256x256/apps`), and `card_frame` returns that frame directly.
 //
 // The colours are not recoloured. A StatusNotifierItem host may ask for
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
@@ -91,11 +91,13 @@ pub fn frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
 
 /// The nearest baked tray frame to `size`, preferring the larger one on a tie.
 ///
-/// Nearest rather than "always the biggest" so a 22px panel icon is handed the
-/// 24px drawing rather than the 256px one, which the host would scale down
-/// itself. Nearest rather than "smallest that fits" so a 24px request does not
-/// get the 16px drawing blown up. Every frame is mark-only, so whichever one is
-/// picked is the same drawing at its native resolution.
+/// A request below the smallest frame clamps up and one above the largest
+/// clamps down, so any request resolves against a non-empty store. In
+/// production it is reached only through [`all_frames`], which passes each
+/// baked size exactly, so the nearest-match behaviour itself is exercised by
+/// the unit test below; the host, not this function, picks the frame for the
+/// size it draws at. Every frame is mark-only, so whichever one is picked is
+/// the same drawing at its native resolution.
 fn frame_index(size: u32) -> Option<usize> {
     if SIZES.is_empty() {
         return None;

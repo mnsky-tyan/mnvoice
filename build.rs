@@ -185,8 +185,9 @@ fn extract_card_frame(path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Decodes every frame of a brand .ico into straight RGBA and returns its size
-/// list plus the concatenated pixels. Called for the tray icon alone; the
-/// launcher card takes only its 256px frame through [`extract_card_frame`].
+/// list plus the concatenated pixels. Both files go through it: the tray bakes
+/// its whole set from the result, and the launcher icon is decoded here too so
+/// that [`extract_card_frame`] can slice out its 256px frame.
 ///
 /// The pixels travel as a binary file in `OUT_DIR` (read with `include_bytes!`)
 /// and the sizes as a small Rust source file (read with `include!`): a
