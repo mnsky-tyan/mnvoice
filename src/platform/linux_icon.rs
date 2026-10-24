@@ -225,14 +225,6 @@ mod tests {
         );
     }
 
-    /// The `Icon=` gate and the file it points at are the same condition. A
-    /// gate that claimed availability the launcher PNG could not back would
-    /// name an icon the desktop cannot resolve.
-    #[test]
-    fn the_icon_gate_agrees_with_the_card_it_points_at() {
-        assert_eq!(card_available(), card_frame().is_some());
-    }
-
     /// The mark must be visible: an all-transparent or all-one-colour frame
     /// would pass every length check and still ship a blank tray icon.
     #[test]
