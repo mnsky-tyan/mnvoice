@@ -168,30 +168,44 @@ impl Tray for MnvoiceTray {
     /// through D-Bus to move a 22px tray icon costs far more than the motion
     /// is worth when the full-size orb on screen already breathes.
     fn icon_pixmap(&self) -> Vec<Icon> {
-        // 22px is what a Plasma panel asks for; `frame` picks the nearest
-        // baked size and keeps the ICO's responsive set (mark-only at tray
-        // sizes, card plus wordmark at large ones).
-        if let Some((width, height, rgba)) = crate::platform::linux_icon::frame(22) {
-            // ksni wants A,R,G,B per pixel; the baked frames are straight RGBA.
-            // `as_chunks` states the four-byte pixel width in the type, so a
-            // buffer that is not a whole number of pixels cannot be silently
-            // truncated the way `chunks_exact` would (it drops the remainder).
-            let (pixels, remainder) = rgba.as_chunks::<4>();
-            debug_assert!(remainder.is_empty(), "RGBA buffer is not whole pixels");
-            let data = pixels
-                .iter()
-                .flat_map(|px| [px[3], px[0], px[1], px[2]])
-                .collect();
-            return vec![Icon {
-                width: width as i32,
-                height: height as i32,
-                data,
-            }];
+        // Every baked frame, not just the nearest one: the StatusNotifierItem
+        // spec's IconPixmap is an array so the host can pick the frame that
+        // matches the size it draws at, and ksni only re-emits the signal when
+        // the content actually changes (it hashes it), so the whole set costs
+        // one send at registration rather than one per refresh.
+        //
+        // The result is the ICO's responsive set doing its job: a 22px panel
+        // icon gets the 24px mark-only drawing, a 44px HiDPI one gets 48px,
+        // and a large context (notification, tray-details view) gets the full
+        // card at 256px. Before this only the 24px frame was served, so any
+        // larger render upscaled it and the icon looked low-resolution.
+        let frames = crate::platform::linux_icon::all_frames();
+        if frames.is_empty() {
+            // No baked brand mark (a checkout whose .ico was missing - the
+            // build script warns and continues): the orb is still a better
+            // tray icon than nothing, so the app keeps identifying itself.
+            return orb_pixmap((self.phase)(), self.frame, self.color, self.fluid_level);
         }
-        // No baked brand mark (a checkout whose .ico was missing - the build
-        // script warns and continues): the orb is still a better tray icon than
-        // nothing, so the app keeps identifying itself.
-        orb_pixmap((self.phase)(), self.frame, self.color, self.fluid_level)
+        frames
+            .into_iter()
+            .map(|(width, height, rgba)| {
+                // ksni wants A,R,G,B per pixel; the baked frames are straight
+                // RGBA. `as_chunks` states the four-byte pixel width in the
+                // type, so a buffer that is not a whole number of pixels
+                // cannot be silently truncated the way `chunks_exact` would
+                // (it drops the remainder).
+                let (pixels, remainder) = rgba.as_chunks::<4>();
+                debug_assert!(remainder.is_empty(), "RGBA buffer is not whole pixels");
+                Icon {
+                    width: width as i32,
+                    height: height as i32,
+                    data: pixels
+                        .iter()
+                        .flat_map(|px| [px[3], px[0], px[1], px[2]])
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// The menu, in the Windows tray's order: the recording control, a
@@ -418,20 +432,27 @@ mod tests {
     fn the_tray_icon_is_the_brand_mark_at_a_panel_sized_frame() {
         let (t, _) = tray(PHASE_RECORDING);
         let pixmap = t.icon_pixmap();
-        assert_eq!(pixmap.len(), 1, "one size: the nearest baked frame");
-        let icon = &pixmap[0];
+        // The whole baked set is offered, so the host can pick the frame that
+        // matches the size it draws at instead of upscaling one.
+        assert_eq!(
+            pixmap.len(),
+            crate::platform::linux_icon::SIZES.len(),
+            "every baked frame is served"
+        );
         // A panel asks for ~22px; the baked set's nearest frame is 24px, and
-        // handing the host the 256px card would make it resample a wordmark it
-        // cannot resolve.
-        assert_eq!((icon.width, icon.height), (24, 24));
+        // handing the host only the 256px card would make it resample a
+        // wordmark it cannot resolve.
+        let icon = &pixmap[2];
+        assert_eq!((icon.width, icon.height), (24, 24), "the 24px frame");
         assert_eq!(
             icon.data.len(),
             (24 * 24 * 4) as usize,
             "ARGB32, one word per pixel"
         );
-        // ksni wants A,R,G,B. The mark is drawn on a light card, so the tray
-        // frame must be mostly opaque - a fully transparent buffer would pass
-        // the length check and ship an invisible icon.
+        // The mark is drawn on a light card, so the tray frame must be mostly
+        // opaque - a fully transparent buffer would pass the length check and
+        // ship an invisible icon. The A,R,G,B layout these counts read is
+        // pinned byte for byte by every_served_frame_matches_the_size_it_declares.
         let opaque = icon.data.chunks(4).filter(|px| px[0] > 40).count();
         assert!(
             opaque > 300,
@@ -448,6 +469,40 @@ mod tests {
             pale > 100,
             "expected the pale brand card, got {pale} pale pixels"
         );
+    }
+
+    /// Every served frame is well-formed: its own declared size, a whole
+    /// number of pixels, and every pixel in A,R,G,B order - a pixmap that put
+    /// alpha last would render as noise in every host. Serving the set is what
+    /// lets a HiDPI panel pick 48px instead of upscaling 24px.
+    #[test]
+    fn every_served_frame_matches_the_size_it_declares() {
+        let (t, _) = tray(PHASE_RECORDING);
+        let pixmap = t.icon_pixmap();
+        let sizes: Vec<u32> = crate::platform::linux_icon::SIZES.to_vec();
+        assert_eq!(pixmap.len(), sizes.len(), "one pixmap per baked frame");
+        for (icon, expected) in pixmap.iter().zip(sizes) {
+            assert_eq!(icon.width as u32, expected, "{expected}px frame");
+            assert_eq!(icon.data.len(), (expected * expected * 4) as usize);
+            let (_, _, rgba) =
+                crate::platform::linux_icon::frame(expected).expect("the baked frame resolves");
+            for (served, source) in icon.data.chunks(4).zip(rgba.chunks(4)) {
+                assert_eq!(
+                    served,
+                    [source[3], source[0], source[1], source[2]].as_slice(),
+                    "{expected}px pixel is not A,R,G,B"
+                );
+            }
+            // The largest frame is the full card: a host that picks it gets the
+            // wordmark, and it must still be opaque enough to see.
+            if expected == 256 {
+                let opaque = icon.data.chunks(4).filter(|px| px[0] > 40).count();
+                assert!(
+                    opaque > 40_000,
+                    "the 256px card must be dense, got {opaque}"
+                );
+            }
+        }
     }
 
     /// The orb fallback is still exercised: a build with no baked brand asset

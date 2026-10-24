@@ -27,12 +27,24 @@
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
 // as-is and the host is expected to draw it like the Windows tray does.
 
-/// Frame sizes, largest last, as baked from `assets/mnvoice.ico`.
+/// Frame sizes, smallest first, as baked from `assets/mnvoice.ico`.
 pub const SIZES: &[u32] = include!(concat!(env!("OUT_DIR"), "/brand_icon_sizes.rs"));
 
 /// Every frame's straight (non-premultiplied) RGBA pixels, concatenated in the
 /// same order as [`SIZES`].
 const PIXELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand_icon.rgba"));
+
+/// Every baked frame, in the size order [`SIZES`] names (smallest first).
+///
+/// This is what a StatusNotifierItem host is supposed to be handed: the spec's
+/// `IconPixmap` is an *array* of (width, height, pixels) precisely so the host
+/// can pick the frame that matches the size it actually draws at. Serving one
+/// frame instead forces the host to resample: a panel asking for 32px on a
+/// HiDPI screen upscales a 24px raster and the icon looks low-resolution,
+/// which is exactly what was reported before this existed.
+pub fn all_frames() -> Vec<(u32, u32, Vec<u8>)> {
+    SIZES.iter().filter_map(|size| frame(*size)).collect()
+}
 
 /// The brand mark as RGBA for one frame, or `None` when the build baked no
 /// icon (a checkout whose `.ico` was missing: the build script warns instead
