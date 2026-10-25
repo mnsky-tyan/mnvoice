@@ -15,7 +15,7 @@ and direct keyboard event injection.
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (151 tests, ~6 s), is what an agent must run before
+     whole crate natively (153 tests, ~6 s), is what an agent must run before
      every commit, and is the gate's own test command (`.no-mistakes.yaml`
      `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
@@ -325,31 +325,53 @@ and direct keyboard event injection.
      `cfg(windows)` dev-dependency so the Windows test build can compute
      `Sec-WebSocket-Accept` with `derive_accept_key` instead of ~95 lines of
      hand-rolled SHA-1/base64. The release binary is unchanged (dev-only).
-   - **One icon file serves both platforms; on Linux it is baked in at build
-     time.** `assets/mnvoice.ico` is the only brand asset: winres embeds it in
-     the exe, and the Linux build script decodes its PNG frames into `OUT_DIR`
-     so `platform::linux_icon` can serve the tray's `IconPixmap` and write the
-     launcher PNG the desktop entry names with `Icon=mnvoice`. Before this, the
-     Linux tray painted the orb from `orb_render` and the entry had no `Icon=`
-     at all, so the brand mark appeared nowhere on a Linux desktop - the orb is
-     a live status indicator, not the product icon. Pixels travel through
-     `OUT_DIR` files, not `cargo:rustc-env`: a 256KB env var overflowed rustc's
-     command line ("Argument list too long", measured). A checkout whose `.ico`
-     is missing warns and falls back to the orb instead of failing the build.
-   - **The exe/tray icon is generated artwork, not a hand-editable asset.**
+   - **Two icon files serve the two platforms' surfaces; on Linux both are
+     baked in at build time.** `assets/mnvoice.ico` is the exe resource and the
+     launcher artwork (winres embeds it in the exe; the Linux build script
+     decodes its 256px frame into `OUT_DIR` so `platform::linux_icon` writes the
+     launcher PNG the desktop entry names with `Icon=mnvoice`), and
+     `assets/mnvoice-tray.ico` is the tray's mark-only set, baked as its nine
+     frames for the tray's `IconPixmap`. Before the brand mark was baked in at
+     all the Linux tray painted the orb from `orb_render` and the entry had no
+     `Icon=`, so the brand mark appeared nowhere on a Linux desktop - the orb
+     is a live status indicator, not the product icon.
+     There is a second asset for a measured reason: `assets/mnvoice-tray.ico`
+     is mark-only at EVERY size (wordmark dropped, 16..256), and the tray is
+     baked from it, while `assets/mnvoice.ico` keeps the wordmark card at
+     64px+ for the launcher's 256px PNG. The measured cause of the blurry
+     tray icon (2026-10-24): Plasma's status popup draws the tray icon at
+     ~94 device px, Qt's `QIcon` picks the smallest frame >= that request -
+     which was the 128px wordmark card - and shrinking the card squeezed
+     "mnvoice" into a smudge. Mark-only stays legible at any size the host
+     draws; the wordmark only reads at ~256px, which is where it belongs.
+     Both files are generated from the brand SVGs by the same recipe as
+     `mnvoice.ico` (librsvg via `~/mnsky/mnbrand/svg_render.py`, mark-only from
+     `mnvoice-mark.svg`, card from `mnvoice-icon.svg`); a test pins that no
+     tray frame carries wordmark ink. Regenerating the tray file: render
+     `mnvoice-mark.svg` natively at each of the nine sizes, then pack those
+     PNGs into a PNG-compressed ICO (one directory entry per size, 32 bpp) -
+     never by downscaling one render, which would blur the small frames.
+     Pixels travel through `OUT_DIR` files, not `cargo:rustc-env`: a 256KB env
+     var overflowed rustc's command line ("Argument list too long", measured).
+     A checkout with a missing `.ico` warns per file instead of failing the
+     build: a missing `mnvoice-tray.ico` leaves the tray on the orb fallback,
+     a missing `mnvoice.ico` leaves the entry without an `Icon=` line.
+   - **The exe and tray icons are generated artwork, not a hand-editable asset.**
      `assets/mnvoice.ico` is built from the mn-brand master
-     `~/mnsky/mn-brand/icons/mnvoice.svg` with librsvg (the brand renderer,
-     `mn-brand/svg_render.py`), never from a screenshot or an upscale. The two
-     source SVGs next to it record exactly what the ICO contains:
+     `~/mnsky/mnbrand/icons/mnvoice.svg` with librsvg (the brand renderer,
+     `~/mnsky/mnbrand/svg_render.py`), never from a screenshot or an upscale. The two
+     source SVGs next to it record exactly what the two ICOs contain:
      `mnvoice-icon.svg` is the master minus the full-square page background
      (transparent corners, so the card floats), and `mnvoice-mark.svg` is that
      plus the wordmark paths dropped and the remaining artwork scaled 1.15x
-     about the mark's own centre. Sizes 16-48 use the mark-only file, 64-256
-     the full card: at tray sizes the wordmark collapses into mush and the mark
-     stroke is sub-pixel, so a responsive set is the only version that stays
-     legible. 1.15x is the measured maximum before the mark clips the card edge
-     (1.25x puts ink outside the rounded rect). Do not "fix" the small sizes by
-     thickening or redrawing the signature - the brand forbids it.
+     about the mark's own centre. Inside `assets/mnvoice.ico` the wordmark
+     appears at 64px and above and the mark alone below, which is what the exe
+     resource and the launcher want; the tray's file drops the wordmark at
+     every size instead, because the tray is drawn small and the mark stroke
+     is sub-pixel there. 1.15x is the measured maximum before the mark clips
+     the card edge (1.25x puts ink outside the rounded rect). Do not "fix"
+     the small sizes by thickening or redrawing the signature - the brand
+     forbids it.
      Regenerate with the recipe in the commit that introduced them, and verify
      a rebuild by extracting the RT_ICON PNG frames from the exe and comparing
      pixels against the source renders (`rc.exe` re-encodes, so byte equality
@@ -361,7 +383,8 @@ and direct keyboard event injection.
 mnvoice/
 ├── AGENTS.md              this file: test rules, release discipline, repo wiki
 ├── Cargo.toml             deps: windows (Win32), cpal+enigo (Unix), ashpd+wayland (Linux desktop)
-├── build.rs               winres: bakes the version resource + icon into mnvoice.exe
+├── build.rs               winres for the exe version+icon; on Linux decodes both brand .ico files into OUT_DIR
+├── assets/                brand artwork: mnvoice.ico (exe resource + launcher card), mnvoice-tray.ico (tray, mark-only), the 2 source SVGs, orb-512.png
 ├── src/
 │   ├── main.rs            entry: Windows -> windows_app; Linux -> linux_app (or --terminal); macOS -> cli
 │   ├── windows_app.rs     the Windows tray app: window, tray, hotkey, message loop (2,982 lines)
@@ -386,7 +409,7 @@ mnvoice/
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from linux_icon (orb fallback)
-│       ├── linux_icon.rs  the brand mark on Linux: ICO frames baked by build.rs, tray pixmap + launcher PNG
+│       ├── linux_icon.rs  the brand mark on Linux: tray frames from mnvoice-tray.ico (mark-only, all sizes), launcher card from mnvoice.ico, baked by build.rs
 │       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)

@@ -67,7 +67,7 @@ unsafe fn app_icon() -> HICON {
 /// the tray has been down-sampling a 32 px frame into a 16 px slot, and at
 /// higher scaling a 32 px frame into a 20 or 24 px slot. This exe carries a
 /// responsive .ico - mark-only at 16-48 px, the full brand card at 64-256 px
-/// (see AGENTS.md, "The exe/tray icon is generated artwork, not a
+/// (see AGENTS.md, "The exe and tray icons are generated artwork, not a
 /// hand-editable asset") - and at 100% the tray was already
 /// showing a mark; what was unreachable were the frames rasterised FOR the
 /// tray's own size. `LoadIconW` cannot express a size at all, which is why
