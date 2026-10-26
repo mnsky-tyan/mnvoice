@@ -761,6 +761,36 @@ pub const DEFAULT_VAD_SILENCE_MS: u32 = 3000;
 /// engines compute over i16 samples (see `rms_of`), so the scale runs 0-32767.
 pub const DEFAULT_VAD_RMS_THRESHOLD: f64 = 400.0;
 
+/// Whether a configured hotkey string means "no key".
+///
+/// One definition for a rule four call sites need: the dictate-key parser, the
+/// cancel-key parser, the window setup that tests the resulting `vk == 0`
+/// sentinel, and the tray tooltip that has to say "disabled" rather than name a
+/// key. They used to spell it independently - one case-insensitive compare that
+/// stored a lowercased `"none"`, one numeric sentinel, one exact match on the
+/// display string - and agreed only because the parse happens to normalise. A
+/// change to the accepted spelling would have left the tooltip degrading to
+/// "mnvoice - idle. none to dictate."
+///
+/// Case-insensitive, and tolerant of surrounding space, because both parsers
+/// see whatever the user typed in `mnvoice.env` before they trim it.
+///
+/// An EMPTY string is not a disabled key. The two keys need the opposite answer
+/// for it: an omitted `CANCEL_KEY` keeps Esc, and an omitted `HOTKEY` falls
+/// through to the Alt+Space default. Folding "empty" into "disabled" silently
+/// switched the documented default off for any config that never mentioned
+/// `HOTKEY`, so the key stopped working with nothing in the log saying why.
+/// Only `cancel_key_with_display` treats empty as its own case, and it does so
+/// before the string reaches this predicate.
+///
+/// `allow(dead_code)` off Windows, where the tray tip that consumes it does not
+/// exist: the predicate and its test are still compiled, so the rule stays
+/// pinned on every platform the suite runs on.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn hotkey_is_disabled(s: &str) -> bool {
+    s.trim().eq_ignore_ascii_case("none")
+}
+
 /// The cancel key to register plus the spelling to show for it, decided in
 /// one place: the display must never advertise a key other than the pair
 /// that was registered, and the fallbacks live here rather than being
@@ -939,9 +969,65 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// Runs the real file pass over `text` and the real derivation, standing in for
+/// the mnvoice.env beside the exe. The API key `derive` demands is always
+/// supplied so the config derives instead of erroring.
+///
+/// Crate-visible rather than test-only: `windows_app` asserts on the derived
+/// pair and display string, and a test helper that only one module can reach
+/// would push that test to rebuild the derivation by hand.
+///
+/// `allow(dead_code)` off Windows, where the only caller (`windows_app`'s hotkey
+/// test) is not compiled: this crate's own tests build their config through
+/// `load`, so nothing else reaches it there.
+#[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn load_from(text: &str) -> Config {
+    let mut raw = RawFields::new();
+    parse(text, |k, v| {
+        if let Some((_, field)) = FIELDS.iter().find(|(names, _)| names.contains(&k)) {
+            raw.set(*field, k, v, true);
+        }
+    });
+    if raw.api_key.trim().is_empty() {
+        raw.api_key = "test-key".to_string();
+    }
+    derive(raw).expect("test config should derive")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The disabled spelling is one predicate, and it accepts what the user
+    /// actually types.
+    ///
+    /// Four call sites consume it (both hotkey parsers, the window setup's
+    /// `vk == 0` sentinel and the tray tooltip), so its tolerance for case and
+    /// surrounding space is what keeps the tooltip from degrading to "none to
+    /// dictate" after a spelling change in only one of them.
+    #[test]
+    fn the_disabled_hotkey_spelling_is_recognised_in_one_place() {
+        for disabled in ["none", "None", "NONE", "  none  "] {
+            assert!(
+                hotkey_is_disabled(disabled),
+                "{disabled:?} must read as no hotkey"
+            );
+        }
+        // An omitted key is not a disabled one: it falls through to the
+        // documented default. Folding "empty" into "disabled" silently switched
+        // the Alt+Space default off for any config that never mentioned HOTKEY.
+        assert!(
+            !hotkey_is_disabled(""),
+            "an omitted hotkey must keep the default, not disable the key"
+        );
+        for enabled in ["Alt+Space", "F9", "none-ish", "none of them"] {
+            assert!(
+                !hotkey_is_disabled(enabled),
+                "{enabled:?} must read as a real hotkey"
+            );
+        }
+    }
 
     /// A BOM is what Windows Notepad and a `>` redirect actually write, so a
     /// config authored on this platform carries one. `lines()` does not treat it
@@ -978,6 +1064,17 @@ mod tests {
         let mut kw = Vec::new();
         parse_keywords_text("\u{feff}alpha\nbeta", &mut kw);
         assert_eq!(kw, vec!["alpha", "beta"]);
+
+        // And the surviving term is the one the speaker says, not the BOM'd
+        // one: `seen` keys on the same string, so a BOM'd spelling that was not
+        // stripped would be kept as a second entry beside a later plain one.
+        let mut twice = vec!["alpha".to_string()];
+        parse_keywords_text("\u{feff}alpha", &mut twice);
+        assert_eq!(
+            twice.len(),
+            1,
+            "the same word must not be kept twice because one spelling carried a BOM"
+        );
     }
 
     #[test]

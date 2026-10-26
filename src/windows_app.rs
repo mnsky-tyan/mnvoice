@@ -752,28 +752,19 @@ fn idle_tip(hotkey: &str, hotkey_ok: bool, has_config: bool) -> String {
     if !has_config {
         return "mnvoice - NO API KEY. Set API_KEY in mnvoice.env (see log).".to_string();
     }
-    // "Disabled" is decided in one place, `hotkey_is_disabled`, rather than
-    // by an exact string match here. The parser normalises to lowercase "none"
-    // and the window setup tests the `hk_vk == 0` sentinel - three spellings of
-    // one rule, where this third one silently degraded to "mnvoice - idle. none
-    // to dictate." if the parser's normalisation ever changed.
-    if hotkey_is_disabled(hotkey) {
+    // "Disabled" is decided in one place, `config::hotkey_is_disabled`, rather
+    // than by an exact string match here. The parser normalises to lowercase
+    // "none" and the window setup tests the `hk_vk == 0` sentinel - three
+    // spellings of one rule, and a spelling kept locally here silently degraded
+    // to "mnvoice - idle. none to dictate." whenever the parser's normalisation
+    // changed.
+    if config::hotkey_is_disabled(hotkey) {
         return "mnvoice - idle. Hotkey disabled - use the tray menu.".to_string();
     }
     match (hotkey, hotkey_ok) {
         (hk, true) => format!("mnvoice - idle. {hk} to dictate."),
         (hk, false) => format!("mnvoice - idle. HOTKEY {hk} UNAVAILABLE (in use by another app)"),
     }
-}
-
-/// Whether `hotkey` is the disabled spelling.
-///
-/// One definition for a rule the parser, the window setup and the tray tip all
-/// need. The parser normalises to lowercase `"none"` when it builds the pair,
-/// so a case-insensitive compare here agrees with it by construction rather
-/// than by the two of them happening to spell it the same way today.
-fn hotkey_is_disabled(hotkey: &str) -> bool {
-    hotkey.eq_ignore_ascii_case("none")
 }
 
 /// The tray tooltip for a given session state. Single-sourced so left-click
@@ -2632,6 +2623,39 @@ mod tests {
         assert_eq!(mods.0, config::DEFAULT_HOTKEY_MOD);
         assert_eq!(vk, config::DEFAULT_HOTKEY_VK);
         assert_eq!(s, config::DEFAULT_HOTKEY_STR);
+    }
+
+    /// An omitted HOTKEY keeps the default; only `none` disables it.
+    ///
+    /// The regression this pins is silent: folding "empty" into the disabled
+    /// predicate switched the documented Alt+Space default off for any config
+    /// that never mentioned HOTKEY, so the key stopped working with nothing in
+    /// the log saying why. Driven through `config::load_from`, so it asserts the
+    /// pair and display string the tray actually shows rather than re-deriving
+    /// them here.
+    #[test]
+    fn an_omitted_hotkey_keeps_the_default_and_none_disables_it() {
+        let derive = |hotkey: &str| {
+            let cfg = config::load_from(&format!("HOTKEY={hotkey}\n"));
+            hotkey_of(&Some(std::sync::Arc::new(cfg)))
+        };
+
+        for empty in ["", "   "] {
+            let (mods, vk, s) = derive(empty);
+            assert_eq!(
+                (mods.0, vk, s.as_str()),
+                (
+                    config::DEFAULT_HOTKEY_MOD,
+                    config::DEFAULT_HOTKEY_VK,
+                    config::DEFAULT_HOTKEY_STR
+                ),
+                "{empty:?} must keep the default, not disable the key"
+            );
+        }
+
+        let (_mods, vk, s) = derive("none");
+        assert_eq!(vk, 0, "none must disable the toggle hotkey");
+        assert_eq!(s, "none");
     }
 
     #[test]

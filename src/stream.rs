@@ -910,10 +910,12 @@ mod tests {
     /// behind it cannot be delivered either - continuing only re-pays the
     /// transport's write bound for each one. Measured before this stopped: 50
     /// queued packets cost 1.6 s against a peer that stopped reading and 500
-    /// cost 300 s, and on Windows the send is not bounded at all, so the drain
-    /// could not finish and `run_stream` never returned. The intent is
-    /// unchanged: ship the queued tail when the peer is healthy, and stop the
-    /// moment it is not.
+    /// cost 300 s.
+    ///
+    /// The repeat cost is what this removes, and it is the whole of what it
+    /// removes on Windows: `WinHttpWebSocketSend` blocks without returning
+    /// `Err`, so against a peer that stalls rather than dies the first send
+    /// parks and the break is never reached. Bounding that is a separate change.
     ///
     /// This asserts the decision rather than the clock. On Unix a peer that
     /// drops the connection makes every send fail in microseconds, so a timing
