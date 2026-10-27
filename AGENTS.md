@@ -325,37 +325,41 @@ and direct keyboard event injection.
      `cfg(windows)` dev-dependency so the Windows test build can compute
      `Sec-WebSocket-Accept` with `derive_accept_key` instead of ~95 lines of
      hand-rolled SHA-1/base64. The release binary is unchanged (dev-only).
-   - **Two icon files serve the two platforms' surfaces; on Linux both are
-     baked in at build time.** `assets/mnvoice.ico` is the exe resource and the
-     launcher artwork (winres embeds it in the exe; the Linux build script
-     decodes its 256px frame into `OUT_DIR` so `platform::linux_icon` writes the
-     launcher PNG the desktop entry names with `Icon=mnvoice`), and
-     `assets/mnvoice-tray.ico` is the tray's mark-only set, baked as its nine
-     frames for the tray's `IconPixmap`. Before the brand mark was baked in at
-     all the Linux tray painted the orb from `orb_render` and the entry had no
-     `Icon=`, so the brand mark appeared nowhere on a Linux desktop - the orb
-     is a live status indicator, not the product icon.
-     There is a second asset for a measured reason: `assets/mnvoice-tray.ico`
-     is mark-only at EVERY size (wordmark dropped, 16..256), and the tray is
-     baked from it, while `assets/mnvoice.ico` keeps the wordmark card at
-     64px+ for the launcher's 256px PNG. The measured cause of the blurry
-     tray icon (2026-10-24): Plasma's status popup draws the tray icon at
-     ~94 device px, Qt's `QIcon` picks the smallest frame >= that request -
-     which was the 128px wordmark card - and shrinking the card squeezed
-     "mnvoice" into a smudge. Mark-only stays legible at any size the host
-     draws; the wordmark only reads at ~256px, which is where it belongs.
-     Both files are generated from the brand SVGs by the same recipe as
-     `mnvoice.ico` (librsvg via `~/mnsky/mnbrand/svg_render.py`, mark-only from
-     `mnvoice-mark.svg`, card from `mnvoice-icon.svg`); a test pins that no
-     tray frame carries wordmark ink. Regenerating the tray file: render
-     `mnvoice-mark.svg` natively at each of the nine sizes, then pack those
-     PNGs into a PNG-compressed ICO (one directory entry per size, 32 bpp) -
-     never by downscaling one render, which would blur the small frames.
+   - **Two icon files serve the two platforms; on Linux both surfaces read one
+     of them, baked in at build time.** `assets/mnvoice.ico` is the Windows exe
+     resource (winres embeds it), and `assets/mnvoice-linux.ico` is the Linux
+     tray's `IconPixmap` set plus the launcher PNG the desktop entry names with
+     `Icon=mnvoice`. Before the brand mark was baked in at all the Linux tray
+     painted the orb from `orb_render` and the entry had no `Icon=`, so the
+     brand mark appeared nowhere on a Linux desktop - the orb is a live status
+     indicator, not the product icon.
+     **The wordmark belongs in the icon** (user, 2026-10-26, after a revision
+     that served a wordmark-free mark: "i still need the word mnvoice insdie the
+     logo"). So `assets/mnvoice-linux.ico` is the full brand card - mark plus
+     "mnvoice" - at EVERY size, and two tests pin it (the wordmark is present
+     from 40px up and unmistakable at the 96px a popup draws; the 256px
+     launcher frame keeps it too). Do not reintroduce a mark-only tray set.
+     **The blur was resampling, not the wordmark.** Plasma's status popup draws
+     the tray icon at ~94 device px and a host picks the smallest frame >= that
+     request, so a sparse ladder lands on 128 and resamples - and a resampled
+     wordmark is what looked blurred. The Linux file therefore carries a dense
+     ladder (16, 20, 24, 28, 32, 36, 40, 44, 48, 56, 64, 72, 84, 96, 112, 128,
+     256), putting a native frame at the sizes hosts actually ask for: panel
+     22/24 at 1.25-2x scaling, popup ~96, HiDPI 44/48. Measured legibility of
+     the wordmark: legible from ~48px, marginal at 32-40, antialiased away below
+     ~40 (which is why the test floor is 40, not 16).
+     Both files are generated from the brand SVGs with librsvg
+     (`~/mnsky/mnbrand/svg_render.py`): `mnvoice-linux.ico` from
+     `mnvoice-icon.svg` (the card, with the wordmark), `mnvoice.ico` from the
+     same card at 64px+ and `mnvoice-mark.svg` below. Regenerating the Linux
+     file: render `mnvoice-icon.svg` natively at each ladder size, then pack
+     those PNGs into a PNG-compressed ICO (one directory entry per size, 32
+     bpp) - never by downscaling one render, which is the blur being fixed.
      Pixels travel through `OUT_DIR` files, not `cargo:rustc-env`: a 256KB env
      var overflowed rustc's command line ("Argument list too long", measured).
-     A checkout with a missing `.ico` warns per file instead of failing the
-     build: a missing `mnvoice-tray.ico` leaves the tray on the orb fallback,
-     a missing `mnvoice.ico` leaves the entry without an `Icon=` line.
+     A checkout with a missing `.ico` warns instead of failing the build: no
+     baked store means the tray falls back to the orb and the entry gets no
+     `Icon=` line, which `available()` gates together.
    - **The exe and tray icons are generated artwork, not a hand-editable asset.**
      `assets/mnvoice.ico` is built from the mn-brand master
      `~/mnsky/mnbrand/icons/mnvoice.svg` with librsvg (the brand renderer,
@@ -366,9 +370,9 @@ and direct keyboard event injection.
      plus the wordmark paths dropped and the remaining artwork scaled 1.15x
      about the mark's own centre. Inside `assets/mnvoice.ico` the wordmark
      appears at 64px and above and the mark alone below, which is what the exe
-     resource and the launcher want; the tray's file drops the wordmark at
-     every size instead, because the tray is drawn small and the mark stroke
-     is sub-pixel there. 1.15x is the measured maximum before the mark clips
+     resource wants; that file is not read on Linux at all, so its mark-only
+     small frames never reach the tray. The Linux file is the card at every
+     size. 1.15x is the measured maximum before the mark clips
      the card edge (1.25x puts ink outside the rounded rect). Do not "fix"
      the small sizes by thickening or redrawing the signature - the brand
      forbids it.
@@ -383,8 +387,8 @@ and direct keyboard event injection.
 mnvoice/
 ├── AGENTS.md              this file: test rules, release discipline, repo wiki
 ├── Cargo.toml             deps: windows (Win32), cpal+enigo (Unix), ashpd+wayland (Linux desktop)
-├── build.rs               winres for the exe version+icon; on Linux decodes both brand .ico files into OUT_DIR
-├── assets/                brand artwork: mnvoice.ico (exe resource + launcher card), mnvoice-tray.ico (tray, mark-only), the 2 source SVGs, orb-512.png
+├── build.rs               winres for the exe version+icon; on Linux decodes mnvoice-linux.ico into OUT_DIR
+├── assets/                brand artwork: mnvoice.ico (Windows exe resource), mnvoice-linux.ico (Linux tray + launcher, card with wordmark at 17 sizes), the 2 source SVGs, orb-512.png
 ├── src/
 │   ├── main.rs            entry: Windows -> windows_app; Linux -> linux_app (or --terminal); macOS -> cli
 │   ├── windows_app.rs     the Windows tray app: window, tray, hotkey, message loop (2,982 lines)
@@ -409,7 +413,7 @@ mnvoice/
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
 │       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from linux_icon (orb fallback)
-│       ├── linux_icon.rs  the brand mark on Linux: tray frames from mnvoice-tray.ico (mark-only, all sizes), launcher card from mnvoice.ico, baked by build.rs
+│       ├── linux_icon.rs  the brand card on Linux: tray frames and the launcher PNG both from mnvoice-linux.ico, baked by build.rs
 │       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
 │       ├── linux_impl.rs  the X11 XTest injector (fallback without a portal grant)
 │       ├── macos_impl.rs  the macOS injector (CoreGraphics)

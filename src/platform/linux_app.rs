@@ -577,12 +577,12 @@ pub fn ensure_autostart() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "mnvoice".into());
-    // The icon line is conditional on the launcher card actually being
-    // baked in: naming a file this build cannot write would be worse than no
-    // Icon= at all, since the desktop then draws its generic application
-    // placeholder. The card store is the one `ensure_icon` reads, so it is the
-    // one this asks about.
-    let icon = if crate::platform::linux_icon::card_available() {
+    // The icon line is conditional on a usable icon store actually being baked
+    // in: naming a file this build cannot write would be worse than no Icon= at
+    // all, since the desktop then draws its generic application placeholder.
+    // `available()` is the same store `ensure_icon` reads, so the two cannot
+    // disagree.
+    let icon = if crate::platform::linux_icon::available() {
         "Icon=mnvoice\n"
     } else {
         ""
@@ -683,12 +683,11 @@ fn add_missing_icon_line(path: &std::path::Path, icon: &str) {
 
 /// Writes the brand mark where the desktop's icon lookup finds `Icon=mnvoice`.
 ///
-/// The size is 256px, the one size `card_frame` bakes: the wordmark card at the
-/// size a launcher grid, a task switcher and a dock draw it at, where the
-/// wordmark is legible. It comes from the card store (`assets/mnvoice.ico`)
-/// rather than the tray's mark-only set (`assets/mnvoice-tray.ico`), because
-/// the two surfaces are drawn at different sizes and each wants the drawing
-/// made for its own - the tray is read small, the launcher is read large.
+/// The size is 256px, the one size the icon theme directory names
+/// (`hicolor/256x256/apps`), which is where a launcher grid, a task switcher
+/// and a dock read it from. It comes from the same store the tray serves
+/// (`assets/mnvoice-linux.ico`), so the icon in the app grid and the icon in
+/// the tray are the same artwork - the brand card with its wordmark.
 ///
 /// Best effort by design: an icon is not worth failing a startup over, and a
 /// read-only home is a legitimate state (a live session, a test run).
@@ -696,7 +695,7 @@ fn ensure_icon() {
     let Ok(home) = std::env::var("HOME") else {
         return;
     };
-    let Some((width, height, rgba)) = crate::platform::linux_icon::card_frame() else {
+    let Some((width, height, rgba)) = crate::platform::linux_icon::frame(256) else {
         return;
     };
     let Some(dir) = std::path::Path::new(&home)
