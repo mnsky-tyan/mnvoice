@@ -334,7 +334,14 @@ impl WaylandTyper {
     /// `notify_keyboard_keysym` takes the keysym, and the compositor applies
     /// the modifier it implies.
     pub async fn type_text(&self, text: &str) -> Result<(), String> {
-        for c in text.chars() {
+        let typed = latin1_typing_chars(text);
+        if transcript_reshaped(text) {
+            eprintln!(
+                "mnvoice: typing {} chars as plain keyboard text (smart punctuation and untypeable characters normalized)",
+                typed.chars().count()
+            );
+        }
+        for c in typed.chars() {
             let keysym = xkbcommon::xkb::Keysym::from_char(c);
             self.remote
                 .notify_keyboard_keysym(
@@ -360,9 +367,119 @@ impl WaylandTyper {
     }
 }
 
+/// Rewrites `text` into what a portal typing session can deliver without a
+/// keymap rebuild, in order, dropping what cannot be typed at all.
+///
+/// Why this exists: a character outside the active layout (the smart
+/// punctuation a transcription model emits - em dash, curly quotes, ellipsis)
+/// has no key in the compositor's keymap. KWin then REBUILDS the keymap
+/// around a spare keycode to type it and rebuilds back, and the rebuild
+/// resets the whole XKB state: any modifier the user is physically holding at
+/// that moment is wiped mid-hold (`MODIFIERS depressed=0` at the focused
+/// window), and the eventual release arrives against a keymap that changed
+/// twice, so clients cannot match it. Measured in a private KWin 6.6.6 on
+/// 2026-10-27: one em dash driven through `org_kde_kwin_fake_input` while
+/// Alt_L was held produced two keymap swaps, a depressed=0 modifiers event
+/// and an Alt release with keysym 0. A dictation transcript types over
+/// seconds, overlapping the user's own keystrokes, so this is the mechanism
+/// behind both "garbled words" and "a modifier feels stuck after a
+/// dictation".
+///
+/// The replacement set is the punctuation a transcription model actually
+/// emits; each maps to what a user would have typed on a us keyboard.
+/// Chars with no keysym at all (emoji, zero-width controls) are dropped
+/// rather than sent as keysym 0. Non-punctuation non-Latin-1 text (CJK and
+/// friends) still types through the rebuild path - better than dropping
+/// words.
+/// The characters a portal typing session can deliver without touching the
+/// compositor's keymap: Latin-1, whose keysyms are their own code points and
+/// which every real layout maps directly.
+fn is_latin1(c: char) -> bool {
+    matches!(c as u32, 0x20..=0x7e | 0xa0..=0xff)
+}
+
+pub fn latin1_typing_chars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            // Dashes, quotes and ellipsis: what the model emits, as the keys
+            // a user would have pressed.
+            '\u{2013}' | '\u{2014}' | '\u{2212}' => out.push('-'),
+            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => out.push('\''),
+            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => out.push('"'),
+            '\u{2026}' => out.push_str("..."),
+            '\u{00a0}' => out.push(' '),
+            // Not typeable on any keyboard: skip rather than inject noise.
+            '\u{00ad}' | '\u{200b}' | '\u{feff}' => {}
+            other => {
+                if is_latin1(other) {
+                    out.push(other);
+                } else if xkbcommon::xkb::Keysym::from_char(other)
+                    != xkbcommon::xkb::Keysym::NoSymbol
+                {
+                    // Real content outside Latin-1 (CJK and friends): it
+                    // still types, through the keymap-rebuild path.
+                    out.push(other);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `latin1_typing_chars` had to reshape `text`: replacements, drops,
+/// or anything outside Latin-1. The caller logs once per transcript so the
+/// user can see why a typed quote came out straight.
+fn transcript_reshaped(text: &str) -> bool {
+    latin1_typing_chars(text) != text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smart_punctuation_types_without_a_keymap_reload() {
+        // The rule that keeps the compositor's keymap (and the user's held
+        // modifiers) untouched while a transcript types. Every character the
+        // model's smart formatting emits must come out as a key a us layout
+        // already has - anything else sends KWin through its keymap-rebuild
+        // path, which wipes held modifiers and mismaps the next releases
+        // (measured against a private KWin 6.6.6, see the function's note).
+        let transcript = "He said \u{2018}ready\u{2019} \u{2014} then waited\u{2026} \u{2013} gone";
+        assert_eq!(latin1_typing_chars(transcript), "He said 'ready' - then waited... - gone");
+        assert_eq!(latin1_typing_chars("\u{201c}quoted\u{201d}"), "\"quoted\"");
+        assert_eq!(latin1_typing_chars("it\u{2019}s"), "it's");
+        // Plain text passes through untouched.
+        assert_eq!(latin1_typing_chars("hello, world! 123"), "hello, world! 123");
+    }
+
+    #[test]
+    fn untypeable_characters_dont_reach_the_portal() {
+        // A keysym-0 press/release pair injects nothing and just spends the
+        // round trip; zero-width controls have no keysym at all.
+        assert_eq!(
+            latin1_typing_chars("a\u{feff}b\u{200b}c\u{ad}d"),
+            "abcd"
+        );
+    }
+
+    #[test]
+    fn real_content_outside_latin1_still_types() {
+        // Dropping words is worse than a keymap rebuild: CJK, accented text
+        // and emoji all resolve to keysyms and keep their characters.
+        assert_eq!(
+            latin1_typing_chars("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"),
+            "caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"
+        );
+    }
+
+    #[test]
+    fn reshape_flag_marks_exactly_the_transcripts_that_changed() {
+        assert!(!transcript_reshaped("plain words"));
+        assert!(transcript_reshaped("em \u{2014} dash"));
+        assert!(transcript_reshaped("dropped \u{feff} mark"));
+    }
 
     #[test]
     fn a_chord_is_the_only_thing_the_portal_will_grab_for_good() {

@@ -15,7 +15,7 @@ and direct keyboard event injection.
 2. **Toolchain & Testing Scope**:
    - The authoritative test suite is TWO, not one, and they answer different
      questions. Locally `~/.cargo/bin/cargo test --locked` builds and tests the
-     whole crate natively (154 tests, ~6 s), is what an agent must run before
+     whole crate natively (158 tests, ~6 s), is what an agent must run before
      every commit, and is the gate's own test command (`.no-mistakes.yaml`
      `commands.test`). CI (`release.yml`, dispatched on `main` and on every PR,
      building windows/linux/macos on real runners) is the gate for a change and
@@ -185,6 +185,26 @@ and direct keyboard event injection.
      fix is to route the streaming loop's own commits through the portal
      typer, not to drop the final pass. Do not "fix the double typing" again
      without measuring which injector reaches the user's actual windows.
+
+   - **A transcript types as plain keyboard text: smart punctuation is
+     normalized to ASCII before the portal sees it.** Measured 2026-10-27 in
+     a private KWin 6.6.6 with a keysym driver and a focused wl_keyboard
+     spy: a character outside the active layout (the em dash, curly quotes
+     and ellipsis a transcription model emits) makes KWin REBUILD its keymap
+     around a spare keycode and rebuild back, and the rebuild resets the
+     whole XKB state. With Alt held, one em dash produced a `MODIFIERS
+     depressed=0` event mid-hold and an Alt release carrying keysym 0 - the
+     app cannot match it, so a modifier looks stuck and keystrokes land
+     mis-mapped. A transcript types over seconds and overlaps the user's own
+     keystrokes, so v0.1.34's raw keysym typing produced both "garbled
+     words" and "the keyboard is broken after a dictation".
+     `linux_portal::latin1_typing_chars` maps the model's smart set to what
+     a us keyboard types (`-`, `'`, `"`, `...`), drops zero-width and
+     keysym-less characters, and passes real content (CJK, accented, emoji)
+     through unchanged - those still type via the rebuild path, which beats
+     dropping words. `type_text` logs once when a transcript was reshaped.
+     Do not "restore exact smart punctuation" without solving the keymap
+     rebuild first.
 
    - **A cancel must not wait out the provider's final-transcription window.**
      The streaming loop waited up to 1500 ms for Deepgram's last frame, and
@@ -411,7 +431,7 @@ mnvoice/
 │       ├── unix_audio.rs  cpal capture (Linux, macOS)
 │       ├── unix_http.rs   ureq + tungstenite transport (Linux, macOS)
 │       ├── linux_app.rs   the Linux desktop app: flock, autostart, worker-thread loop (hotkey + tray events), PHASE static, relaunch
-│       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing
+│       ├── linux_portal.rs ashpd clients: GlobalShortcuts hotkey (with the bare-key guard), RemoteDesktop typing (smart punctuation normalized to keymap-safe text)
 │       ├── linux_tray.rs  the tray (ksni StatusNotifierItem): rows per phase -> AppEvent, icon from linux_icon (orb fallback)
 │       ├── linux_icon.rs  the brand card on Linux: tray frames and the launcher PNG both from mnvoice-linux.ico, baked by build.rs
 │       ├── linux_orb.rs   the orb's Linux surface: zwlr_layer_shell_v1 overlay, one surface per dictation, buffers destroyed with it, scope=on-screen-display (window type, not a label), buffer released before reuse
