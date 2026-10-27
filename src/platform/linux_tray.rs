@@ -161,13 +161,14 @@ impl Tray for MnvoiceTray {
         }
     }
 
-    /// The tray icon is the brand mark, not the orb: this is the surface a
-    /// Linux desktop identifies the app by. The mark is mark-only at every
-    /// size - the wordmark card lives in the launcher icon instead - because
-    /// the tray is drawn small (Plasma's status popup measured at ~94 device
-    /// px), where the wordmark is unreadable mush. The orb stays on screen as
-    /// the live indicator, where motion carries the state; a still of it in
-    /// the panel said nothing and was not the product's icon.
+    /// The tray icon is the brand card, not the orb: this is the surface a
+    /// Linux desktop identifies the app by. Every frame is the same artwork -
+    /// the mark with the "mnvoice" wordmark beneath it - drawn natively at its
+    /// own size, so the wordmark is the artwork's rather than a resample of a
+    /// bigger drawing. It reads at the ~94px a status popup draws and is part
+    /// of the artwork below that, where it is too small to make out. The orb
+    /// stays on screen as the live indicator, where motion carries the state; a
+    /// still of it in the panel said nothing and was not the product's icon.
     ///
     /// A still rather than an animation either way: driving a 30 fps timer
     /// through D-Bus to move a 22px tray icon costs far more than the motion
@@ -186,9 +187,10 @@ impl Tray for MnvoiceTray {
         // a bigger one - resampling it is what looked blurred.
         let frames = crate::platform::linux_icon::all_frames();
         if frames.is_empty() {
-            // No baked brand mark (a checkout whose tray `.ico` was missing -
-            // the build script warns and continues): the orb is still a better
-            // tray icon than nothing, so the app keeps identifying itself.
+            // No baked brand card (a checkout whose `mnvoice-linux.ico` was
+            // missing: the build script warns and continues): the orb is still
+            // a better tray icon than nothing, so the app keeps identifying
+            // itself.
             return orb_pixmap((self.phase)(), self.frame, self.color, self.fluid_level);
         }
         frames

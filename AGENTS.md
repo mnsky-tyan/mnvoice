@@ -370,9 +370,9 @@ and direct keyboard event injection.
      plus the wordmark paths dropped and the remaining artwork scaled 1.15x
      about the mark's own centre. Inside `assets/mnvoice.ico` the wordmark
      appears at 64px and above and the mark alone below, which is what the exe
-     resource and the launcher want; the tray's file drops the wordmark at
-     every size instead, because the tray is drawn small and the mark stroke
-     is sub-pixel there. 1.15x is the measured maximum before the mark clips
+     resource wants; that file is not read on Linux at all, so its mark-only
+     small frames never reach the tray. The Linux file is the card at every
+     size. 1.15x is the measured maximum before the mark clips
      the card edge (1.25x puts ink outside the rounded rect). Do not "fix"
      the small sizes by thickening or redrawing the signature - the brand
      forbids it.

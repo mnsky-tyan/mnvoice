@@ -146,10 +146,12 @@ Notepad; on Linux the files are a text editor away and no editor command is
 configured here). A row that could not do the thing would be a lie.
 
 Left click opens the menu, the convention for an item with no window to raise.
-The icon is the mnvoice brand mark, drawn mark-only at every size so it stays
-legible however small a host renders it - the wordmark card is reserved for the
-launcher icon, where it is drawn large enough to read - and its tooltip names
-the hotkey.
+The icon is the mnvoice brand card - the mark with "mnvoice" beneath it - and
+its tooltip names the hotkey. It ships as seventeen drawings, one for each size
+a host might ask for, because a host left to resample one drawing is what made
+the wordmark look blurred. The wordmark reads at the ~96px a status popup
+draws and stays legible down to ~48px; at panel sizes it is part of the artwork
+but too small to read, which is a limit of the pixels rather than a choice.
 
 The Linux orb is a Wayland layer-shell overlay (the protocol panels and OSDs
 use): above every window, click-through, no focus. It is 48 logical pixels on
@@ -501,9 +503,10 @@ GlobalShortcuts portal; typing goes through the RemoteDesktop portal.
   launcher icon with `Icon=mnvoice`, and the icon they name is written to
   `~/.local/share/icons/hicolor/256x256/apps/mnvoice.png` (refreshed on each
   start), so the app is identified by its brand icon rather than a generic
-  placeholder. The tray serves the same artwork at seventeen sizes, so the panel
-  and its status popup each get an icon drawn for the size they show. The compositor shows one confirmation dialog for the hotkey
-  binding and one for keyboard access on the first dictation; both grants persist.
+  placeholder. The tray serves the same artwork at seventeen sizes, so the
+  panel and its status popup each get an icon drawn for the size they show.
+  The compositor shows one confirmation dialog for the hotkey binding and one
+  for keyboard access on the first dictation; both grants persist.
 
 Known limits in this release, stated rather than papered over:
 
