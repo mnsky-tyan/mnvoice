@@ -521,6 +521,14 @@ Known limits in this release, stated rather than papered over:
   RemoteDesktop grant the compositor synthesizes the keystrokes and native
   Wayland windows receive them; without it the X11 XTest injector runs, which
   reaches X11 and XWayland windows only.
+- **Linux transcripts type as plain keyboard text.** Smart punctuation from
+  the transcription model is normalized before typing - an em dash becomes
+  `-`, curly quotes become `'` and `"`, an ellipsis becomes `...` - and the
+  invisible controls (soft hyphen, zero-width space, byte-order mark) are
+  dropped. A character outside the active keyboard layout makes the
+  compositor rebuild its keymap around it, which resets modifier state, so
+  this is what keeps a held modifier from being swallowed mid-dictation.
+  Accented letters, CJK and emoji are typed unchanged.
 - **No self-update on Linux.** The updater is Windows-only; the Linux app
   checks the releases page by hand. The tray has no "Check for updates" row for
   the same reason - see "The tray menu" above.

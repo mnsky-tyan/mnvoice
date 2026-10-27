@@ -325,7 +325,12 @@ impl WaylandTyper {
     }
 
     /// Types `text` into whatever window has focus, one keysym press and
-    /// release per character.
+    /// release per emitted character.
+    ///
+    /// `text` goes through [`latin1_typing_chars`] first, so the smart
+    /// punctuation a transcription model emits types as the keys a us layout
+    /// already has and the invisible controls are dropped; the log line below
+    /// fires only when that changed something.
     ///
     /// The pacing matches the XTest injector's contract (`input::KEY_GAP`
     /// after each character): a burst of D-Bus messages can outpace the target
@@ -434,11 +439,17 @@ mod tests {
         // path, which wipes held modifiers and mismaps the next releases
         // (measured against a private KWin 6.6.6, see the function's note).
         let transcript = "He said \u{2018}ready\u{2019} \u{2014} then waited\u{2026} \u{2013} gone";
-        assert_eq!(latin1_typing_chars(transcript), "He said 'ready' - then waited... - gone");
+        assert_eq!(
+            latin1_typing_chars(transcript),
+            "He said 'ready' - then waited... - gone"
+        );
         assert_eq!(latin1_typing_chars("\u{201c}quoted\u{201d}"), "\"quoted\"");
         assert_eq!(latin1_typing_chars("it\u{2019}s"), "it's");
         // Plain text passes through untouched.
-        assert_eq!(latin1_typing_chars("hello, world! 123"), "hello, world! 123");
+        assert_eq!(
+            latin1_typing_chars("hello, world! 123"),
+            "hello, world! 123"
+        );
     }
 
     #[test]
@@ -446,10 +457,7 @@ mod tests {
         // Zero-width and soft-hyphen controls are removed by the explicit
         // drop list, not by a missing keysym: from_char gives every one of
         // them a Unicode keysym, so only the list keeps them off the wire.
-        assert_eq!(
-            latin1_typing_chars("a\u{feff}b\u{200b}c\u{ad}d"),
-            "abcd"
-        );
+        assert_eq!(latin1_typing_chars("a\u{feff}b\u{200b}c\u{ad}d"), "abcd");
     }
 
     #[test]
