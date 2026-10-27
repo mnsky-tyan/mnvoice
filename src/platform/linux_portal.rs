@@ -368,7 +368,8 @@ impl WaylandTyper {
 }
 
 /// Rewrites `text` into what a portal typing session can deliver without a
-/// keymap rebuild, in order, dropping what cannot be typed at all.
+/// keymap rebuild, in order, deliberately skipping the invisible controls
+/// listed below.
 ///
 /// Why this exists: a character outside the active layout (the smart
 /// punctuation a transcription model emits - em dash, curly quotes, ellipsis)
@@ -403,7 +404,9 @@ pub fn latin1_typing_chars(text: &str) -> String {
             '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => out.push('"'),
             '\u{2026}' => out.push_str("..."),
             '\u{00a0}' => out.push(' '),
-            // Not typeable on any keyboard: skip rather than inject noise.
+            // Invisible controls (soft hyphen, zero-width space and NBSP's
+            // widthless cousin): skipped deliberately rather than injected,
+            // not because they lack keysyms.
             '\u{00ad}' | '\u{200b}' | '\u{feff}' => {}
             other => {
                 if xkbcommon::xkb::Keysym::from_char(other) != xkbcommon::xkb::Keysym::NoSymbol {
