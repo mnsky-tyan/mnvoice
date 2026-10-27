@@ -16,13 +16,13 @@
 //     startup (`linux_app::ensure_autostart`), not a checkbox that can flip a
 //     task. A menu item that could not do the thing would be a lie.
 //
-// The icon is the brand MARK, mark-only at every size, baked from
-// `assets/mnvoice-tray.ico` by `build.rs` and served by `linux_icon`. The
-// wordmark card is deliberately NOT in this set: the tray is drawn small
-// (Plasma's status popup measured at ~94 device px), where a wordmark is
-// unreadable mush - the mark alone stays legible. The card with the wordmark
-// lives in the launcher icon instead. The orb survives only as the fallback a
-// build without a baked mark serves; see `icon_pixmap`.
+// The icon is the brand card - the mark with the "mnvoice" wordmark beneath it -
+// baked from `assets/mnvoice-linux.ico` by `build.rs` and served by
+// `linux_icon` at seventeen sizes. The wordmark belongs in the icon, and the
+// dense size ladder is what keeps it sharp: the host picks the frame nearest
+// the size it draws at instead of resampling one, which is what made the
+// wordmark look blurred before. The orb survives only as the fallback a build
+// without a baked icon serves; see `icon_pixmap`.
 
 use crate::orb_render::{render_gas_fluid, OrbState, ORB_HEIGHT, ORB_WIDTH};
 use crate::platform::linux_app::AppEvent;
@@ -179,12 +179,11 @@ impl Tray for MnvoiceTray {
         // the content actually changes (it hashes it), so the whole set costs
         // one send at registration rather than one per refresh.
         //
-        // The result is the responsive set doing its job: a 22px panel icon
-        // gets the 24px drawing, a 44px HiDPI one gets 48px, and a large
-        // context such as the status popup gets the 128px or 256px frame
-        // instead of an upscale. Every frame is mark-only, so the largest one
-        // is still a clean mark rather than a shrunk wordmark - that was the
-        // reported blur.
+        // The result is the responsive set doing its job: a 22px panel icon gets
+        // the 24px drawing, a 44px HiDPI one gets 44px exactly, and the status
+        // popup's ~94px gets 96px. Every frame is the same card, drawn for its
+        // own size, so the wordmark is the artwork's rather than a resample of
+        // a bigger one - resampling it is what looked blurred.
         let frames = crate::platform::linux_icon::all_frames();
         if frames.is_empty() {
             // No baked brand mark (a checkout whose tray `.ico` was missing -
@@ -501,8 +500,7 @@ mod tests {
                     "{expected}px pixel is not A,R,G,B"
                 );
             }
-            // The largest frame is still the mark, not the wordmark card (that
-            // is the launcher's artwork, `card_frame`); it must be opaque
+            // The largest frame is the same card at 256px; it must be opaque
             // enough to see.
             if expected == 256 {
                 let opaque = icon.data.chunks(4).filter(|px| px[0] > 40).count();

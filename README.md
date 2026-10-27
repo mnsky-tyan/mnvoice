@@ -500,8 +500,9 @@ GlobalShortcuts portal; typing goes through the RemoteDesktop portal.
   you sit down, the same way the Windows logon task works. Both entries name the
   launcher icon with `Icon=mnvoice`, and the icon they name is written to
   `~/.local/share/icons/hicolor/256x256/apps/mnvoice.png` (refreshed on each
-  start), so the app is identified by its brand mark rather than a generic
-  placeholder. The compositor shows one confirmation dialog for the hotkey
+  start), so the app is identified by its brand icon rather than a generic
+  placeholder. The tray serves the same artwork at seventeen sizes, so the panel
+  and its status popup each get an icon drawn for the size they show. The compositor shows one confirmation dialog for the hotkey
   binding and one for keyboard access on the first dictation; both grants persist.
 
 Known limits in this release, stated rather than papered over:
