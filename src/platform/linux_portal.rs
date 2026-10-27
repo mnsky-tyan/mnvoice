@@ -335,7 +335,7 @@ impl WaylandTyper {
     /// the modifier it implies.
     pub async fn type_text(&self, text: &str) -> Result<(), String> {
         let typed = latin1_typing_chars(text);
-        if transcript_reshaped(text) {
+        if typed != text {
             eprintln!(
                 "mnvoice: typing {} chars as plain keyboard text (smart punctuation and untypeable characters normalized)",
                 typed.chars().count()
@@ -387,17 +387,11 @@ impl WaylandTyper {
 ///
 /// The replacement set is the punctuation a transcription model actually
 /// emits; each maps to what a user would have typed on a us keyboard.
-/// Chars with no keysym at all (emoji, zero-width controls) are dropped
-/// rather than sent as keysym 0. Non-punctuation non-Latin-1 text (CJK and
-/// friends) still types through the rebuild path - better than dropping
-/// words.
-/// The characters a portal typing session can deliver without touching the
-/// compositor's keymap: Latin-1, whose keysyms are their own code points and
-/// which every real layout maps directly.
-fn is_latin1(c: char) -> bool {
-    matches!(c as u32, 0x20..=0x7e | 0xa0..=0xff)
-}
-
+/// Zero-width and soft-hyphen controls are dropped by the explicit list
+/// below, not because they lack a keysym. Only printable ASCII is keymap
+/// safe: everything else that still resolves to a keysym - accented
+/// Latin-1, CJK, emoji - is kept and types through KWin's keymap-rebuild
+/// path, which beats dropping words.
 pub fn latin1_typing_chars(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -412,26 +406,16 @@ pub fn latin1_typing_chars(text: &str) -> String {
             // Not typeable on any keyboard: skip rather than inject noise.
             '\u{00ad}' | '\u{200b}' | '\u{feff}' => {}
             other => {
-                if is_latin1(other) {
-                    out.push(other);
-                } else if xkbcommon::xkb::Keysym::from_char(other)
-                    != xkbcommon::xkb::Keysym::NoSymbol
-                {
-                    // Real content outside Latin-1 (CJK and friends): it
-                    // still types, through the keymap-rebuild path.
+                if xkbcommon::xkb::Keysym::from_char(other) != xkbcommon::xkb::Keysym::NoSymbol {
+                    // Real content outside printable ASCII (accented
+                    // Latin-1, CJK, emoji): it still types, through the
+                    // keymap-rebuild path.
                     out.push(other);
                 }
             }
         }
     }
     out
-}
-
-/// Whether `latin1_typing_chars` had to reshape `text`: replacements, drops,
-/// or anything outside Latin-1. The caller logs once per transcript so the
-/// user can see why a typed quote came out straight.
-fn transcript_reshaped(text: &str) -> bool {
-    latin1_typing_chars(text) != text
 }
 
 #[cfg(test)]
@@ -456,8 +440,9 @@ mod tests {
 
     #[test]
     fn untypeable_characters_dont_reach_the_portal() {
-        // A keysym-0 press/release pair injects nothing and just spends the
-        // round trip; zero-width controls have no keysym at all.
+        // Zero-width and soft-hyphen controls are removed by the explicit
+        // drop list, not by a missing keysym: from_char gives every one of
+        // them a Unicode keysym, so only the list keeps them off the wire.
         assert_eq!(
             latin1_typing_chars("a\u{feff}b\u{200b}c\u{ad}d"),
             "abcd"
@@ -465,9 +450,10 @@ mod tests {
     }
 
     #[test]
-    fn real_content_outside_latin1_still_types() {
+    fn real_content_outside_printable_ascii_still_types() {
         // Dropping words is worse than a keymap rebuild: CJK, accented text
-        // and emoji all resolve to keysyms and keep their characters.
+        // and emoji all resolve to keysyms and keep their characters, even
+        // though they type through the rebuild path.
         assert_eq!(
             latin1_typing_chars("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"),
             "caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"
@@ -475,10 +461,24 @@ mod tests {
     }
 
     #[test]
-    fn reshape_flag_marks_exactly_the_transcripts_that_changed() {
-        assert!(!transcript_reshaped("plain words"));
-        assert!(transcript_reshaped("em \u{2014} dash"));
-        assert!(transcript_reshaped("dropped \u{feff} mark"));
+    fn the_log_decision_is_the_mapping_changing_the_text() {
+        // What `type_text` compares to decide whether to log: the transcript
+        // the mapping produced against the one it was given. Text that needs
+        // no reshaping comes back byte-identical, so the log stays silent;
+        // anything the model's smart formatting touched, or the drop list
+        // removed, is not.
+        assert_eq!(latin1_typing_chars("plain words"), "plain words");
+        assert_ne!(latin1_typing_chars("em \u{2014} dash"), "em \u{2014} dash");
+        assert_ne!(
+            latin1_typing_chars("dropped \u{feff} mark"),
+            "dropped \u{feff} mark"
+        );
+        // Content that types through the rebuild path is unchanged, so it
+        // does not claim a reshape that never happened.
+        assert_eq!(
+            latin1_typing_chars("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"),
+            "caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"
+        );
     }
 
     #[test]

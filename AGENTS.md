@@ -199,10 +199,12 @@ and direct keyboard event injection.
      keystrokes, so v0.1.34's raw keysym typing produced both "garbled
      words" and "the keyboard is broken after a dictation".
      `linux_portal::latin1_typing_chars` maps the model's smart set to what
-     a us keyboard types (`-`, `'`, `"`, `...`), drops zero-width and
-     keysym-less characters, and passes real content (CJK, accented, emoji)
-     through unchanged - those still type via the rebuild path, which beats
-     dropping words. `type_text` logs once when a transcript was reshaped.
+     a us keyboard types (`-`, `'`, `"`, `...`) and drops the zero-width and
+     soft-hyphen controls on its explicit list. Only printable ASCII is
+     keymap safe: real content outside it (accented Latin-1, CJK, emoji)
+     passes through unchanged and still types via the rebuild path, which
+     beats dropping words. `type_text` logs once when the mapping changed
+     the transcript.
      Do not "restore exact smart punctuation" without solving the keymap
      rebuild first.
 
