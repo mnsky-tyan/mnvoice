@@ -325,7 +325,12 @@ impl WaylandTyper {
     }
 
     /// Types `text` into whatever window has focus, one keysym press and
-    /// release per character.
+    /// release per emitted character.
+    ///
+    /// `text` goes through [`latin1_typing_chars`] first, so the smart
+    /// punctuation a transcription model emits types as the keys a us layout
+    /// already has and the invisible controls are dropped; the log line below
+    /// fires only when that changed something.
     ///
     /// The pacing matches the XTest injector's contract (`input::KEY_GAP`
     /// after each character): a burst of D-Bus messages can outpace the target
@@ -334,7 +339,14 @@ impl WaylandTyper {
     /// `notify_keyboard_keysym` takes the keysym, and the compositor applies
     /// the modifier it implies.
     pub async fn type_text(&self, text: &str) -> Result<(), String> {
-        for c in text.chars() {
+        let typed = latin1_typing_chars(text);
+        if typed != text {
+            eprintln!(
+                "mnvoice: typing {} chars as plain keyboard text (smart punctuation and invisible characters normalized)",
+                typed.chars().count()
+            );
+        }
+        for c in typed.chars() {
             let keysym = xkbcommon::xkb::Keysym::from_char(c);
             self.remote
                 .notify_keyboard_keysym(
@@ -360,9 +372,125 @@ impl WaylandTyper {
     }
 }
 
+/// Rewrites `text` into what a portal typing session can deliver without a
+/// keymap rebuild, in order, deliberately skipping the invisible controls
+/// listed below.
+///
+/// Why this exists: a character outside the active layout (the smart
+/// punctuation a transcription model emits - em dash, curly quotes, ellipsis)
+/// has no key in the compositor's keymap. KWin then REBUILDS the keymap
+/// around a spare keycode to type it and rebuilds back, and the rebuild
+/// resets the whole XKB state: any modifier the user is physically holding at
+/// that moment is wiped mid-hold (`MODIFIERS depressed=0` at the focused
+/// window), and the eventual release arrives against a keymap that changed
+/// twice, so clients cannot match it. Measured in a private KWin 6.6.6 on
+/// 2026-10-27: one em dash driven through `org_kde_kwin_fake_input` while
+/// Alt_L was held produced two keymap swaps, a depressed=0 modifiers event
+/// and an Alt release with keysym 0. A dictation transcript types over
+/// seconds, overlapping the user's own keystrokes, so this is the mechanism
+/// behind both "garbled words" and "a modifier feels stuck after a
+/// dictation".
+///
+/// The replacement set is the punctuation a transcription model actually
+/// emits; each maps to what a user would have typed on a us keyboard.
+/// Zero-width and soft-hyphen controls are dropped by the explicit list
+/// below, not because they lack a keysym. Only printable ASCII is keymap
+/// safe: everything else that still resolves to a keysym - accented
+/// Latin-1, CJK, emoji - is kept and types through KWin's keymap-rebuild
+/// path, which beats dropping words.
+pub fn latin1_typing_chars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            // Dashes, quotes and ellipsis: what the model emits, as the keys
+            // a user would have pressed.
+            '\u{2013}' | '\u{2014}' | '\u{2212}' => out.push('-'),
+            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => out.push('\''),
+            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => out.push('"'),
+            '\u{2026}' => out.push_str("..."),
+            '\u{00a0}' => out.push(' '),
+            // Invisible controls (soft hyphen, zero-width space and NBSP's
+            // widthless cousin): skipped deliberately rather than injected,
+            // not because they lack keysyms.
+            '\u{00ad}' | '\u{200b}' | '\u{feff}' => {}
+            other => {
+                if xkbcommon::xkb::Keysym::from_char(other) != xkbcommon::xkb::Keysym::NoSymbol {
+                    // Real content outside printable ASCII (accented
+                    // Latin-1, CJK, emoji): it still types, through the
+                    // keymap-rebuild path.
+                    out.push(other);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smart_punctuation_types_without_a_keymap_reload() {
+        // The rule that keeps the compositor's keymap (and the user's held
+        // modifiers) untouched while a transcript types. Every character the
+        // model's smart formatting emits must come out as a key a us layout
+        // already has - anything else sends KWin through its keymap-rebuild
+        // path, which wipes held modifiers and mismaps the next releases
+        // (measured against a private KWin 6.6.6, see the function's note).
+        let transcript = "He said \u{2018}ready\u{2019} \u{2014} then waited\u{2026} \u{2013} gone";
+        assert_eq!(
+            latin1_typing_chars(transcript),
+            "He said 'ready' - then waited... - gone"
+        );
+        assert_eq!(latin1_typing_chars("\u{201c}quoted\u{201d}"), "\"quoted\"");
+        assert_eq!(latin1_typing_chars("it\u{2019}s"), "it's");
+        // Plain text passes through untouched.
+        assert_eq!(
+            latin1_typing_chars("hello, world! 123"),
+            "hello, world! 123"
+        );
+    }
+
+    #[test]
+    fn invisible_controls_dont_reach_the_portal() {
+        // Zero-width and soft-hyphen controls are removed by the explicit
+        // drop list, not by a missing keysym: from_char gives every one of
+        // them a Unicode keysym, so only the list keeps them off the wire.
+        assert_eq!(latin1_typing_chars("a\u{feff}b\u{200b}c\u{ad}d"), "abcd");
+    }
+
+    #[test]
+    fn real_content_outside_printable_ascii_still_types() {
+        // Dropping words is worse than a keymap rebuild: CJK, accented text
+        // and emoji all resolve to keysyms and keep their characters, even
+        // though they type through the rebuild path.
+        assert_eq!(
+            latin1_typing_chars("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"),
+            "caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"
+        );
+    }
+
+    #[test]
+    fn the_log_decision_is_the_mapping_changing_the_text() {
+        // What `type_text` compares to decide whether to log: the transcript
+        // the mapping produced against the one it was given. Text that needs
+        // no reshaping comes back byte-identical, so the log stays silent;
+        // anything the model's smart formatting touched, or the drop list
+        // removed, is not.
+        assert_eq!(latin1_typing_chars("plain words"), "plain words");
+        assert_ne!(latin1_typing_chars("em \u{2014} dash"), "em \u{2014} dash");
+        assert_ne!(
+            latin1_typing_chars("dropped \u{feff} mark"),
+            "dropped \u{feff} mark"
+        );
+        // Content that types through the rebuild path is unchanged, so it
+        // does not claim a reshape that never happened.
+        assert_eq!(
+            latin1_typing_chars("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"),
+            "caf\u{e9} \u{4e2d}\u{6587} \u{1f600}"
+        );
+    }
 
     #[test]
     fn a_chord_is_the_only_thing_the_portal_will_grab_for_good() {
