@@ -25,9 +25,11 @@
 // pixels drawn are the pixels drawn for that size.
 //
 // The whole set is served together and the host picks. `frame` maps a requested
-// size to the nearest baked frame through `frame_index`; in production both are
-// reached from `all_frames`, which asks for each baked size exactly, and from
-// the launcher's single 256px read.
+// size to the nearest baked frame through `frame_index`, and production reaches
+// that pair twice: `all_frames` asks for each baked size exactly, and the
+// launcher asks once for 256, the size its PNG is written at. The ladder carries
+// a 256px frame so that second read lands on it rather than on the nearest
+// neighbour.
 //
 // The colours are not recoloured. A StatusNotifierItem host may ask for
 // symbolic recolouring; this icon is a full-colour brand mark, so it is served
@@ -55,7 +57,10 @@ pub fn all_frames() -> Vec<(u32, u32, Vec<u8>)> {
 
 /// The brand card as RGBA for one frame, or `None` when the build baked no icon
 /// (a checkout whose `mnvoice-linux.ico` was missing: the build script warns
-/// instead of failing, and callers fall back to the orb).
+/// instead of failing). The two callers differ there: the tray falls back to
+/// the orb, while the launcher writes no PNG at all and relies on [`available`]
+/// keeping `Icon=` out of the desktop entry, so nothing names a file that was
+/// never written.
 pub fn frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
     let index = frame_index(size)?;
     let side = *SIZES.get(index)? as usize;
@@ -68,15 +73,17 @@ pub fn frame(size: u32) -> Option<(u32, u32, Vec<u8>)> {
     Some((side as u32, side as u32, pixels.to_vec()))
 }
 
-/// The nearest baked tray frame to `size`, preferring the larger one on a tie.
+/// The nearest baked frame to `size`, preferring the larger one on a tie.
 ///
 /// A request below the smallest frame clamps up and one above the largest
-/// clamps down, so any request resolves against a non-empty store. In
-/// production it is reached only through [`all_frames`], which passes each
-/// baked size exactly, so the nearest-match behaviour itself is exercised by
-/// the unit test below; the host, not this function, picks the frame for the
-/// size it draws at. Every frame is the same drawing at its native resolution,
-/// so whichever one is picked is the artwork made for that size.
+/// clamps down, so any request resolves against a non-empty store. Production
+/// reaches it two ways: [`all_frames`] passes each baked size exactly and lets
+/// the host pick, and `ensure_icon` asks for 256 - the one request that must not
+/// nearest-match, since a ladder without a 256px frame would hand it the 128px
+/// drawing to write into `hicolor/256x256/apps`. That a 256px frame exists is
+/// pinned by `the_baked_set_has_the_documented_ladder`, not by this function.
+/// Every frame is the same drawing at its native resolution, so whichever one
+/// is picked is the artwork made for that size.
 fn frame_index(size: u32) -> Option<usize> {
     if SIZES.is_empty() {
         return None;
@@ -99,10 +106,11 @@ fn frame_index(size: u32) -> Option<usize> {
 /// `Icon=` at all.
 ///
 /// Not a bare emptiness test: the store must also be the exact whole number of
-/// squares [`SIZES`] names. A store of the wrong length would pass an emptiness
-/// check, `ensure_autostart` would write `Icon=mnvoice`, and `ensure_icon`'s
-/// encoder would then return `None` on its own length check - a desktop entry
-/// naming an icon file that was never written.
+/// squares [`SIZES`] names, which is the arithmetic [`frame`] slices with.
+/// Without that check a short store would pass an emptiness test,
+/// `ensure_autostart` would write `Icon=mnvoice`, and `frame(256)` would then
+/// return `None` on its own bounds check - a desktop entry naming an icon file
+/// that was never written.
 pub fn available() -> bool {
     let expected: usize = SIZES
         .iter()
