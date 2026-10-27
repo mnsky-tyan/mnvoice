@@ -342,7 +342,7 @@ impl WaylandTyper {
         let typed = latin1_typing_chars(text);
         if typed != text {
             eprintln!(
-                "mnvoice: typing {} chars as plain keyboard text (smart punctuation and untypeable characters normalized)",
+                "mnvoice: typing {} chars as plain keyboard text (smart punctuation and invisible characters normalized)",
                 typed.chars().count()
             );
         }
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn untypeable_characters_dont_reach_the_portal() {
+    fn invisible_controls_dont_reach_the_portal() {
         // Zero-width and soft-hyphen controls are removed by the explicit
         // drop list, not by a missing keysym: from_char gives every one of
         // them a Unicode keysym, so only the list keeps them off the wire.
