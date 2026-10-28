@@ -529,6 +529,15 @@ Known limits in this release, stated rather than papered over:
   compositor rebuild its keymap around it, which resets modifier state, so
   this is what keeps a held modifier from being swallowed mid-dictation.
   Accented letters, CJK and emoji are typed unchanged.
+- **Linux typing drives Shift itself and waits out the hotkey key.** The
+  compositor's own Shift synthesis for capital letters proved racy (Shift
+  could stick down mid-dictation, typing the rest in caps), so mnvoice
+  sends explicit Shift press/release around capitals and shifted
+  punctuation, plus a bare Shift tap before the first character. Typing
+  also waits up to 400 ms for the hotkey's modifier release, so the first
+  keystroke cannot land while Alt from the stop chord is still held -
+  previously that first character went to the window as an Alt+key
+  shortcut (`What` lost its W to Alt+W).
 - **No self-update on Linux.** The updater is Windows-only; the Linux app
   checks the releases page by hand. The tray has no "Check for updates" row for
   the same reason - see "The tray menu" above.

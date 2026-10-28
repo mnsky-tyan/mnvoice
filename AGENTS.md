@@ -208,6 +208,29 @@ and direct keyboard event injection.
      Do not "restore exact smart punctuation" without solving the keymap
      rebuild first.
 
+   - **Capitals and shifted punctuation are typed with explicit Shift
+     events; the first keystroke waits out the hotkey's Alt.** Both rules
+     come from the 2026-10-28 harness session that explained the garbling
+     v0.1.35 did not fix (user report: `What the fuck` typed as `hat the
+     fuck wHAT THE FUCK?`, and Caps Lock toggling on after a dictation).
+     Measured: (1) handing the compositor an uppercase keysym makes KWin
+     synthesize the Shift press and release itself, and that synthesis
+     bounces - Shift-up between the key's own down and up - and on the live
+     session it stuck down, typing everything after in caps. The session now
+     sends `Shift_L press, unshifted key, Shift_L release` itself
+     (`push_key_events`; the warm-up Shift tap at the start of `type_text`
+     also absorbs the compositor swallowing the very first keysym pair after
+     a client gains focus). (2) The first character of a toggle-stopped
+     dictation raced the user's Alt release: typing that starts while Alt is
+     down delivers its first key to the focused window as Alt+<key> - an
+     application shortcut, not text (`What` became `hat` because Alt+W went
+     to the window). `HotkeyCounters` counts portal Activated/Deactivated
+     pairs and `wait_out_hotkey_modifiers` caps the wait at 400 ms before
+     typing anyway.
+     Do not send uppercase or shifted keysyms through
+     `notify_keyboard_keysym`, and do not remove the release wait without a
+     replacement that answers "is the user's Alt still down".
+
    - **A cancel must not wait out the provider's final-transcription window.**
      The streaming loop waited up to 1500 ms for Deepgram's last frame, and
      the only thing that could end that wait early was the reader thread -
