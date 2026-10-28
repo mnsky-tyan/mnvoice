@@ -586,12 +586,7 @@ mod tests {
         push_key_events(&mut events, 'H');
         assert_eq!(
             events,
-            vec![
-                (0xffe1, true),
-                (0x68, true),
-                (0x68, false),
-                (0xffe1, false)
-            ]
+            vec![(0xffe1, true), (0x68, true), (0x68, false), (0xffe1, false)]
         );
         // Lowercase letters stay a plain pair.
         let mut events = Vec::new();
@@ -603,23 +598,13 @@ mod tests {
         push_key_events(&mut events, '?');
         assert_eq!(
             events,
-            vec![
-                (0xffe1, true),
-                (0x2f, true),
-                (0x2f, false),
-                (0xffe1, false)
-            ]
+            vec![(0xffe1, true), (0x2f, true), (0x2f, false), (0xffe1, false)]
         );
         let mut events = Vec::new();
         push_key_events(&mut events, '"');
         assert_eq!(
             events,
-            vec![
-                (0xffe1, true),
-                (0x27, true),
-                (0x27, false),
-                (0xffe1, false)
-            ]
+            vec![(0xffe1, true), (0x27, true), (0x27, false), (0xffe1, false)]
         );
     }
 
