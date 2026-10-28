@@ -119,9 +119,11 @@ pub fn main() -> Result<(), String> {
     // The tray and the hotkey share one event channel (see `AppEvent`).
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
     let hotkey_tx = event_tx.clone();
+    let hotkey_counters = Arc::new(linux_portal::HotkeyCounters::new());
     let _hotkey_stop = match linux_portal::spawn_hotkey_listener(
         &Some(Arc::clone(&cfg)),
         hotkey_tx,
+        Arc::clone(&hotkey_counters),
         AppEvent::from_hotkey,
     ) {
         Ok(Some(stop)) => Some(stop),
@@ -212,6 +214,7 @@ pub fn main() -> Result<(), String> {
                     let worker_cfg = Arc::clone(&cfg);
                     let orb = orb_tx.clone();
                     let events = event_tx.clone();
+                    let counters = Arc::clone(&hotkey_counters);
                     let start_typer = typer.take();
                     worker = Some(std::thread::spawn(move || {
                         // Whatever happens to the dictation - Ok, Err, or
@@ -231,8 +234,15 @@ pub fn main() -> Result<(), String> {
                         // Capture is live from this thread's first moment; the
                         // loop clears it when it collects the worker.
                         let _recording = RecordingGuard;
-                        let result =
-                            dictate(&worker_cfg, &engine, &stop_rx, &cancel_rx, &mut typer, &orb);
+                        let result = dictate(
+                            &worker_cfg,
+                            &engine,
+                            &stop_rx,
+                            &cancel_rx,
+                            &mut typer,
+                            &orb,
+                            &counters,
+                        );
                         // The orb's lifetime is the recording's; the worker
                         // owns the hide because the loop is free to handle the
                         // next event before this thread is collected.
@@ -458,6 +468,7 @@ fn dictate(
     cancel_rx: &Receiver<()>,
     typer: &mut Option<linux_portal::WaylandTyper>,
     orb_tx: &std::sync::mpsc::Sender<linux_orb::OrbCommand>,
+    hotkey: &Arc<linux_portal::HotkeyCounters>,
 ) -> Result<(), String> {
     set_phase(PHASE_RECORDING);
     let result = cli::dictate_with_controls(cfg, engine, toggle_rx, Some(cancel_rx), |text| {
@@ -466,10 +477,42 @@ fn dictate(
         let _ = orb_tx.send(linux_orb::OrbCommand::State(
             crate::orb_render::OrbState::Transcribing,
         ));
+        wait_out_hotkey_modifiers(hotkey);
         type_transcript(typer, text);
     });
     set_phase(PHASE_IDLE);
     result
+}
+
+/// Blocks while the user's hotkey chord modifier is still physically held,
+/// so the transcript's first keystroke cannot race the Alt release.
+///
+/// Measured 2026-10-28 (private KWin + fake_input + focused wl_keyboard
+/// spy): typing that starts while Alt is down delivers its first character
+/// to the focused window as Alt+<key> - an application shortcut, not text.
+/// `What` typed as `hat the fuck` because Alt+W went to the window. A
+/// toggle-stopped dictation hits exactly this: the stop tap's Alt is still
+/// down when the final transcript lands. The counters say whether every
+/// hotkey press has seen its release; a bounded wait (not infinite - a user
+/// who holds the chord down while VAD ends the recording must not stall
+/// typing forever) keeps the worst case at a short delay.
+fn wait_out_hotkey_modifiers(hotkey: &Arc<linux_portal::HotkeyCounters>) {
+    use std::sync::atomic::Ordering;
+    let start = std::time::Instant::now();
+    loop {
+        let presses = hotkey.presses.load(Ordering::Acquire);
+        let releases = hotkey.releases.load(Ordering::Acquire);
+        if releases >= presses {
+            return;
+        }
+        if start.elapsed() >= std::time::Duration::from_millis(400) {
+            eprintln!(
+                "mnvoice: hotkey modifier still held 400 ms after the transcript landed; typing anyway"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Types `text` at the cursor through whichever injection path is available.

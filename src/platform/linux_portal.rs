@@ -46,6 +46,34 @@ pub enum HotkeyEvent {
     Cancel,
 }
 
+/// How many hotkey presses and releases the portal has seen, in one shared
+/// place so the typing path can tell whether the user's chord modifier is
+/// still physically held.
+///
+/// Why this exists (measured 2026-10-28, private KWin + fake_input + a
+/// focused wl_keyboard spy): the transcript of a toggle-stopped dictation
+/// starts typing while the user's Alt from the stop tap is still down, and
+/// the first character is then delivered to the focused window as
+/// Alt+<key> - an application shortcut, not text. `What` typed as
+/// `hat the fuck` because Alt+W went to the window. The counters turn "the
+/// user's hands are still on the hotkey" into a number the typing path can
+/// wait out: a press with no matching release yet means a modifier is held.
+pub struct HotkeyCounters {
+    /// Hotkey presses seen on the portal's Activated stream.
+    pub presses: std::sync::atomic::AtomicU64,
+    /// Hotkey releases seen on the portal's Deactivated stream.
+    pub releases: std::sync::atomic::AtomicU64,
+}
+
+impl HotkeyCounters {
+    pub fn new() -> Self {
+        Self {
+            presses: std::sync::atomic::AtomicU64::new(0),
+            releases: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 /// Whether a key can be bound through the portal without taking it away from
 /// every other application.
 ///
@@ -142,6 +170,7 @@ fn portal_trigger(hotkey_str: &str) -> String {
 pub fn spawn_hotkey_listener<E, F>(
     cfg: &Option<Arc<config::Config>>,
     tx: Sender<E>,
+    counters: Arc<HotkeyCounters>,
     map: F,
 ) -> Result<Option<Sender<()>>, String>
 where
@@ -170,7 +199,7 @@ where
         // journal on 2026-10-20). A failure before bind lands here.
         let err_tx = ready_tx.clone();
         let result = futures_executor::block_on(hotkey_loop(
-            hotkey_str, cancel_str, tx, map, stop_rx, ready_tx,
+            hotkey_str, cancel_str, tx, counters, map, stop_rx, ready_tx,
         ));
         if let Err(e) = result {
             let _ = err_tx.send(Err(e));
@@ -199,6 +228,7 @@ async fn hotkey_loop<E, F>(
     hotkey_str: String,
     cancel_str: String,
     tx: Sender<E>,
+    counters: Arc<HotkeyCounters>,
     map: F,
     stop_rx: std::sync::mpsc::Receiver<()>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
@@ -281,9 +311,18 @@ where
                 if tx.send(map(event_type)).is_err() {
                     return Ok(());
                 }
+                counters
+                    .presses
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
             futures_util::future::Either::Right((Some(_event), _)) => {
-                // Key release: drained, deliberately ignored. See above.
+                // Key release: still not forwarded as an event (a release must
+                // not toggle - see the press comment above), but counted: the
+                // typing path waits out an unmatched press, which is the
+                // user's chord modifier still physically held.
+                counters
+                    .releases
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
             _ => return Ok(()),
         }
@@ -325,19 +364,24 @@ impl WaylandTyper {
     }
 
     /// Types `text` into whatever window has focus, one keysym press and
-    /// release per emitted character.
+    /// release per emitted character - with the Shift key driven explicitly
+    /// by this session rather than synthesized by the compositor.
     ///
     /// `text` goes through [`latin1_typing_chars`] first, so the smart
     /// punctuation a transcription model emits types as the keys a us layout
     /// already has and the invisible controls are dropped; the log line below
     /// fires only when that changed something.
     ///
+    /// A bare Shift tap runs first. Measured against a private KWin 6.6.6
+    /// with a focused wl_keyboard spy: the very first keysym pair after a
+    /// client gains keyboard focus can be swallowed outright by the
+    /// compositor, so the tap gives that swallow a harmless victim (Shift
+    /// alone produces no character) instead of the transcript's first letter.
+    ///
     /// The pacing matches the XTest injector's contract (`input::KEY_GAP`
     /// after each character): a burst of D-Bus messages can outpace the target
     /// window exactly like a burst of XTest events can, so the gap applies
-    /// here too. The state and casing come from the character itself -
-    /// `notify_keyboard_keysym` takes the keysym, and the compositor applies
-    /// the modifier it implies.
+    /// here too.
     pub async fn type_text(&self, text: &str) -> Result<(), String> {
         let typed = latin1_typing_chars(text);
         if typed != text {
@@ -346,29 +390,37 @@ impl WaylandTyper {
                 typed.chars().count()
             );
         }
+        // The warm-up tap: see the doc comment above.
+        self.send_keysym(SHIFT_KEYSYM, true).await?;
+        self.send_keysym(SHIFT_KEYSYM, false).await?;
         for c in typed.chars() {
-            let keysym = xkbcommon::xkb::Keysym::from_char(c);
-            self.remote
-                .notify_keyboard_keysym(
-                    &self.session,
-                    keysym.raw() as i32,
-                    ashpd::desktop::remote_desktop::KeyState::Pressed,
-                    ashpd::desktop::remote_desktop::NotifyKeyboardKeysymOptions::default(),
-                )
-                .await
-                .map_err(|e| format!("key injection failed ({e})"))?;
-            self.remote
-                .notify_keyboard_keysym(
-                    &self.session,
-                    keysym.raw() as i32,
-                    ashpd::desktop::remote_desktop::KeyState::Released,
-                    ashpd::desktop::remote_desktop::NotifyKeyboardKeysymOptions::default(),
-                )
-                .await
-                .map_err(|e| format!("key injection failed ({e})"))?;
+            let mut events = Vec::with_capacity(4);
+            push_key_events(&mut events, c);
+            for (keysym, press) in events {
+                self.send_keysym(keysym, press).await?;
+            }
             std::thread::sleep(crate::platform::input::KEY_GAP);
         }
         Ok(())
+    }
+
+    /// One keysym press or release through the portal, mapped to the same
+    /// error text every caller shows.
+    async fn send_keysym(&self, keysym: u32, press: bool) -> Result<(), String> {
+        let state = if press {
+            ashpd::desktop::remote_desktop::KeyState::Pressed
+        } else {
+            ashpd::desktop::remote_desktop::KeyState::Released
+        };
+        self.remote
+            .notify_keyboard_keysym(
+                &self.session,
+                keysym as i32,
+                state,
+                ashpd::desktop::remote_desktop::NotifyKeyboardKeysymOptions::default(),
+            )
+            .await
+            .map_err(|e| format!("key injection failed ({e})"))
     }
 }
 
@@ -426,6 +478,76 @@ pub fn latin1_typing_chars(text: &str) -> String {
     out
 }
 
+/// `notify_keyboard_keysym` for `Shift_L`, the one modifier this module
+/// drives itself.
+const SHIFT_KEYSYM: u32 = 0xffe1;
+
+/// Appends the keystroke events one character types as: an explicit Shift
+/// press and release around the unshifted key whenever the character lives on
+/// a shifted key of a us layout, and a plain press and release otherwise.
+///
+/// Why explicit Shift: handing the compositor an uppercase keysym makes IT
+/// synthesize the Shift press and release, and that synthesis is racy -
+/// measured 2026-10-28 against a private KWin 6.6.6 with a focused
+/// wl_keyboard spy, typing `What the fuck. What the fuck?` delivered
+/// Shift-up between the key's own down and up (`Shift, w-down, Shift-up,
+/// Shift-down, w-up, Shift-up`); on the live session the same bounce stuck
+/// down, typing everything after the second word in caps and leaving the
+/// keyboard feeling broken. Events this function emits never nest: each
+/// Shift press is followed by the key and then the matching release, in
+/// order, on the wire.
+fn push_key_events(out: &mut Vec<(u32, bool)>, c: char) {
+    // The shifted pairs of a us layout, for the punctuation a transcript
+    // can contain. Letters use their own lowercase.
+    let shifted_base = match c {
+        '!' => Some('1'),
+        '@' => Some('2'),
+        '#' => Some('3'),
+        '$' => Some('4'),
+        '%' => Some('5'),
+        '^' => Some('6'),
+        '&' => Some('7'),
+        '*' => Some('8'),
+        '(' => Some('9'),
+        ')' => Some('0'),
+        '_' => Some('-'),
+        '+' => Some('='),
+        '{' => Some('['),
+        '}' => Some(']'),
+        '|' => Some('\\'),
+        ':' => Some(';'),
+        '"' => Some('\''),
+        '<' => Some(','),
+        '>' => Some('.'),
+        '?' => Some('/'),
+        '~' => Some('`'),
+        _ => None,
+    };
+    if let Some(base) = shifted_base.or_else(|| {
+        if c.is_ascii_uppercase() {
+            Some(c.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }) {
+        let keysym = xkbcommon::xkb::Keysym::from_char(base).raw();
+        out.push((SHIFT_KEYSYM, true));
+        out.push((keysym, true));
+        out.push((keysym, false));
+        out.push((SHIFT_KEYSYM, false));
+        return;
+    }
+    // Everything else - lowercase letters, digits, unshifted punctuation,
+    // and the pass-through content that types through the keymap-rebuild
+    // path (accented Latin-1, CJK, emoji) - keeps its own keysym.
+    let keysym = xkbcommon::xkb::Keysym::from_char(c);
+    if keysym != xkbcommon::xkb::Keysym::NoSymbol {
+        let raw = keysym.raw();
+        out.push((raw, true));
+        out.push((raw, false));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +572,62 @@ mod tests {
             latin1_typing_chars("hello, world! 123"),
             "hello, world! 123"
         );
+    }
+
+    #[test]
+    fn capitals_type_as_explicit_shift_not_compositor_synthesis() {
+        // The measured failure this prevents: handing the compositor an
+        // uppercase keysym makes KWin synthesize the Shift press and release,
+        // and its synthesis bounced (Shift-up between the key's own down and
+        // up) and stuck down on the live session - `What` typed as
+        // `wHAT THE FUCK` and the keyboard felt broken afterwards. The
+        // session now owns Shift outright: press, key, release, in order.
+        let mut events = Vec::new();
+        push_key_events(&mut events, 'H');
+        assert_eq!(
+            events,
+            vec![(0xffe1, true), (0x68, true), (0x68, false), (0xffe1, false)]
+        );
+        // Lowercase letters stay a plain pair.
+        let mut events = Vec::new();
+        push_key_events(&mut events, 'h');
+        assert_eq!(events, vec![(0x68, true), (0x68, false)]);
+        // Shifted punctuation rides the same explicit Shift, mapped to its
+        // unshifted key on a us layout.
+        let mut events = Vec::new();
+        push_key_events(&mut events, '?');
+        assert_eq!(
+            events,
+            vec![(0xffe1, true), (0x2f, true), (0x2f, false), (0xffe1, false)]
+        );
+        let mut events = Vec::new();
+        push_key_events(&mut events, '"');
+        assert_eq!(
+            events,
+            vec![(0xffe1, true), (0x27, true), (0x27, false), (0xffe1, false)]
+        );
+    }
+
+    #[test]
+    fn every_characters_events_are_shift_balanced() {
+        // A Shift press without its release would shift-stick everything the
+        // transcript types after it - the exact live failure this module
+        // exists to prevent. Walk the events of a mixed sentence and the
+        // outstanding-Shift count must never go negative and must end at
+        // zero.
+        let text = "Hello, WORLD! (it's) 100%? caf\u{e9} \u{4e2d}\u{6587}";
+        let mut events = Vec::new();
+        for c in latin1_typing_chars(text).chars() {
+            push_key_events(&mut events, c);
+        }
+        let mut depth: i64 = 0;
+        for (keysym, press) in &events {
+            if *keysym == 0xffe1 {
+                depth += if *press { 1 } else { -1 };
+                assert!(depth >= 0, "Shift released before pressed: {events:?}");
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced Shift events: {events:?}");
     }
 
     #[test]
